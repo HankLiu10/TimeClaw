@@ -1,0 +1,88 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "timeclaw"
+version = "0.1.0"
+description = "TimeClaw: Native Multimodal Time-Series Autonomous Agent Platform"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "TimeClaw Team" },
+]
+keywords = ["time-series", "agent", "multimodal", "forecasting", "anomaly-detection"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "litellm>=1.80",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pyyaml>=6.0",
+    "loguru>=0.7",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "scipy>=1.12",
+    "statsmodels>=0.14",
+]
+
+[project.optional-dependencies]
+dl = [
+    "torch>=2.2",
+    "transformers>=4.40",
+]
+signal = [
+    "PyWavelets>=1.5",
+    "pycatch22>=0.4",
+    "EMD-signal>=1.6",
+    "ruptures>=1.1",
+    "antropy>=0.1",
+]
+prediction = [
+    "prophet>=1.1",
+]
+image = [
+    "Pillow>=10.0",
+]
+sbm-chronos = [
+    "chronos-forecasting",
+]
+sbm-moirai = [
+    "uni2ts",
+]
+sbm-timesfm = [
+    "timesfm",
+]
+sbm = [
+    "timeclaw[sbm-chronos,sbm-moirai,sbm-timesfm]",
+]
+all = [
+    "timeclaw[dl,signal,prediction,image]",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "scikit-learn>=1.4",
+]
+
+[project.scripts]
+timeclaw = "timeclaw.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.hatch.build.targets.wheel]
+packages = ["timeclaw"]

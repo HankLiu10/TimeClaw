@@ -1,0 +1,80 @@
+# TimeClaw Configuration: Claude Sonnet 4 via relay API
+# Main agents use claude-sonnet-4-6-1m, text_light uses haiku for cost savings
+
+llm:
+  api_base: "https://easyli.codesuc.top/v1"
+  api_key: "sk-kYfChA7EAAb9OsYwIRTBj2fjov2L49kYEow3ENB9wXpR1tlP"
+  models:
+    manager: "anthropic/claude-sonnet-4-6-1m"
+    analyzer: "anthropic/claude-sonnet-4-6-1m"
+    executor: "anthropic/claude-sonnet-4-6-1m"
+    reasoner: "anthropic/claude-sonnet-4-6-1m"
+    text_light: "anthropic/claude-3-5-haiku-20241022"
+    text_heavy: "anthropic/claude-sonnet-4-6-1m"
+  fallback: null
+  max_retries: 3
+  timeout: 180.0
+  temperature: 0.1
+  max_tokens: 4096
+
+reasoning:
+  max_evidence_steps: 10
+  max_reflact_iterations: 3
+  max_quality_gate_retries: 2
+  critic_enabled: true
+
+pipeline:
+  enable_fingerprint: true
+  enable_safeauto: true
+  parallel_execution: false
+  verbose: false
+  multi_agent_mode: true
+
+memory:
+  enable_vector: true
+  vector_dim: 256
+  hybrid_vector_weight: 0.7
+  hybrid_text_weight: 0.3
+  max_experience_entries: 10000
+
+context:
+  max_tokens: 16000
+  reserve_tokens: 4000
+  compaction_threshold: 0.8
+  prune_observation_chars: 200
+  enable_lazy_tool_descriptions: true
+
+scheduler:
+  enabled: false
+  heartbeat_interval_minutes: 30
+  drift_check_enabled: true
+  experience_cleanup_enabled: true
+
+fusion:
+  strategy: "confidence_weighted"
+  task_weights:
+    forecast:
+      timeseries: 0.7
+      text: 0.2
+      image: 0.1
+    classification:
+      timeseries: 0.5
+      text: 0.3
+      image: 0.2
+    anomaly_detection:
+      timeseries: 0.6
+      text: 0.2
+      image: 0.2
+    qa:
+      timeseries: 0.2
+      text: 0.6
+      image: 0.2
+    imputation:
+      timeseries: 0.8
+      text: 0.1
+      image: 0.1
+  llm_arbitration_enabled: true
+  confidence_floor: 0.1
+
+log_level: "INFO"
+workspace_dir: ".timeclaw"

@@ -1,0 +1,29 @@
+# TimeClaw Cloud Configuration (API-based models)
+# Requires API keys: OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.
+
+llm:
+  models:
+    manager: "gpt-4o"
+    analyzer: "gpt-4o-mini"
+    executor: "gpt-4o-mini"
+    reasoner: "gpt-4o"
+  fallback: "claude-sonnet-4-20250514"
+  max_retries: 3
+  timeout: 60.0
+  temperature: 0.1
+  max_tokens: 4096
+
+reasoning:
+  max_evidence_steps: 20
+  max_reflact_iterations: 5
+  max_quality_gate_retries: 3
+  critic_enabled: true
+
+pipeline:
+  enable_fingerprint: true
+  enable_safeauto: true
+  parallel_execution: false
+  verbose: false
+
+log_level: "INFO"
+workspace_dir: ".timeclaw"

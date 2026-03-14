@@ -1,0 +1,5 @@
+# Reasoner Agent Configuration
+role: reasoner
+consistency_sigma_threshold: 5.0
+enable_llm_review: true
+max_correction_attempts: 2

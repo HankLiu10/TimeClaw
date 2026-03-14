@@ -1,0 +1,5 @@
+# Manager Agent Configuration
+role: manager
+max_planning_depth: 3
+dag_max_nodes: 10
+replan_on_failure: true

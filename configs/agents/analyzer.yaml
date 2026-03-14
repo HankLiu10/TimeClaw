@@ -1,0 +1,10 @@
+# Analyzer Agent Configuration
+role: analyzer
+profiling_tools:
+  - basic_stats
+  - autocorrelation
+  - stationarity_test
+detection_tools:
+  - detect_trend
+  - detect_anomaly
+max_profiling_time_sec: 30

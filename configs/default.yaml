@@ -1,0 +1,29 @@
+# TimeClaw Default Configuration (Local Models Priority)
+# Uses Ollama for local inference, with cloud API fallback
+
+llm:
+  models:
+    manager: "ollama/qwen3:8b"
+    analyzer: "ollama/qwen3:1.7b"
+    executor: "ollama/qwen3:1.7b"
+    reasoner: "ollama/qwen3:8b"
+  fallback: "gpt-4o-mini"
+  max_retries: 3
+  timeout: 120.0
+  temperature: 0.1
+  max_tokens: 4096
+
+reasoning:
+  max_evidence_steps: 15
+  max_reflact_iterations: 5
+  max_quality_gate_retries: 3
+  critic_enabled: true
+
+pipeline:
+  enable_fingerprint: true
+  enable_safeauto: true
+  parallel_execution: false
+  verbose: false
+
+log_level: "INFO"
+workspace_dir: ".timeclaw"
