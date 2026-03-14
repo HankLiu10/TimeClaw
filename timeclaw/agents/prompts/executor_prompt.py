@@ -269,6 +269,16 @@ Each turn, you see the results of all previous steps. You then decide:
 5. Keep total steps ≤ {max_steps}. Be efficient — don't run tools that won't help.
 6. When you have a prediction or have extracted all useful information, set done=true.
 
+## CRITICAL — Task-specific requirements
+- **forecast**: You MUST call at least one *_forecast tool (arima_forecast, ets_forecast,
+  sbm_forecast, prophet_forecast, ensemble_forecast) to produce a numeric prediction.
+  Decomposition and detection tools alone are NOT sufficient — they are preprocessing
+  steps that should INFORM your choice of forecast tool. Do NOT declare done until
+  you have a forecast result.
+- **anomaly**: You MUST call at least one detection tool (detect_anomaly, detect_changepoint, etc.).
+- **text modality**: Decomposition/detection/forecast tools are NOT available to you.
+  Focus on text analysis tools only.
+
 ## Output Format (strict JSON)
 {{
   "thought": "what I learned from previous results and what I should do next",

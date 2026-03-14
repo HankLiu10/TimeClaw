@@ -191,6 +191,16 @@ class ExecutorAgent(AgentBase):
             is_done = decision.get("done", False)
 
             if is_done:
+                if self._needs_forecast_guard(plan, execution_log, step):
+                    history_lines.append(
+                        f"[Step {step}] ⚠ SYSTEM: forecast task requires a *_forecast "
+                        f"tool. You ran analysis/decomposition but no prediction. "
+                        f"Pick a forecast tool now."
+                    )
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "thought": thought, "override": "forecast_guard_triggered",
+                    })
+                    continue
                 trace.agent_step("executor", f"react_step_{step}", {
                     "thought": thought, "done": True,
                 })
@@ -226,9 +236,7 @@ class ExecutorAgent(AgentBase):
 
                 if tool_name == "normalize" and result.metadata.get("inverse"):
                     norm_inverse = result.metadata["inverse"]
-                if result.success and getattr(
-                    get_tool_instance(tool_name), "io_type", None
-                ) and get_tool_instance(tool_name).io_type.value == "X->X":
+                if self._is_passthrough_transform(tool_name, result.data):
                     current_data = result.data
             else:
                 error_msg = result.error if result else "tool not found"
@@ -277,6 +285,41 @@ class ExecutorAgent(AgentBase):
             "prediction_preview": str(final_result)[:500] if final_result else None,
         })
         return act_result
+
+    @staticmethod
+    def _is_passthrough_transform(tool_name: str, result_data: Any) -> bool:
+        """Check if a tool's output should replace current_data for downstream tools.
+
+        Only true transforms (normalize, handle_missing, etc.) that output an
+        array of the same shape should replace current_data. Decomposition tools
+        output dicts and must NOT replace the working array.
+        """
+        if isinstance(result_data, dict):
+            return False
+        if hasattr(result_data, "shape") or isinstance(result_data, (list, np.ndarray)):
+            return True
+        return False
+
+    _FORECAST_TOOLS = frozenset({
+        "arima_forecast", "ets_forecast", "sbm_forecast",
+        "prophet_forecast", "ensemble_forecast", "checkpoint_forecast",
+    })
+
+    def _needs_forecast_guard(
+        self,
+        plan: dict[str, Any],
+        execution_log: list[dict[str, Any]],
+        step: int,
+    ) -> bool:
+        """Return True if this is a forecast task on timeseries but no forecast tool was run."""
+        if plan.get("task_type") != "forecast":
+            return False
+        if plan.get("modality") != "timeseries":
+            return False
+        if step >= MAX_REACT_STEPS:
+            return False
+        ran_tools = {e["tool"] for e in execution_log if e.get("success")}
+        return not ran_tools.intersection(self._FORECAST_TOOLS)
 
     async def reflect(self, action_result: dict[str, Any]) -> dict[str, Any]:
         log = action_result.get("execution_log", [])
