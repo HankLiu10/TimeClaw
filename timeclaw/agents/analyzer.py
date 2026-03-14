@@ -47,10 +47,16 @@ class AnalyzerAgent(AgentBase):
         text_data = envelope.environment.text_data or None
         images = envelope.environment.images or None
 
-        modality_report = self._modality_detector.detect(
-            ts_data=data, text_data=text_data, images=images,
-        )
-        modalities = modality_report["modalities"]
+        existing_modalities = envelope.environment.modalities
+        if existing_modalities and len(existing_modalities) > 0:
+            modalities = existing_modalities
+            modality_details = {}
+        else:
+            modality_report = self._modality_detector.detect(
+                ts_data=data, text_data=text_data, images=images,
+            )
+            modalities = modality_report["modalities"]
+            modality_details = modality_report["details"]
 
         fingerprint = await self.fingerprint_extractor.extract(data)
 
@@ -103,7 +109,7 @@ class AnalyzerAgent(AgentBase):
             "data_shape": envelope.environment.data_shape,
             "suggested_strategy": strategy,
             "modalities": modalities,
-            "modality_details": modality_report["details"],
+            "modality_details": modality_details,
             "similar_experiences": similar_experiences,
         }
 

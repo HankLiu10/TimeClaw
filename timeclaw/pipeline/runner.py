@@ -26,7 +26,7 @@ from timeclaw.clawhub.tool_registry import discover_and_register, get_tool_insta
 from timeclaw.core.config import TimeClawConfig
 from timeclaw.core.evidence import EvidenceLog, QualityGate
 from timeclaw.core.message import AgentRole, ResultMessage
-from timeclaw.core.reasoning import EvidenceIterator, HierarchicalPlanner, ReflActLoop
+from timeclaw.core.reasoning import EvidenceIterator
 from timeclaw.core.task_graph import TaskDAG, TaskNode
 from timeclaw.core.tea_protocol import (
     AgentState,
@@ -72,7 +72,6 @@ class PipelineRunner:
         )
         self._reasoner = ReasonerAgent(self.router.get_backend("reasoner"))
 
-        self._planner = HierarchicalPlanner(manager_llm)
         self._quality_gate = QualityGate()
 
         self._tools_registered = False

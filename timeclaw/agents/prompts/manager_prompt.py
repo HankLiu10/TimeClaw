@@ -37,32 +37,3 @@ Always respond in JSON with the following structure:
 }
 """
 
-PLAN_PROMPT = """\
-Given the following task and data summary, generate a task execution plan as a DAG.
-
-Task: {task_description}
-Data shape: {data_shape}
-Columns: {columns}
-Data fingerprint: {fingerprint}
-Detected modalities: {modalities}
-
-Generate a JSON plan with:
-{{
-  "nodes": [
-    {{"id": "str", "name": "str", "agent_role": "analyzer|executor|reasoner", "description": "str", "modality": "timeseries|text|image|null"}}
-  ],
-  "edges": [["from_id", "to_id"]],
-  "reasoning": "why this plan"
-}}
-"""
-
-REPLAN_PROMPT = """\
-The current plan needs adjustment. Here is the situation:
-
-Original plan: {original_plan}
-Completed steps: {completed_steps}
-Failed steps: {failed_steps}
-Reason for replanning: {reason}
-
-Generate an updated plan in the same JSON format.
-"""
