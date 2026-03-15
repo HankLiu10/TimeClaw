@@ -11,9 +11,16 @@ from timeclaw.sbm.base import SBMBase, SBMConfig, SBMOutput, SBMTask
 
 TIMESFM_DEFAULT_CONFIG = SBMConfig(
     model_name="timesfm",
-    model_path="google/timesfm-1.0-200m-pytorch",
+    model_path="google/timesfm-2.0-500m-pytorch",
     context_length=512,
-    prediction_length=96,
+    prediction_length=128,
+    extra={
+        "num_layers": 50,
+        "model_dims": 1280,
+        "input_patch_len": 32,
+        "output_patch_len": 128,
+        "use_positional_embedding": False,
+    },
 )
 
 
@@ -26,7 +33,7 @@ class TimesFMAdapter(SBMBase):
 
     name: str = "timesfm"
     supported_tasks: list[SBMTask] = [SBMTask.FORECAST]
-    requires_gpu: bool = False
+    requires_gpu: bool = True
 
     def load(self) -> None:
         try:
@@ -36,10 +43,10 @@ class TimesFMAdapter(SBMBase):
                 "timesfm is required: pip install timesfm"
             )
 
-        model_path = self.config.model_path or "google/timesfm-1.0-200m-pytorch"
-        logger.info(f"Loading TimesFM from {model_path}")
-
+        model_path = self.config.model_path or "google/timesfm-2.0-500m-pytorch"
         backend = "gpu" if self.config.device in ("cuda", "auto") else "cpu"
+        logger.info(f"Loading TimesFM from {model_path} on {backend}")
+        extra = self.config.extra
 
         self._model = tfm.TimesFm(
             hparams=tfm.TimesFmHparams(
@@ -47,6 +54,11 @@ class TimesFMAdapter(SBMBase):
                 per_core_batch_size=self.config.batch_size,
                 horizon_len=self.config.prediction_length,
                 context_len=self.config.context_length,
+                num_layers=extra.get("num_layers", 50),
+                model_dims=extra.get("model_dims", 1280),
+                input_patch_len=extra.get("input_patch_len", 32),
+                output_patch_len=extra.get("output_patch_len", 128),
+                use_positional_embedding=extra.get("use_positional_embedding", False),
             ),
             checkpoint=tfm.TimesFmCheckpoint(
                 huggingface_repo_id=model_path,

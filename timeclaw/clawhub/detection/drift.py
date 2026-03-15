@@ -59,7 +59,16 @@ class DetectDriftTool(ClawTool):
 
     name: str = "detect_drift"
     category: ToolCategory = ToolCategory.DETECTION
-    description: str = "Detect distribution drift using CUSUM and PSI."
+    description: str = (
+        "Detect distribution drift in time series using CUSUM (cumulative sum) and PSI (Population Stability Index). "
+        "Measures whether the data's statistical properties shift over time. "
+        "Input: 1D numeric array, Series, or single-column DataFrame. "
+        "Output: dict with 'cusum_drift_points' (list of indices where drift is detected), "
+        "'psi_score' (float quantifying distributional shift between the first and second half), "
+        "and 'drift_detected' (bool). "
+        "Use for monitoring data quality, detecting concept drift, or identifying regime changes. "
+        "Param 'threshold' (float, default 5.0): CUSUM sensitivity — lower values detect subtler shifts."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_C
     parameters_schema: dict[str, Any] = {
         "type": "object",

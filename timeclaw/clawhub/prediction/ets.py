@@ -32,7 +32,16 @@ class ETSForecastTool(ClawTool):
 
     name: str = "ets_forecast"
     category: ToolCategory = ToolCategory.PREDICTION
-    description: str = "Forecast using exponential smoothing (ETS)."
+    description: str = (
+        "Forecast a univariate time series using Holt-Winters Exponential Smoothing (ETS) "
+        "with configurable error, trend, and seasonal components. "
+        "Input: 1-D numeric array. "
+        "Output: dict with 'forecast' (array of predicted values), 'horizon', and 'fitted_values' (last 10 in-sample fits). "
+        "Strengths: very fast, robust baseline method that works well on smooth, low-noise series "
+        "with clear trend and/or seasonal patterns. Falls back to simple exponential smoothing if full model fails. "
+        "Key params: 'horizon' — steps ahead (default 10); 'seasonal_periods' — cycle length; "
+        "'trend' — trend type ('add' or 'mul', default 'add'); 'seasonal' — seasonal type ('add', 'mul', or None)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

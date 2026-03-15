@@ -67,11 +67,12 @@ def discover_and_register() -> int:
                     continue
                 try:
                     mod = importlib.import_module(f"timeclaw.clawhub.{sub_pkg}.{modname}")
-                    # Each module should define a `tool` attribute (instance of ClawTool)
-                    tool_obj = getattr(mod, "tool", None)
-                    if tool_obj is not None and isinstance(tool_obj, ClawTool):
-                        register_tool_instance(tool_obj)
-                        count += 1
+                    for attr_name in dir(mod):
+                        if attr_name == "tool" or attr_name.startswith("tool_"):
+                            tool_obj = getattr(mod, attr_name, None)
+                            if tool_obj is not None and isinstance(tool_obj, ClawTool):
+                                register_tool_instance(tool_obj)
+                                count += 1
                 except Exception as e:
                     logger.warning(f"Failed to load tool module {sub_pkg}.{modname}: {e}")
         except Exception as e:

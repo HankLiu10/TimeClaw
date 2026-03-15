@@ -30,7 +30,16 @@ class LaggedCorrelationTool(ClawTool):
 
     name: str = "lagged_correlation"
     category: ToolCategory = ToolCategory.RELATION
-    description: str = "Compute lagged cross-correlation between time series channels."
+    description: str = (
+        "Compute the lagged cross-correlation between two time series channels, revealing the "
+        "time delay at which they are most strongly correlated. Input: multivariate time series "
+        "with at least 2 channels (uses the first two columns). Output: dict with 'lags' "
+        "(array from -max_lag to +max_lag), 'correlations' (correlation at each lag), "
+        "'best_lag' (lag with strongest absolute correlation), and 'best_correlation'. Use when "
+        "you need to find the time offset between two related signals, detect lead-lag "
+        "relationships, or align channels that are shifted in time. Key param: max_lag (int, "
+        "default 20) — maximum number of time steps to shift in each direction."
+    )
     io_type: ToolIOType = ToolIOType.XK_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

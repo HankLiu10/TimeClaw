@@ -55,7 +55,7 @@ class EvidenceLog(BaseModel):
         lines = [f"Evidence Log ({self.num_steps} steps):"]
         for e in self.entries:
             status = "OK" if e.is_successful else "FAIL"
-            lines.append(f"  [{status}] Step {e.step}: {e.tool_name} -> {e.thought[:60]}")
+            lines.append(f"  [{status}] Step {e.step}: {e.tool_name} -> {e.thought[:500]}")
         lines.append(f"  Covered: {self.covered_predicates}")
         lines.append(f"  Gaps: {self.gap_predicates}")
         return "\n".join(lines)

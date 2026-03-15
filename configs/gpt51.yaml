@@ -1,0 +1,56 @@
+# TimeClaw Configuration: Azure GPT-5.1 (unified)
+# All agents and all tasks use GPT-5.1 via Azure OpenAI
+
+llm:
+  azure_api_base: "https://asure-test-openai-004.openai.azure.com/"
+  azure_api_key: "5jDLlQ5ccmal2OAOchrqcatcKMr4FfqQbOD1n0YUwkIFCwdxcI5aJQQJ99ALACYeBjFXJ3w3AAABACOGZLN4"
+  azure_api_version: "2024-12-01-preview"
+  api_base: "https://asure-test-openai-004.openai.azure.com/"
+  api_key: "5jDLlQ5ccmal2OAOchrqcatcKMr4FfqQbOD1n0YUwkIFCwdxcI5aJQQJ99ALACYeBjFXJ3w3AAABACOGZLN4"
+  models:
+    manager: "azure/gpt-5.1"
+    analyzer: "azure/gpt-5.1"
+    executor: "azure/gpt-5.1"
+    reasoner: "azure/gpt-5.1"
+    text_light: "azure/gpt-5.1"
+    text_heavy: "azure/gpt-5.1"
+  fallback: "azure/gpt-5.1"
+  max_retries: 3
+  timeout: 180.0
+  temperature: 0.1
+  max_tokens: 4096
+
+reasoning:
+  max_evidence_steps: 10
+  max_reflact_iterations: 3
+  max_quality_gate_retries: 2
+  critic_enabled: true
+
+pipeline:
+  enable_fingerprint: true
+  enable_safeauto: true
+  parallel_execution: true
+  verbose: false
+  multi_agent_mode: true
+
+memory:
+  enable_vector: true
+  vector_dim: 256
+  hybrid_vector_weight: 0.7
+  hybrid_text_weight: 0.3
+  max_experience_entries: 10000
+
+context:
+  max_tokens: 16000
+  reserve_tokens: 4000
+  compaction_threshold: 0.8
+  prune_observation_chars: 200
+  enable_lazy_tool_descriptions: true
+
+fusion:
+  strategy: "confidence_weighted"
+  llm_arbitration_enabled: true
+  confidence_floor: 0.1
+
+log_level: "INFO"
+workspace_dir: ".timeclaw"

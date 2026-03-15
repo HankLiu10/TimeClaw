@@ -33,12 +33,41 @@ def _to_array(ts_data):
     return arr.astype(float)
 
 
+def _detect_dominant_period(arr: np.ndarray, min_period: int = 3) -> int | None:
+    """Use FFT to find the dominant period in the data."""
+    if len(arr) < 2 * min_period:
+        return None
+    detrended = arr - np.linspace(arr[0], arr[-1], len(arr))
+    fft_vals = np.abs(np.fft.rfft(detrended))
+    fft_vals[0] = 0  # ignore DC
+    freqs = np.fft.rfftfreq(len(arr))
+    valid = freqs > 0
+    fft_vals = fft_vals[valid]
+    freqs = freqs[valid]
+    if len(fft_vals) == 0:
+        return None
+    peak_idx = np.argmax(fft_vals)
+    period = int(round(1.0 / freqs[peak_idx]))
+    if period < min_period or period > len(arr) // 2:
+        return None
+    return period
+
+
 class ProphetForecastTool(ClawTool):
     """Prophet forecast for time series with seasonality."""
 
     name: str = "prophet_forecast"
     category: ToolCategory = ToolCategory.PREDICTION
-    description: str = "Forecast using Facebook Prophet."
+    description: str = (
+        "Forecast a univariate time series using Facebook Prophet, an additive regression model "
+        "that automatically detects changepoints and models multiple seasonalities. "
+        "Input: 1-D numeric array. "
+        "Output: dict with 'forecast' (array of predicted values), 'horizon', and 'trend' (trend component array). "
+        "Strengths: handles piecewise-linear trend shifts and periodic patterns without manual tuning; "
+        "best for moderate-length series (100–1000 points) with clear seasonal structure. "
+        "Slower than ARIMA/ETS but more flexible for complex, non-linear patterns. "
+        "Key params: 'horizon' — number of steps ahead to forecast (default 10)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",
@@ -59,15 +88,29 @@ class ProphetForecastTool(ClawTool):
         arr = _to_array(ts_data)
         horizon: int = params.get("horizon", 10)
 
+        dominant_period = _detect_dominant_period(arr)
+
+        if dominant_period is not None and dominant_period >= 3:
+            minutes_per_point = int(round(7 * 24 * 60 / dominant_period))
+            minutes_per_point = max(minutes_per_point, 1)
+            freq = f"{minutes_per_point}min"
+        else:
+            freq = "D"
+
         df = pd.DataFrame({
-            "ds": pd.date_range(start="2000-01-01", periods=len(arr), freq="D"),
+            "ds": pd.date_range(start="2000-01-01", periods=len(arr), freq=freq),
             "y": arr,
         })
 
-        model = Prophet()
+        model = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=(dominant_period is not None),
+            daily_seasonality=False,
+            changepoint_prior_scale=0.1,
+        )
         model.fit(df)
 
-        future = model.make_future_dataframe(periods=horizon)
+        future = model.make_future_dataframe(periods=horizon, freq=freq)
         prediction = model.predict(future)
 
         forecast_values = prediction["yhat"].iloc[-horizon:].tolist()

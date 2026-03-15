@@ -32,6 +32,9 @@ class ModelRouter:
             timeout=self.config.timeout,
             api_base=self.config.api_base,
             api_key=self.config.api_key,
+            azure_api_base=self.config.azure_api_base,
+            azure_api_key=self.config.azure_api_key,
+            azure_api_version=self.config.azure_api_version,
         )
         self._backends[role] = backend
         logger.info(f"Router: {role} -> {model} (fallback: {self.config.fallback})")

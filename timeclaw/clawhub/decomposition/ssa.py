@@ -31,7 +31,17 @@ class SSADecomposeTool(ClawTool):
 
     name: str = "ssa_decompose"
     category: ToolCategory = ToolCategory.DECOMPOSITION
-    description: str = "Decompose time series using singular spectrum analysis (SSA)."
+    description: str = (
+        "Decompose a time series using Singular Spectrum Analysis (SSA), a data-driven method "
+        "that does not require a known seasonal period. Separates signal from noise via singular "
+        "value decomposition of the trajectory matrix. Input: univariate time series array. "
+        "Output: dict with 'components' (list of reconstructed component arrays), "
+        "'singular_values', 'explained_variance_ratio', and 'n_components'. Use when the "
+        "seasonal period is unknown, when you want a non-parametric decomposition, or when you "
+        "need to separate trend and oscillatory components without assuming periodicity. Key "
+        "params: window_size (int, default half the series length capped at 50) — embedding "
+        "dimension; n_components (int, default 3) — number of components to reconstruct."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

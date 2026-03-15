@@ -27,7 +27,13 @@ class KeywordExtractTool(ClawTool):
 
     name: str = "keyword_extract"
     category: ToolCategory = ToolCategory.TEXT
-    description: str = "Extract top keywords from text using TF-IDF or word frequency."
+    description: str = (
+        "Identifies the most important terms and topics in text using TF-IDF or word frequency. "
+        "Input: text data (string or list of text dicts). "
+        "Output: dict with ranked keywords and their scores. "
+        "Use when you need to understand the main themes of a document or compare topic focus across texts. "
+        "Params: top_k (number of keywords to return), model ('light'/'heavy')."
+    )
     io_type: ToolIOType = ToolIOType.T_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

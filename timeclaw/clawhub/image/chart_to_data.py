@@ -13,7 +13,11 @@ class ChartToDataTool(ClawTool):
     name: str = "chart_to_data"
     category: ToolCategory = ToolCategory.IMAGE
     description: str = (
-        "Parse chart or graph images into numerical time-series data using multimodal LLM."
+        "Extracts numerical data points from chart or graph images using a multimodal LLM. "
+        "Input: image file path of a chart/plot. "
+        "Output: dict with extracted 'values' array and 'axis_labels'. "
+        "Use when you only have a screenshot or photo of a plot and need to recover the underlying numeric time-series data. "
+        "Params: path (file path to chart image), chart_type (hint about chart format, e.g. 'line', 'bar')."
     )
     io_type: ToolIOType = ToolIOType.I_TO_R
     parameters_schema: dict[str, Any] = {
@@ -39,6 +43,8 @@ class ChartToDataTool(ClawTool):
             first = images[0]
             if isinstance(first, dict):
                 path = first.get("path", path)
+            elif isinstance(first, str):
+                path = first
 
         if not path:
             raise ValueError("Image path is required")

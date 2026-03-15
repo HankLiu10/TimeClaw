@@ -22,7 +22,7 @@ class SBMConfig(BaseModel):
 
     model_name: str
     model_path: str | None = None
-    device: str = "cpu"
+    device: str = "cuda"
     context_length: int = 512
     prediction_length: int = 96
     batch_size: int = 32

@@ -32,7 +32,14 @@ class SpectralDensityTool(ClawTool):
 
     name: str = "spectral_density"
     category: ToolCategory = ToolCategory.PROFILING
-    description: str = "Compute power spectral density of a time series."
+    description: str = (
+        "Compute power spectral density (PSD) of a time series using Welch's method, "
+        "revealing frequency-domain characteristics. "
+        "Returns a dict with keys: frequencies (list), psd (list of power values), "
+        "dominant_frequency, and total_power. "
+        "Use to identify dominant cycles, periodicities, or spectral structure in the data. "
+        "Key parameter: nperseg (int, default 256) — segment length for Welch's method."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",
@@ -56,7 +63,8 @@ class SpectralDensityTool(ClawTool):
 
         dominant_idx = int(np.argmax(psd))
         dominant_freq = float(freqs[dominant_idx])
-        total_power = float(np.trapezoid(psd, freqs))
+        _trapz = getattr(np, "trapezoid", None) or np.trapz
+        total_power = float(_trapz(psd, freqs))
 
         return {
             "frequencies": freqs.tolist(),

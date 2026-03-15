@@ -15,7 +15,13 @@ class TextSimilarityTool(ClawTool):
 
     name: str = "text_similarity"
     category: ToolCategory = ToolCategory.TEXT
-    description: str = "Compute cosine similarity between two text inputs."
+    description: str = (
+        "Measures semantic similarity between two text strings using cosine similarity of embeddings. "
+        "Input: two text strings. "
+        "Output: dict with 'similarity' score (0 to 1, where 1 means identical meaning). "
+        "Use when you need to compare documents, find related content, or check if two texts discuss the same topic. "
+        "Params: text_a and text_b (required, the two texts to compare), method (similarity algorithm)."
+    )
     io_type: ToolIOType = ToolIOType.T_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

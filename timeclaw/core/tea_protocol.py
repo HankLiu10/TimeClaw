@@ -99,10 +99,14 @@ class TaskEnvelope(BaseModel):
     trace_id: str = ""
 
     def with_agent(self, role: str) -> TaskEnvelope:
-        """Return a copy with a fresh agent state for the given role."""
+        """Return a shallow copy with a fresh agent state for the given role.
+
+        Shallow copy avoids pickling un-serializable objects (e.g.
+        sqlite3.Connection stored transitively via metadata closures).
+        """
         return self.model_copy(
             update={"agent_state": AgentState(agent_role=role)},
-            deep=True,
+            deep=False,
         )
 
     def update_environment(self, **kwargs: Any) -> None:

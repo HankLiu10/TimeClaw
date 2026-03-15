@@ -1,0 +1,12 @@
+{
+  "dataset": "weather_aligned_short",
+  "split_year": 2020,
+  "train_count": 1445,
+  "test_count": 514,
+  "domain": "weather",
+  "task_types": [
+    "forecast",
+    "trend",
+    "indicator"
+  ]
+}

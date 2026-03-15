@@ -18,7 +18,13 @@ class UncertaintyQuantifyTool(ClawTool):
 
     name: str = "uncertainty_quantify"
     category: ToolCategory = ToolCategory.VALIDATION
-    description: str = "Quantify prediction uncertainty using bootstrap resampling of historical residuals."
+    description: str = (
+        "Estimates confidence intervals for predictions by bootstrap resampling of historical residuals. "
+        "Input: prediction array and historical time-series array. "
+        "Output: dict with confidence intervals (lower/upper bounds) at the specified confidence level. "
+        "Use when you need to quantify how uncertain a forecast is and provide prediction bands. "
+        "Params: prediction (required), historical (required), n_bootstrap (number of resamples, default 1000), confidence (confidence level, e.g. 0.95)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

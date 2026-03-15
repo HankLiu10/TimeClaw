@@ -87,10 +87,30 @@ def get_global_registry() -> SBMRegistry:
     return _global_registry
 
 
-def auto_register() -> int:
-    """Auto-discover and register available SBM adapters."""
+def auto_register(server_url: str = "http://localhost:8100") -> int:
+    """Auto-discover and register available SBM adapters.
+
+    If the SBM HTTP server is running, registers HTTP client adapters
+    for all models served there (zero local GPU needed).  Otherwise
+    falls back to local adapters.
+    """
     count = 0
     registry = get_global_registry()
+
+    try:
+        from timeclaw.sbm.http_client import is_server_available, get_server_models
+        if is_server_available(server_url):
+            from timeclaw.sbm.http_client import SBMHttpClient
+            remote_models = get_server_models(server_url)
+            for model_name in remote_models:
+                client = SBMHttpClient(server_url=server_url, target_model=model_name)
+                registry._instances[model_name] = client
+                registry._factories[model_name] = SBMHttpClient
+                count += 1
+            logger.info(f"SBM auto-register: {count} models via HTTP server ({server_url})")
+            return count
+    except Exception as e:
+        logger.debug(f"SBM HTTP server not available: {e}")
 
     try:
         from timeclaw.sbm.chronos_adapter import ChronosAdapter, CHRONOS_DEFAULT_CONFIG
@@ -120,5 +140,5 @@ def auto_register() -> int:
     except ImportError:
         logger.debug("Timer adapter not available (missing dependencies)")
 
-    logger.info(f"SBM auto-register: {count} adapters available")
+    logger.info(f"SBM auto-register: {count} local adapters available")
     return count

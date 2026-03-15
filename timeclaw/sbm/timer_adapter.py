@@ -30,7 +30,7 @@ class TimerAdapter(SBMBase):
         SBMTask.IMPUTATION,
         SBMTask.ANOMALY,
     ]
-    requires_gpu: bool = False
+    requires_gpu: bool = True
 
     def load(self) -> None:
         try:
@@ -79,32 +79,31 @@ class TimerAdapter(SBMBase):
 
         import torch
 
-        if context.ndim == 1:
-            ctx = context.reshape(1, -1, 1)
-        elif context.ndim == 2:
-            ctx = context.reshape(1, *context.shape)
-        else:
-            ctx = context
+        flat = context.ravel() if context.ndim == 1 else context[:, 0]
+        input_token_len = getattr(self._model.config, "input_token_len", 96)
+        usable_len = (len(flat) // input_token_len) * input_token_len
+        if usable_len < input_token_len:
+            return self._naive_forecast(context, pred_len)
+        flat = flat[-usable_len:]
 
-        ctx_tensor = torch.tensor(ctx, dtype=torch.float32).to(self._device)
+        ctx_tensor = torch.tensor(flat.reshape(1, -1), dtype=torch.float32).to(self._device)
 
         with torch.no_grad():
             try:
-                output = self._model.generate(
+                output = self._model(
                     ctx_tensor,
-                    max_new_tokens=pred_len,
+                    use_cache=False,
+                    revin=True,
+                    max_output_length=pred_len,
                 )
-                if hasattr(output, "sequences"):
-                    pred = output.sequences[0, -pred_len:].cpu().numpy()
-                else:
-                    pred = output[0, -pred_len:].cpu().numpy()
-
+                logits = output.logits
+                pred = logits[0].cpu().numpy()
                 return SBMOutput(
-                    point_forecast=pred.ravel()[:pred_len],
+                    point_forecast=pred[:pred_len],
                     metadata={"model": "timer", "prediction_length": pred_len},
                 )
             except Exception as e:
-                logger.warning(f"Timer generation failed: {e}, using fallback")
+                logger.warning(f"Timer forward failed: {e}, using fallback")
                 return self._naive_forecast(context, pred_len)
 
     def _naive_forecast(self, context: np.ndarray, pred_len: int) -> SBMOutput:

@@ -20,7 +20,16 @@ class ResampleTool(ClawTool):
 
     name: str = "resample"
     category: ToolCategory = ToolCategory.PROCESSING
-    description: str = "Resample time series to a different frequency (e.g. '5min', '1H') or target length."
+    description: str = (
+        "Change the temporal resolution of a time series by resampling to a different frequency "
+        "or a target number of samples. Input: a numeric array, DataFrame, or Series. "
+        "Output: dict with keys 'data' (resampled values as list), 'original_length', and "
+        "'target_length'. Use this to align data from different sources to a common cadence, "
+        "downsample high-frequency data, or upsample sparse data before feeding into models "
+        "that require fixed-length input. "
+        "Parameters: freq (str, e.g. '5min', '1H', '1D' — for datetime-indexed pandas data) "
+        "or target_length (int — for numeric resampling via scipy)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

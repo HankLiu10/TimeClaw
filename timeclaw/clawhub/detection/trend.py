@@ -19,7 +19,14 @@ class DetectTrendTool(ClawTool):
 
     name: str = "detect_trend"
     category: ToolCategory = ToolCategory.DETECTION
-    description: str = "Detect trend direction using linear regression slope. Returns direction (up/down/flat), slope, and p-value."
+    description: str = (
+        "Detect trend direction in a time series using linear regression slope and statistical significance. "
+        "Input: 1D numeric array or array-like. "
+        "Output: dict with 'direction' ('up', 'down', or 'flat'), 'slope' (float), and 'p_value' (float). "
+        "Direction is 'flat' when p_value > 0.05 (not statistically significant). "
+        "Use to determine if the data has a significant upward or downward tendency before choosing a model. "
+        "No required parameters."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_C
     parameters_schema: dict[str, Any] = {
         "type": "object",

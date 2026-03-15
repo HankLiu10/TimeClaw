@@ -31,7 +31,16 @@ class GrangerCausalityTool(ClawTool):
 
     name: str = "granger_causality"
     category: ToolCategory = ToolCategory.RELATION
-    description: str = "Test Granger causality between time series channels."
+    description: str = (
+        "Test Granger causality between two time series channels — whether past values of one "
+        "channel significantly improve predictions of the other beyond its own past (directional "
+        "predictive relationship). Input: multivariate time series with at least 2 channels "
+        "(tests the first two columns). Output: dict with 'results' (list of per-lag dicts "
+        "containing 'lag', 'f_statistic', and 'p_value'), 'significant_lags' (lags where "
+        "p < 0.05), and 'max_lag'. Use when you need to establish whether one variable "
+        "predictively leads another, e.g., determining if economic indicator X forecasts "
+        "variable Y. Key param: max_lag (int, default 4) — maximum number of lags to test."
+    )
     io_type: ToolIOType = ToolIOType.XK_TO_C
     parameters_schema: dict[str, Any] = {
         "type": "object",

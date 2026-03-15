@@ -19,7 +19,17 @@ class CorrelationMatrixTool(ClawTool):
 
     name: str = "correlation_matrix"
     category: ToolCategory = ToolCategory.RELATION
-    description: str = "Compute correlation matrix between channels (pearson, spearman, or kendall)."
+    description: str = (
+        "Compute a pairwise correlation matrix between multivariate time series channels "
+        "using Pearson (linear), Spearman (rank-based monotonic), or Kendall (rank-based "
+        "concordance) methods. Input: multivariate time series with at least 2 channels "
+        "(DataFrame or 2-D array). Output: dict with 'matrix' (correlation values), "
+        "'columns' (channel names), and 'method'. Use when you need to quantify linear or "
+        "monotonic association between channels, identify highly correlated or independent "
+        "variables, or build a dependency overview. For nonlinear dependence, use "
+        "mutual_information instead. Key param: method (str, required) — one of 'pearson', "
+        "'spearman', or 'kendall'."
+    )
     io_type: ToolIOType = ToolIOType.XK_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

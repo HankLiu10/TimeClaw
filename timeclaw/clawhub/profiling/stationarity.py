@@ -15,7 +15,11 @@ class StationarityTool(ClawTool):
     description = (
         "Run stationarity tests on a time series. Supports Augmented Dickey-Fuller (ADF) "
         "and KPSS tests. ADF null hypothesis: series has a unit root (non-stationary). "
-        "KPSS null hypothesis: series is stationary."
+        "KPSS null hypothesis: series is stationary. "
+        "Returns a dict with test statistics, p-values, critical values, and a stationarity "
+        "conclusion ('stationary', 'non_stationary', 'trend_stationary', or 'difference_stationary'). "
+        "Use to determine if differencing or detrending is needed before applying ARIMA or other "
+        "stationary-assumption models. Key parameter: test ('adf', 'kpss', or 'both', default 'both')."
     )
     io_type = ToolIOType.X_TO_R
     parameters_schema = {

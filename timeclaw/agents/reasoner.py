@@ -48,6 +48,7 @@ class ReasonerAgent(AgentBase):
             "modalities": modalities,
             "is_multimodal": len(modalities) > 1,
             "per_modality_results": self.per_modality_results,
+            "soul_prompt": envelope.task.metadata.get("soul_prompt", ""),
         }
 
     async def plan(self, perception: dict[str, Any]) -> dict[str, Any]:
@@ -109,25 +110,50 @@ class ReasonerAgent(AgentBase):
                     reanalyze_request = reanalyze_decision
                     logger.info(
                         f"[Reasoner] LLM requests re-analysis: "
-                        f"{reanalyze_decision.get('reasoning', '')[:100]}"
+                        f"{reanalyze_decision.get('reasoning', '')[:2000]}"
                     )
 
             # Step 3: LLM synthesizes final answer from all modality evidence
-            synthesized = await self._synthesize_answer(pmr, envelope)
-            trace.agent_step("reasoner", "synthesis", synthesized)
-            if synthesized.get("answer") is not None:
-                prediction = synthesized["answer"]
+            #
+            # If the executor already produced a structured dict from an
+            # LLM-based tool (e.g. llm_indicator), pass it through directly
+            # to avoid degrading precision via re-synthesis.
+            ts_pred = pmr.get("timeseries", {}).get("prediction")
+            ts_exec_log = pmr.get("timeseries", {}).get("execution_log", [])
+            last_tool = ts_exec_log[-1].get("tool", "") if ts_exec_log else ""
+            skip_synthesis = (
+                isinstance(ts_pred, dict)
+                and last_tool in ("llm_indicator",)
+                and len(ts_pred) > 0
+            )
+
+            if skip_synthesis:
+                prediction = ts_pred
                 checks_results.append({
                     "name": "llm_synthesis",
                     "passed": True,
-                    "details": f"LLM synthesized answer from {len(pmr)} modalities "
-                               f"(confidence={synthesized.get('confidence', '?')})",
+                    "details": f"Structured dict from {last_tool} — passthrough (no re-synthesis)",
                 })
-                fusion_report["synthesized_answer"] = synthesized
+                fusion_report["synthesized_answer"] = {
+                    "answer": ts_pred, "confidence": 0.8,
+                    "reasoning": "Direct passthrough of executor indicator dict",
+                }
             else:
-                fused_pred = fusion_report.get("prediction")
-                if fused_pred is not None:
-                    prediction = fused_pred
+                synthesized = await self._synthesize_answer(pmr, envelope)
+                trace.agent_step("reasoner", "synthesis", synthesized)
+                if synthesized.get("answer") is not None:
+                    prediction = synthesized["answer"]
+                    checks_results.append({
+                        "name": "llm_synthesis",
+                        "passed": True,
+                        "details": f"LLM synthesized answer from {len(pmr)} modalities "
+                                   f"(confidence={synthesized.get('confidence', '?')})",
+                    })
+                    fusion_report["synthesized_answer"] = synthesized
+                else:
+                    fused_pred = fusion_report.get("prediction")
+                    if fused_pred is not None:
+                        prediction = fused_pred
 
         # Step 4: Quality gate checks
         gate_result = self.quality_gate.check(
@@ -180,7 +206,7 @@ class ReasonerAgent(AgentBase):
             "gate_accepted": final_accepted,
             "checks": checks_results,
             "corrections": corrections,
-            "prediction_preview": str(prediction)[:500] if prediction is not None else None,
+            "prediction_preview": str(prediction)[:5000] if prediction is not None else None,
             "reanalyze_requested": reanalyze_request is not None,
         })
         return act_result
@@ -263,11 +289,11 @@ class ReasonerAgent(AgentBase):
         text_data = envelope.environment.text_data
         text_block = ""
         if text_data:
-            for td in text_data[:5]:
+            for td in text_data[:10]:
                 src = td.get("source", "?")
                 ts = td.get("timestamp", "?")
                 content = td.get("content", td.get("text", ""))
-                text_block += f"  [{src}, timestamp={ts}]: {str(content)[:500]}\n"
+                text_block += f"  [{src}, timestamp={ts}]: {str(content)[:5000]}\n"
 
         try:
             messages = [
@@ -282,9 +308,9 @@ class ReasonerAgent(AgentBase):
                         "Your job is to:\n"
                         "A. For each event described in the text, examine the time-series data "
                         "to determine whether the event's impact is ALREADY VISIBLE in the data. "
-                        "For example, if text says 'temperature will drop 8 degrees' and the "
-                        "recent data already shows a drop from 22 to 15, then the event has "
-                        "already occurred and is captured in the data.\n"
+                        "If the text describes an upcoming change and the recent data already "
+                        "shows that change, then the event has already occurred and is captured "
+                        "in the data.\n"
                         "B. Assess whether the modality conclusions are consistent.\n\n"
                         "Return JSON:\n"
                         "{\n"
@@ -301,7 +327,7 @@ class ReasonerAgent(AgentBase):
                     "role": "user",
                     "content": (
                         f"Task: {envelope.task.task_type}\n"
-                        f"Task description: {envelope.task.description[:500]}\n\n"
+                        f"Task description: {envelope.task.description[:5000]}\n\n"
                         f"=== TIME-SERIES DATA (recent values) ===\n{ts_tail}\n\n"
                         f"=== ORIGINAL TEXT DATA ===\n{text_block}\n"
                         f"=== PER-MODALITY RESULTS ===\n" + "\n".join(summaries)
@@ -365,7 +391,7 @@ class ReasonerAgent(AgentBase):
                     "role": "user",
                     "content": (
                         f"Task: {envelope.task.task_type}\n"
-                        f"Description: {envelope.task.description[:300]}\n\n"
+                        f"Description: {envelope.task.description[:5000]}\n\n"
                         f"Conflicts found:\n{cross_modal_result.get('details', '')}\n"
                         f"Conflict reasoning: {cross_modal_result.get('reasoning', '')}\n\n"
                         f"Per-modality results:\n" + "\n".join(summaries)
@@ -380,6 +406,23 @@ class ReasonerAgent(AgentBase):
 
     # ── LLM Synthesis ──
 
+    @staticmethod
+    def _fmt_raw_ts(data: Any) -> str:
+        """Format raw time-series data for injection into synthesis prompt."""
+        try:
+            arr = np.asarray(data, dtype=np.float64).ravel()
+            arr = arr[~np.isnan(arr)]
+            if len(arr) == 0:
+                return "(no numeric data)"
+            vals = ", ".join(f"{v:.2f}" for v in arr)
+            return (
+                f"Length: {len(arr)} steps, range: [{float(arr.min()):.2f}, "
+                f"{float(arr.max()):.2f}], mean: {float(arr.mean()):.2f}\n"
+                f"Values: [{vals}]"
+            )
+        except (ValueError, TypeError):
+            return "(non-numeric data)"
+
     async def _synthesize_answer(
         self,
         per_modality_results: dict[str, dict[str, Any]],
@@ -387,22 +430,38 @@ class ReasonerAgent(AgentBase):
     ) -> dict[str, Any]:
         """LLM synthesizes a final answer by combining all modality evidence.
 
-        Uses the event_assessment from cross-modal check (stored in
-        ``self._last_event_assessment``) so the synthesis LLM knows which
-        text events are already reflected in the data and which are not.
+        Receives the complete raw time-series data, domain context, full text,
+        and the event_assessment from cross-modal check so the synthesis LLM
+        can make well-informed decisions.
         """
         summaries = self._build_modality_summaries(per_modality_results, detailed=True)
 
         task_type = envelope.task.task_type
         description = envelope.task.description
         text_data = envelope.environment.text_data
+        domain = envelope.task.metadata.get("domain", "")
+
+        raw_ts_block = ""
+        if envelope.environment.data is not None:
+            raw_ts_block = (
+                "\n=== RAW TIME-SERIES DATA ===\n"
+                + self._fmt_raw_ts(envelope.environment.data)
+                + "\n"
+            )
+
+        domain_block = ""
+        if domain:
+            from timeclaw.clawhub.prediction.llm_indicator import _DOMAIN_CONTEXT
+            ctx = _DOMAIN_CONTEXT.get(domain, "")
+            if ctx:
+                domain_block = f"\n=== DOMAIN CONTEXT ({domain}) ===\n{ctx}\n"
 
         text_context = ""
         if text_data:
-            for td in text_data[:5]:
+            for td in text_data[:10]:
                 content = td.get("content", td.get("text", ""))
                 source = td.get("source", "unknown")
-                text_context += f"\n[{source}]: {str(content)[:2000]}\n"
+                text_context += f"\n[{source}]: {str(content)[:10000]}\n"
 
         assessment_block = ""
         if self._last_event_assessment:
@@ -418,6 +477,9 @@ class ReasonerAgent(AgentBase):
                 "values. Trust it when deciding whether to adjust the forecast.\n"
             )
 
+        soul_block_text = envelope.task.metadata.get("soul_prompt", "")
+        l3_block = f"\n\n{soul_block_text}" if soul_block_text else ""
+
         try:
             messages = [
                 {
@@ -427,6 +489,8 @@ class ReasonerAgent(AgentBase):
                         "the definitive answer by combining evidence from all modality-specialized "
                         "executor branches.\n\n"
                         "You have access to:\n"
+                        "- The COMPLETE raw time-series data (all values)\n"
+                        "- Domain-specific context\n"
                         "- Time-series analysis results (statistics, trends, forecasts, anomalies)\n"
                         "- Text analysis results (sentiment, keywords, events, summaries)\n"
                         "- The original text data (news, reports, questions)\n"
@@ -435,19 +499,21 @@ class ReasonerAgent(AgentBase):
                         "IMPORTANT: If the event verification says an event is 'ALREADY IN DATA', "
                         "do NOT apply its impact again — the forecast already accounts for it. "
                         "Only adjust the forecast for events marked 'NOT YET IN DATA'.\n\n"
-                        "For FORECAST tasks: produce the final numerical prediction.\n"
-                        "For QA/MCQA tasks: reason through the evidence and produce the answer.\n"
-                        "For CLASSIFICATION tasks: produce the class label.\n\n"
+                        "Read the task description carefully to understand what output is expected, "
+                        "then produce the most accurate answer based on all available evidence.\n\n"
                         "Return JSON:\n"
                         '{"answer": <your answer>, "confidence": float 0-1, '
                         '"reasoning": "step-by-step explanation of how you combined evidence"}'
+                        + l3_block
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
                         f"Task type: {task_type}\n"
-                        f"Task description: {description[:1000]}\n\n"
+                        f"Task description: {description[:5000]}\n"
+                        f"{domain_block}"
+                        f"{raw_ts_block}\n"
                         f"=== MODALITY EVIDENCE ===\n" + "\n".join(summaries) + "\n\n"
                         f"=== ORIGINAL TEXT DATA ==={text_context}\n"
                         f"{assessment_block}\n"
@@ -458,7 +524,7 @@ class ReasonerAgent(AgentBase):
             response = await self.llm.complete(messages, response_format="json")
             parsed = response.parsed or {}
             logger.info(
-                f"[Reasoner] LLM synthesis: answer={str(parsed.get('answer', ''))[:100]}, "
+                f"[Reasoner] LLM synthesis: answer={str(parsed.get('answer', ''))[:2000]}, "
                 f"confidence={parsed.get('confidence', '?')}"
             )
             return parsed
@@ -471,7 +537,11 @@ class ReasonerAgent(AgentBase):
         per_modality_results: dict[str, dict[str, Any]],
         detailed: bool = False,
     ) -> list[str]:
-        """Build human-readable summaries of per-modality results."""
+        """Build human-readable summaries of per-modality results.
+
+        Uses generous limits so the synthesis LLM receives enough
+        information to make well-informed decisions.
+        """
         summaries = []
         for modality, result in per_modality_results.items():
             pred = result.get("prediction")
@@ -484,16 +554,34 @@ class ReasonerAgent(AgentBase):
             for entry in log:
                 tool = entry.get("tool", "?")
                 ok = entry.get("success", False)
-                summary = (entry.get("result_summary") or "")[:300]
+                summary = (entry.get("result_summary") or "")[:50000]
                 lines.append(f"  - {tool}: {'OK' if ok else 'FAIL'} → {summary}")
 
             if detailed:
-                lines.append(f"  Prediction: {str(pred)[:500]}")
+                pred_str = self._format_prediction(pred)
+                lines.append(f"  Prediction: {pred_str}")
                 if method:
-                    lines.append(f"  Method: {method[:200]}")
+                    lines.append(f"  Method: {method[:5000]}")
 
             summaries.append("\n".join(lines))
         return summaries
+
+    @staticmethod
+    def _format_prediction(pred: Any) -> str:
+        """Format a prediction for the synthesis prompt without aggressive truncation."""
+        if pred is None:
+            return "None"
+        if isinstance(pred, np.ndarray):
+            flat = pred.ravel()
+            return "[" + ", ".join(f"{v:.4f}" for v in flat) + "]"
+        if isinstance(pred, list):
+            try:
+                arr = np.asarray(pred, dtype=np.float64).ravel()
+                return "[" + ", ".join(f"{v:.4f}" for v in arr) + "]"
+            except (ValueError, TypeError):
+                pass
+        s = str(pred)
+        return s[:50000] if len(s) > 50000 else s
 
     # ── Standard Checks ──
 
@@ -568,7 +656,7 @@ class ReasonerAgent(AgentBase):
         checks: list[dict[str, Any]],
     ) -> dict[str, Any]:
         try:
-            pred_str = str(prediction)[:500]
+            pred_str = str(prediction)[:5000]
             hist_data = envelope.environment.data
             hist_summary = ""
             try:
@@ -590,7 +678,7 @@ class ReasonerAgent(AgentBase):
                         f"Task: {envelope.task.task_type}\n"
                         f"Prediction: {pred_str}\n"
                         f"{hist_summary}\n"
-                        f"Check results: {str(checks)[:2000]}\n"
+                        f"Check results: {str(checks)[:10000]}\n"
                         f"Constraints: {str(envelope.task.constraints)}\n\n"
                         "Is this prediction acceptable? Return JSON with 'accepted' (bool) and 'reasoning'."
                     ),

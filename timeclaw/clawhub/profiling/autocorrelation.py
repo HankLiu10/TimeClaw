@@ -14,7 +14,10 @@ class AutocorrelationTool(ClawTool):
     category = ToolCategory.PROFILING
     description = (
         "Compute autocorrelation function (ACF) and/or partial autocorrelation function (PACF) "
-        "at specified lags. Useful for identifying temporal dependencies and model order selection."
+        "at specified lags. Useful for identifying temporal dependencies and model order selection. "
+        "Returns a dict with lag values and correlation coefficients (keys: acf, acf_lags, pacf, pacf_lags). "
+        "Use to identify AR/MA order for ARIMA modeling or to detect periodicity in the series. "
+        "Key parameters: max_lag (int, default 20), mode ('acf', 'pacf', or 'both', default 'both')."
     )
     io_type = ToolIOType.X_TO_R
     parameters_schema = {

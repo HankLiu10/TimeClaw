@@ -18,7 +18,16 @@ class CheckpointForecastTool(ClawTool):
 
     name: str = "checkpoint_forecast"
     category: ToolCategory = ToolCategory.PREDICTION
-    description: str = "Forecast using a domain-specific saved model checkpoint."
+    description: str = (
+        "Forecast a time series by loading and running a previously trained model checkpoint from disk. "
+        "Supports PyTorch (.pt/.pth), ONNX (.onnx), and pickle (.pkl) checkpoint formats. "
+        "Input: 1-D or 2-D numeric array as context, plus a valid checkpoint file path. "
+        "Output: dict with 'point_forecast' (array of predicted values), 'horizon', 'model', and 'checkpoint'. "
+        "Use when a custom-trained model has been saved and you want to run inference with it "
+        "rather than using a general-purpose forecasting method. "
+        "Key params: 'checkpoint_path' (required, path to saved model); 'horizon' — steps ahead (default 96); "
+        "'model_type' — format hint ('pytorch', 'onnx', 'pickle', or 'auto' to detect from extension)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

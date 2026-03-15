@@ -22,10 +22,10 @@ class ContextManager:
 
     def __init__(
         self,
-        max_tokens: int = 8000,
-        reserve_tokens: int = 2000,
+        max_tokens: int = 200000,
+        reserve_tokens: int = 50000,
         compaction_threshold: float = 0.8,
-        prune_observation_chars: int = 200,
+        prune_observation_chars: int = 5000,
     ):
         self.max_tokens = max_tokens
         self.reserve_tokens = reserve_tokens
@@ -120,7 +120,7 @@ class ContextManager:
                     "Keep it under 500 words. Output plain text, not JSON."
                 ),
             },
-            {"role": "user", "content": summary[:12000]},
+            {"role": "user", "content": summary[:100000]},
         ]
 
         try:
@@ -149,7 +149,7 @@ class ContextManager:
             desc = t.get("description", "")
             category = t.get("category", "")
 
-            short = {"name": name, "description": desc[:100], "category": category}
+            short = {"name": name, "description": desc[:500], "category": category}
             short_tokens = self.estimate_tokens(str(short))
 
             if current_tokens + short_tokens > budget:

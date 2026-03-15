@@ -30,7 +30,17 @@ class DTWDistanceTool(ClawTool):
 
     name: str = "dtw_distance"
     category: ToolCategory = ToolCategory.RELATION
-    description: str = "Compute dynamic time warping (DTW) distance between channels."
+    description: str = (
+        "Compute the Dynamic Time Warping (DTW) distance between two time series channels, "
+        "measuring shape-based similarity that is robust to time shifts, stretching, and "
+        "compression. Unlike Euclidean distance, DTW aligns sequences non-linearly to find "
+        "the optimal match. Input: multivariate time series with at least 2 channels (uses "
+        "the first two columns). Output: dict with 'distance' (total DTW cost), "
+        "'normalized_distance' (cost divided by warping path length), and 'path_length'. "
+        "Use when you need to compare time series that may be misaligned in time, have "
+        "different speeds, or when shape similarity matters more than point-to-point matching. "
+        "No required parameters."
+    )
     io_type: ToolIOType = ToolIOType.XK_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

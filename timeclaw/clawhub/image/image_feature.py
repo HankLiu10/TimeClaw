@@ -15,7 +15,11 @@ class ImageFeatureTool(ClawTool):
     name: str = "image_feature"
     category: ToolCategory = ToolCategory.IMAGE
     description: str = (
-        "Describe image content and extract visual features using a multimodal LLM."
+        "Uses a vision-language model to describe what is in an image and extract semantic visual features. "
+        "Input: image file path. "
+        "Output: dict with 'description' text and 'features' list. "
+        "Use when you need to understand image content in context with time-series data, e.g. interpreting visual conditions or scenes. "
+        "Params: path (file path to image), prompt (optional guidance for the model on what to look for)."
     )
     io_type: ToolIOType = ToolIOType.I_TO_R
     parameters_schema: dict[str, Any] = {
@@ -40,6 +44,8 @@ class ImageFeatureTool(ClawTool):
             first = images[0]
             if isinstance(first, dict):
                 path = first.get("path", path)
+            elif isinstance(first, str):
+                path = first
 
         if not path:
             raise ValueError("Image path is required")

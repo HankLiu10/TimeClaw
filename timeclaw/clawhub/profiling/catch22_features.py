@@ -32,7 +32,13 @@ class Catch22Tool(ClawTool):
 
     name: str = "catch22_features"
     category: ToolCategory = ToolCategory.PROFILING
-    description: str = "Extract the catch22 feature set from a time series."
+    description: str = (
+        "Extract the catch22 set of 22 canonical time-series features covering autocorrelation, "
+        "stationarity, distribution shape, and nonlinear dynamics. "
+        "Returns a dict with keys: features (dict of 22 feature name-value pairs) and count (22). "
+        "Use for compact time-series fingerprinting, classification, or as input to downstream ML models. "
+        "No parameters required."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

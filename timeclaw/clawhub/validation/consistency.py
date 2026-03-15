@@ -18,7 +18,13 @@ class ConsistencyCheckTool(ClawTool):
 
     name: str = "consistency_check"
     category: ToolCategory = ToolCategory.VALIDATION
-    description: str = "Check consistency of predictions against historical time series data."
+    description: str = (
+        "Verifies that predictions are statistically consistent with historical data by checking continuity, value range, and trend alignment. "
+        "Input: prediction array and historical time-series array. "
+        "Output: dict with 'passed' boolean and consistency metrics (e.g. range overlap, trend agreement). "
+        "Use after generating predictions to ensure they are plausible given the observed history. "
+        "Params: prediction (required, forecast values), historical (required, past time-series values)."
+    )
     io_type: ToolIOType = ToolIOType.XP_TO_ACCEPT
     parameters_schema: dict[str, Any] = {
         "type": "object",

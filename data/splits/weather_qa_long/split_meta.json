@@ -1,0 +1,11 @@
+{
+  "dataset": "weather_qa_long",
+  "split_year": 2020,
+  "train_count": 537,
+  "test_count": 191,
+  "domain": "weather",
+  "task_types": [
+    "forecast",
+    "mcqa"
+  ]
+}

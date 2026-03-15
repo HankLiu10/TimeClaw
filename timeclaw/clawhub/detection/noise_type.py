@@ -40,7 +40,16 @@ class ClassifyNoiseTypeTool(ClawTool):
 
     name: str = "classify_noise_type"
     category: ToolCategory = ToolCategory.DETECTION
-    description: str = "Classify noise type (white/red/pink) in time series."
+    description: str = (
+        "Classify the noise type of a time series by analyzing its spectral slope in log-log space. "
+        "White noise (~0 slope) indicates independent random values; pink noise (~-1 slope, 1/f) shows "
+        "long-range correlations; brown/red noise (~-2 slope) is autocorrelated and slow-varying. "
+        "Input: 1D numeric array, Series, or single-column DataFrame. "
+        "Output: dict with 'noise_type' ('white', 'pink', or 'brown'), 'spectral_slope' (float), "
+        "and 'r_squared' (goodness of fit). "
+        "Use to understand the underlying stochastic process or to select appropriate models and filters. "
+        "No required parameters."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_C
     parameters_schema: dict[str, Any] = {
         "type": "object",

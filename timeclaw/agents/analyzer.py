@@ -96,7 +96,7 @@ class AnalyzerAgent(AgentBase):
                         "trace_id": exp.trace_id,
                         "tool_chain": exp.tool_chain,
                         "quality_gate_passed": exp.quality_gate_passed,
-                        "prediction_summary": exp.prediction_summary[:200],
+                        "prediction_summary": exp.prediction_summary[:2000],
                     })
                 if similar_experiences:
                     logger.info(f"[Analyzer] Found {len(similar_experiences)} similar past experiences")
@@ -166,11 +166,11 @@ class AnalyzerAgent(AgentBase):
         if "text" in modalities:
             text_tools = {k: v for k, v in tool_results.items()
                           if k in self.TEXT_PROFILING_TOOLS}
-            modality_ctx += f"\nText analysis results: {str(text_tools)[:1000]}"
+            modality_ctx += f"\nText analysis results: {str(text_tools)[:10000]}"
         if "image" in modalities:
             img_tools = {k: v for k, v in tool_results.items()
                          if k in self.IMAGE_PROFILING_TOOLS}
-            modality_ctx += f"\nImage analysis results: {str(img_tools)[:1000]}"
+            modality_ctx += f"\nImage analysis results: {str(img_tools)[:10000]}"
 
         messages = [
             {"role": "system", "content": system_prompt + modality_ctx},
@@ -180,7 +180,7 @@ class AnalyzerAgent(AgentBase):
                     task_type="analysis",
                     data_shape=perception.get("data_shape", "unknown"),
                     columns="unknown",
-                    tool_results=str(tool_results)[:3000],
+                    tool_results=str(tool_results)[:50000],
                 ),
             },
         ]
@@ -192,7 +192,7 @@ class AnalyzerAgent(AgentBase):
             "diagnosis": diagnosis,
             "fingerprint": fingerprint,
             "tool_results": tool_results,
-            "suggested_strategy": perception.get("suggested_strategy", "arima_forecast"),
+            "suggested_strategy": perception.get("suggested_strategy", "auto"),
             "modalities": modalities,
             "similar_experiences": perception.get("similar_experiences", []),
         }

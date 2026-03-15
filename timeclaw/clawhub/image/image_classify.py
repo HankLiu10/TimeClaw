@@ -12,7 +12,13 @@ class ImageClassifyTool(ClawTool):
 
     name: str = "image_classify"
     category: ToolCategory = ToolCategory.IMAGE
-    description: str = "Classify an image into predefined categories using multimodal LLM."
+    description: str = (
+        "Assigns an image to one of the provided categories using a vision-language model. "
+        "Input: image file path and a list of candidate categories. "
+        "Output: dict with predicted 'category' and 'confidence' score. "
+        "Use when you need to categorize visual patterns, conditions, or image types from a known set of labels. "
+        "Params: path (file path to image), categories (list of category labels to classify into)."
+    )
     io_type: ToolIOType = ToolIOType.I_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",
@@ -37,6 +43,8 @@ class ImageClassifyTool(ClawTool):
             first = images[0]
             if isinstance(first, dict):
                 path = first.get("path", path)
+            elif isinstance(first, str):
+                path = first
 
         if not path:
             raise ValueError("Image path is required")

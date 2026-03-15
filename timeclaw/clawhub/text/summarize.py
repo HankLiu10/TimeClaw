@@ -13,7 +13,13 @@ class SummarizeTool(ClawTool):
 
     name: str = "summarize"
     category: ToolCategory = ToolCategory.TEXT
-    description: str = "Generate a concise summary of input text."
+    description: str = (
+        "Condenses text documents into key points using an LLM. "
+        "Input: text data (string or list of text dicts). "
+        "Output: dict with 'summary' string. "
+        "Use when you need to reduce long documents before passing to other tools or to distill key findings. "
+        "Params: max_sentences (int, controls summary length), model ('light' for fast/short text, 'heavy' for accurate/long text)."
+    )
     io_type: ToolIOType = ToolIOType.T_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

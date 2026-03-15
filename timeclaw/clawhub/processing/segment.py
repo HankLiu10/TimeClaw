@@ -32,7 +32,16 @@ class SegmentTool(ClawTool):
 
     name: str = "segment"
     category: ToolCategory = ToolCategory.PROCESSING
-    description: str = "Segment time series into fixed-size windows using a sliding window approach."
+    description: str = (
+        "Segment a time series into fixed-size windows using a sliding-window approach, "
+        "producing overlapping or non-overlapping sub-arrays. "
+        "Input: a 1-D numeric array (or DataFrame/Series flattened to 1-D). "
+        "Output: dict with 'segments' (list of sub-arrays as lists), 'num_segments', "
+        "'window_size', and 'step_size'. Use this for batch analysis, pattern mining, or "
+        "preparing fixed-length input chunks for models that require uniform-length sequences. "
+        "Parameters: window_size (int, default 100), step_size (int, default 50 — set equal "
+        "to window_size for non-overlapping segments)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

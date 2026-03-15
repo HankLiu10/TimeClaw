@@ -11,7 +11,7 @@ from timeclaw.sbm.base import SBMBase, SBMConfig, SBMOutput, SBMTask
 
 CHRONOS_DEFAULT_CONFIG = SBMConfig(
     model_name="chronos",
-    model_path="amazon/chronos-t5-small",
+    model_path="amazon/chronos-t5-large",
     context_length=512,
     prediction_length=64,
     num_samples=20,
@@ -27,7 +27,7 @@ class ChronosAdapter(SBMBase):
 
     name: str = "chronos"
     supported_tasks: list[SBMTask] = [SBMTask.FORECAST]
-    requires_gpu: bool = False
+    requires_gpu: bool = True
 
     def load(self) -> None:
         try:
@@ -43,7 +43,7 @@ class ChronosAdapter(SBMBase):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        model_path = self.config.model_path or "amazon/chronos-t5-small"
+        model_path = self.config.model_path or "amazon/chronos-t5-large"
         logger.info(f"Loading Chronos from {model_path} on {device}")
 
         self._model = ChronosPipeline.from_pretrained(

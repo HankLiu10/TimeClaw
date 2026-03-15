@@ -40,7 +40,14 @@ class DistributionFitTool(ClawTool):
 
     name: str = "distribution_fit"
     category: ToolCategory = ToolCategory.PROFILING
-    description: str = "Fit statistical distributions (e.g. normal, exponential) to time series."
+    description: str = (
+        "Test which probability distribution best fits the data values of a time series. "
+        "Candidates: normal, exponential, lognormal, gamma, uniform. "
+        "Returns a dict with keys: best_fit (distribution name), best_p_value (float), "
+        "and fits (list of dicts each with name, params, ks_statistic, p_value). "
+        "Use to characterize the statistical distribution of observations, e.g. for anomaly detection "
+        "thresholds or simulation. No parameters required."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

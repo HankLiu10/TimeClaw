@@ -31,7 +31,15 @@ class HurstExponentTool(ClawTool):
 
     name: str = "hurst_exponent"
     category: ToolCategory = ToolCategory.PROFILING
-    description: str = "Compute Hurst exponent for long-range dependence in time series."
+    description: str = (
+        "Compute the Hurst exponent to assess long-range dependence in a time series. "
+        "H < 0.5 indicates mean-reverting behavior, H ≈ 0.5 indicates a random walk, "
+        "H > 0.5 indicates trending/persistent behavior. "
+        "Returns a dict with keys: hurst (float) and interpretation (str: 'mean-reverting', "
+        "'random walk', or 'trending'). "
+        "Use to determine if a series has memory or persistence, which informs model selection. "
+        "Requires at least 20 data points. No parameters required."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

@@ -32,7 +32,15 @@ class DetectChangepointTool(ClawTool):
 
     name: str = "detect_changepoint"
     category: ToolCategory = ToolCategory.DETECTION
-    description: str = "Detect changepoints in time series."
+    description: str = (
+        "Detect changepoints in time series using the PELT (Pruned Exact Linear Time) algorithm. "
+        "Input: 1D numeric array, Series, or single-column DataFrame. "
+        "Output: dict with 'changepoints' (list of integer indices where regime changes occur), "
+        "'n_changepoints' (count), and 'penalty' used. "
+        "Use when you need to identify structural breaks or regime transitions in the data. "
+        "Param 'penalty' (float, default 10): controls sensitivity — lower values detect more changepoints, "
+        "higher values yield fewer, more significant ones."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_C
     parameters_schema: dict[str, Any] = {
         "type": "object",

@@ -1,0 +1,11 @@
+{
+  "dataset": "finance_qa_short",
+  "split_year": 2023,
+  "train_count": 341,
+  "test_count": 150,
+  "domain": "finance",
+  "task_types": [
+    "mcqa",
+    "correlation"
+  ]
+}

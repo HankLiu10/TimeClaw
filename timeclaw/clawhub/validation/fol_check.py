@@ -18,7 +18,13 @@ class FOLCheckTool(ClawTool):
 
     name: str = "fol_check"
     category: ToolCategory = ToolCategory.VALIDATION
-    description: str = "Check first-order logic constraints on time series or predictions."
+    description: str = (
+        "Validates predictions against formal first-order logic constraints such as monotonicity, bounds, and custom rules. "
+        "Input: prediction array and a set of constraint definitions. "
+        "Output: dict with 'passed' boolean and list of 'violations' describing which constraints were broken. "
+        "Use when predictions must satisfy domain-specific logical invariants beyond simple range checks. "
+        "Params: prediction (required, the values to validate), constraints (required, list of FOL constraint definitions)."
+    )
     io_type: ToolIOType = ToolIOType.XP_TO_ACCEPT
     parameters_schema: dict[str, Any] = {
         "type": "object",

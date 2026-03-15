@@ -18,7 +18,15 @@ class DetectAnomalyTool(ClawTool):
 
     name: str = "detect_anomaly"
     category: ToolCategory = ToolCategory.DETECTION
-    description: str = "Detect anomalies using z-score method. Returns list of anomaly indices."
+    description: str = (
+        "Detect anomalies in a time series using the z-score method. "
+        "Identifies data points that deviate significantly from the mean. "
+        "Input: 1D numeric array or array-like. "
+        "Output: dict with 'anomaly_indices' (list of int positions), 'count' (number of anomalies), "
+        "and 'threshold' used. "
+        "Use for finding outliers, unusual events, or data quality issues before further analysis. "
+        "Param 'threshold' (float, default 3.0): z-score cutoff — lower values flag more points as anomalous."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_C
     parameters_schema: dict[str, Any] = {
         "type": "object",

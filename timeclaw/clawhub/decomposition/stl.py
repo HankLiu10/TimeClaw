@@ -19,7 +19,17 @@ class STLDecomposeTool(ClawTool):
 
     name: str = "stl_decompose"
     category: ToolCategory = ToolCategory.DECOMPOSITION
-    description: str = "Decompose time series into trend, seasonal, and residual components using STL."
+    description: str = (
+        "Decompose a time series into trend, seasonal, and residual components using STL "
+        "(Seasonal-Trend decomposition using LOESS). Requires a known seasonal period; run "
+        "detect_seasonality first if the period is unknown. Input: univariate or multivariate "
+        "time series array/DataFrame. Output: dict with 'trend', 'seasonal', and 'residual' "
+        "arrays (or a list of such dicts per channel for multivariate input). Use when you need "
+        "to isolate a long-term trend from periodic fluctuations, remove seasonality before "
+        "modeling, or examine residuals for anomalies. Key param: period (int, required) — the "
+        "number of observations per seasonal cycle (e.g., 12 for monthly data with yearly "
+        "seasonality)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

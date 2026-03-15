@@ -14,7 +14,13 @@ class TemporalAlignImageTool(ClawTool):
 
     name: str = "temporal_align_image"
     category: ToolCategory = ToolCategory.IMAGE
-    description: str = "Align images by timestamp to corresponding time-series windows."
+    description: str = (
+        "Maps images with timestamps to specific time windows in a time-series. "
+        "Input: requires both image data (with timestamps) and time-series data in context. "
+        "Output: dict with aligned image-to-window mappings showing which image corresponds to which time window. "
+        "Use when you need to associate timestamped images (e.g. satellite, surveillance, medical) with matching time-series segments. "
+        "Params: window_size (duration of each alignment window), strategy (alignment method)."
+    )
     io_type: ToolIOType = ToolIOType.IX_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

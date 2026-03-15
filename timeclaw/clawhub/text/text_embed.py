@@ -13,7 +13,11 @@ class TextEmbedTool(ClawTool):
     name: str = "text_embed"
     category: ToolCategory = ToolCategory.TEXT
     description: str = (
-        "Convert text into a dense embedding vector for downstream similarity/clustering."
+        "Transforms text into a dense numeric vector representation using an embedding model. "
+        "Input: text data (string or list of text dicts). "
+        "Output: dict with 'embedding' array (float vector). "
+        "Use when you need vector representations for similarity computation, clustering, or as input features for downstream models. "
+        "Params: model ('light'/'heavy')."
     )
     io_type: ToolIOType = ToolIOType.T_TO_R
     parameters_schema: dict[str, Any] = {

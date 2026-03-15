@@ -31,7 +31,18 @@ class VarianceDecomposeTool(ClawTool):
 
     name: str = "variance_decompose"
     category: ToolCategory = ToolCategory.DECOMPOSITION
-    description: str = "Decompose variance contributions (e.g., between-group vs within-group)."
+    description: str = (
+        "Decompose the total variance of a time series into between-group (trend) and "
+        "within-group (residual) components. For univariate input, splits variance across "
+        "time windows defined by window_size. For multivariate input (DataFrame with multiple "
+        "columns), splits variance between channels vs within channels. Input: univariate "
+        "array or multivariate DataFrame. Output: dict with 'total_variance', "
+        "'between_variance', 'within_variance', and 'variance_ratio' (proportion explained "
+        "by trend/between-group). Use when you need to understand whether variability is "
+        "driven by long-term trends or short-term fluctuations, or whether channel-level "
+        "differences dominate. Key param: window_size (int, default 1/10 of series length) — "
+        "smoothing window for univariate decomposition."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

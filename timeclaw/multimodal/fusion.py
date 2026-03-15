@@ -235,7 +235,7 @@ class ModalityFusion:
         for modality, data in evidence.items():
             pred = data.get("prediction") if isinstance(data, dict) else data
             conf = data.get("confidence", "unknown") if isinstance(data, dict) else "unknown"
-            summaries.append(f"- {modality}: prediction={str(pred)[:300]}, confidence={conf}")
+            summaries.append(f"- {modality}: prediction={str(pred)[:5000]}, confidence={conf}")
 
         messages = [
             {
@@ -254,7 +254,7 @@ class ModalityFusion:
                 "role": "user",
                 "content": (
                     f"Task type: {task_type}\n"
-                    f"Description: {task_description[:500]}\n\n"
+                    f"Description: {task_description[:5000]}\n\n"
                     f"Modality predictions:\n" + "\n".join(summaries)
                 ),
             },

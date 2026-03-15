@@ -13,25 +13,28 @@ from pydantic import BaseModel, Field
 class LLMModelConfig(BaseModel):
     """Per-agent model assignment."""
 
-    manager: str = "ollama/qwen3:8b"
-    analyzer: str = "ollama/qwen3:1.7b"
-    executor: str = "ollama/qwen3:1.7b"
-    reasoner: str = "ollama/qwen3:8b"
-    text_light: str | None = None
-    text_heavy: str | None = None
+    manager: str = "azure/gpt-5.1"
+    analyzer: str = "azure/gpt-5.1"
+    executor: str = "azure/gpt-5.1"
+    reasoner: str = "azure/gpt-5.1"
+    text_light: str | None = "azure/gpt-5.1"
+    text_heavy: str | None = "azure/gpt-5.1"
 
 
 class LLMConfig(BaseModel):
     """LLM routing configuration."""
 
     models: LLMModelConfig = Field(default_factory=LLMModelConfig)
-    fallback: str | None = "gpt-4o-mini"
+    fallback: str | None = "azure/gpt-5.1"
     max_retries: int = 3
-    timeout: float = 120.0
+    timeout: float = 180.0
     temperature: float = 0.1
     max_tokens: int = 4096
-    api_base: str | None = None
-    api_key: str | None = None
+    api_base: str | None = "https://asure-test-openai-004.openai.azure.com/"
+    api_key: str | None = "5jDLlQ5ccmal2OAOchrqcatcKMr4FfqQbOD1n0YUwkIFCwdxcI5aJQQJ99ALACYeBjFXJ3w3AAABACOGZLN4"
+    azure_api_base: str | None = "https://asure-test-openai-004.openai.azure.com/"
+    azure_api_key: str | None = "5jDLlQ5ccmal2OAOchrqcatcKMr4FfqQbOD1n0YUwkIFCwdxcI5aJQQJ99ALACYeBjFXJ3w3AAABACOGZLN4"
+    azure_api_version: str | None = "2024-12-01-preview"
 
 
 class ReasoningConfig(BaseModel):
@@ -97,6 +100,39 @@ class FusionConfig(BaseModel):
     confidence_floor: float = 0.1
 
 
+class MCPServerEntry(BaseModel):
+    """Configuration for a single MCP tool server."""
+
+    name: str
+    command: str = "python"
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class MCPConfig(BaseModel):
+    """MCP (Model Context Protocol) tool server configuration.
+
+    ``servers`` lists the built-in category servers.  Additional external
+    MCP servers (e.g. third-party models) can be added via
+    ``extra_servers``.
+    """
+
+    enabled: bool = True
+    servers: list[MCPServerEntry] = Field(default_factory=lambda: [
+        MCPServerEntry(name="timeclaw-processing", args=["-m", "timeclaw.mcp.servers.processing"]),
+        MCPServerEntry(name="timeclaw-profiling", args=["-m", "timeclaw.mcp.servers.profiling"]),
+        MCPServerEntry(name="timeclaw-detection", args=["-m", "timeclaw.mcp.servers.detection"]),
+        MCPServerEntry(name="timeclaw-decomposition", args=["-m", "timeclaw.mcp.servers.decomposition"]),
+        MCPServerEntry(name="timeclaw-relation", args=["-m", "timeclaw.mcp.servers.relation"]),
+        MCPServerEntry(name="timeclaw-prediction", args=["-m", "timeclaw.mcp.servers.prediction"]),
+        MCPServerEntry(name="timeclaw-validation", args=["-m", "timeclaw.mcp.servers.validation"]),
+        MCPServerEntry(name="timeclaw-text", args=["-m", "timeclaw.mcp.servers.text"]),
+        MCPServerEntry(name="timeclaw-image", args=["-m", "timeclaw.mcp.servers.image"]),
+    ])
+    extra_servers: list[MCPServerEntry] = Field(default_factory=list)
+
+
 class TimeClawConfig(BaseModel):
     """Root configuration for the TimeClaw platform."""
 
@@ -107,6 +143,7 @@ class TimeClawConfig(BaseModel):
     context: ContextConfig = Field(default_factory=ContextConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     fusion: FusionConfig = Field(default_factory=FusionConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
     log_level: str = "INFO"
     workspace_dir: str = ".timeclaw"
 
@@ -119,9 +156,14 @@ class TimeClawConfig(BaseModel):
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> TimeClawConfig:
-        """Load config from explicit path, env var, or defaults."""
+        """Load config from explicit path, env var, or auto-detected yaml."""
         if path is None:
             path = os.environ.get("TIMECLAW_CONFIG")
+        if path is None:
+            for candidate in ("configs/gpt51.yaml", "configs/gpt5.yaml", "configs/cloud.yaml", "configs/default.yaml"):
+                if Path(candidate).exists():
+                    path = candidate
+                    break
         if path is not None:
             return cls.from_yaml(path)
         return cls()

@@ -33,7 +33,13 @@ class BasicStatsTool(ClawTool):
 
     name: str = "basic_stats"
     category: ToolCategory = ToolCategory.PROFILING
-    description: str = "Compute basic statistics: mean, std, min, max, skewness, kurtosis."
+    description: str = (
+        "Compute basic statistics for a 1D numeric time series. "
+        "Returns a dict with keys: mean, std, min, max, skewness, kurtosis. "
+        "Use as a first step to understand data distribution, central tendency, and spread. "
+        "Accepts any 1D numeric array (numpy, pandas Series/DataFrame, or list). "
+        "No parameters required."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

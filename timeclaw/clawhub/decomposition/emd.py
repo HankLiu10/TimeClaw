@@ -32,7 +32,16 @@ class EMDDecomposeTool(ClawTool):
 
     name: str = "emd_decompose"
     category: ToolCategory = ToolCategory.DECOMPOSITION
-    description: str = "Decompose time series into intrinsic mode functions (IMFs) using EMD."
+    description: str = (
+        "Decompose a time series into Intrinsic Mode Functions (IMFs) using Empirical Mode "
+        "Decomposition (EMD). This is an adaptive, nonlinear decomposition that makes no "
+        "assumptions about linearity or stationarity of the signal. Input: univariate time "
+        "series array. Output: dict with 'imfs' (list of IMF arrays from highest to lowest "
+        "frequency), 'n_imfs', and 'residue'. Use when the signal is non-stationary or "
+        "nonlinear and FFT-based methods fail, when you want to decompose into physically "
+        "meaningful oscillatory modes, or when the frequency content changes over time. "
+        "No required parameters."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

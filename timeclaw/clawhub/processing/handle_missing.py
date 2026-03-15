@@ -19,7 +19,15 @@ class HandleMissingTool(ClawTool):
 
     name: str = "handle_missing"
     category: ToolCategory = ToolCategory.PROCESSING
-    description: str = "Handle missing values using ffill, bfill, interpolate, or mean imputation."
+    description: str = (
+        "Clean NaN or missing values in a time series using one of several imputation "
+        "strategies. Input: a numeric array, DataFrame, or Series that may contain NaN entries. "
+        "Output: dict with 'data' (cleaned values as list) and 'missing_count' (number of NaN "
+        "values that were filled). This is an essential preprocessing step — run it before any "
+        "analysis, prediction, or profiling tool that cannot handle missing data. "
+        "Parameters (required): strategy ('ffill' forward-fill | 'bfill' backward-fill | "
+        "'interpolate' linear interpolation | 'mean' column-mean imputation)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

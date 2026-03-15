@@ -19,7 +19,15 @@ class SliceTool(ClawTool):
 
     name: str = "slice"
     category: ToolCategory = ToolCategory.PROCESSING
-    description: str = "Slice time series by start and end index or timestamp."
+    description: str = (
+        "Extract a contiguous sub-sequence from a time series by specifying start and end "
+        "positions. Input: a numeric array, DataFrame, or Series. Output: the sliced array "
+        "or DataFrame retaining the original data type. Use this when you need a specific "
+        "time range or index range from a longer series — e.g., isolating a region of interest "
+        "before analysis or trimming leading/trailing artifacts. "
+        "Parameters (both required): start (int index or timestamp str), end (int index exclusive "
+        "or timestamp str)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

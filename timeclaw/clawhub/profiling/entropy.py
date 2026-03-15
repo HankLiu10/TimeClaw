@@ -32,7 +32,13 @@ class EntropyTool(ClawTool):
 
     name: str = "entropy"
     category: ToolCategory = ToolCategory.PROFILING
-    description: str = "Compute sample entropy, permutation entropy, and spectral entropy for time series."
+    description: str = (
+        "Measure the complexity and regularity of a time series via three entropy metrics. "
+        "Low entropy indicates regular/predictable patterns; high entropy indicates chaotic/random behavior. "
+        "Returns a dict with keys: sample_entropy, permutation_entropy, and spectral_entropy. "
+        "Use to assess how predictable or complex a time series is before choosing forecasting methods. "
+        "No parameters required."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

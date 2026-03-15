@@ -51,7 +51,17 @@ class TransferEntropyTool(ClawTool):
 
     name: str = "transfer_entropy"
     category: ToolCategory = ToolCategory.RELATION
-    description: str = "Compute transfer entropy (information flow) between channels."
+    description: str = (
+        "Compute the transfer entropy between two time series channels, measuring the directed "
+        "information flow from one channel to another. Unlike correlation (symmetric), transfer "
+        "entropy is asymmetric and can reveal causal directionality. Input: multivariate time "
+        "series with at least 2 channels (uses the first two columns). Output: dict with "
+        "'transfer_entropy_xy' (X → Y), 'transfer_entropy_yx' (Y → X), and "
+        "'dominant_direction' ('X -> Y', 'Y -> X', or 'symmetric'). Use when you need to "
+        "determine which channel drives the other, or to quantify information-theoretic causal "
+        "influence. Key params: lag (int, default 1) — time lag for the transfer; bins (int, "
+        "default 10) — histogram bins for entropy estimation."
+    )
     io_type: ToolIOType = ToolIOType.XK_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

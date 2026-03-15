@@ -34,7 +34,13 @@ class TemporalAlignTextTool(ClawTool):
 
     name: str = "temporal_align_text"
     category: ToolCategory = ToolCategory.TEXT
-    description: str = "Align text events by timestamp to corresponding time-series windows."
+    description: str = (
+        "Maps text documents with timestamps to specific time windows in a time-series. "
+        "Input: requires both text data (with timestamps) and time-series data in context. "
+        "Output: dict with aligned text-to-window mappings showing which text corresponds to which time window. "
+        "Use when you need to associate news, reports, or events with the matching segment of a time-series for joint analysis. "
+        "Params: window_size (duration of each alignment window), strategy (alignment method)."
+    )
     io_type: ToolIOType = ToolIOType.TX_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",
@@ -54,6 +60,13 @@ class TemporalAlignTextTool(ClawTool):
         text_data = params.get("text")
         if text_data is None:
             raise ValueError("text parameter is required (list of dicts with 'timestamp' and 'text')")
+
+        if isinstance(text_data, str):
+            import json
+            try:
+                text_data = json.loads(text_data)
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("text must be a JSON list of dicts with 'timestamp' and 'text' keys")
 
         if not isinstance(text_data, list):
             raise ValueError("text must be a list of dicts with 'timestamp' and 'text' keys")

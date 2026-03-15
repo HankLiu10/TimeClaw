@@ -43,7 +43,14 @@ class DetectSeasonalityTool(ClawTool):
 
     name: str = "detect_seasonality"
     category: ToolCategory = ToolCategory.DETECTION
-    description: str = "Detect seasonality period in time series."
+    description: str = (
+        "Detect the dominant seasonality period in a time series by analyzing autocorrelation function (ACF) peaks. "
+        "Input: 1D numeric array, Series, or single-column DataFrame. "
+        "Output: dict with 'seasonal' (bool), 'period' (int or null — the dominant cycle length in samples), "
+        "'autocorrelation_peaks' (list of lag indices), and 'peak_strengths' (list of ACF values). "
+        "Use as a prerequisite step before STL decomposition, seasonal ARIMA, or any method requiring a known period. "
+        "No required parameters."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_C
     parameters_schema: dict[str, Any] = {
         "type": "object",

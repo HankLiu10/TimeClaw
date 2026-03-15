@@ -12,7 +12,13 @@ class ImageOCRTool(ClawTool):
 
     name: str = "image_ocr"
     category: ToolCategory = ToolCategory.IMAGE
-    description: str = "Extract text and numerical values from images using multimodal LLM."
+    description: str = (
+        "Reads text, numbers, and labels from images using a multimodal LLM. "
+        "Input: image file path. "
+        "Output: dict with extracted text and structured numeric values. "
+        "Use when you need to digitize charts, labels, instrument readings, or any text visible in an image. "
+        "Params: path (file path to image), extract_type (what to extract, e.g. 'text', 'numbers', 'all')."
+    )
     io_type: ToolIOType = ToolIOType.I_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",
@@ -37,6 +43,8 @@ class ImageOCRTool(ClawTool):
             first = images[0]
             if isinstance(first, dict):
                 path = first.get("path", path)
+            elif isinstance(first, str):
+                path = first
 
         if not path:
             raise ValueError("Image path is required")

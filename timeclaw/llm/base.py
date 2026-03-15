@@ -5,6 +5,7 @@ Supports multimodal messages (text + image) via OpenAI-compatible content arrays
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -14,6 +15,17 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from timeclaw.core import trace_logger as trace
+
+_MAX_RETRIES = 5
+_RETRY_BASE_DELAY = 2.0
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Check if an exception is a transient API error worth retrying."""
+    msg = str(exc).lower()
+    return any(k in msg for k in ("429", "rate limit", "too many requests",
+                                   "server error", "502", "503", "timeout",
+                                   "connection", "overloaded"))
 
 
 class LLMResponse(BaseModel):
@@ -40,6 +52,9 @@ class LLMBackend:
         timeout: float = 120.0,
         api_base: str | None = None,
         api_key: str | None = None,
+        azure_api_base: str | None = None,
+        azure_api_key: str | None = None,
+        azure_api_version: str | None = None,
     ):
         import os
 
@@ -51,6 +66,9 @@ class LLMBackend:
         self.timeout = timeout
         self.api_base = api_base
         self.api_key = api_key
+        self.azure_api_base = azure_api_base
+        self.azure_api_key = azure_api_key
+        self.azure_api_version = azure_api_version or "2024-12-01-preview"
 
         if api_key and api_base:
             base_no_v1 = api_base.rstrip("/")
@@ -61,6 +79,37 @@ class LLMBackend:
             os.environ.setdefault("ANTHROPIC_API_KEY", api_key)
             os.environ.setdefault("ANTHROPIC_API_BASE", base_no_v1)
 
+        if azure_api_key and azure_api_base:
+            os.environ.setdefault("AZURE_API_KEY", azure_api_key)
+            os.environ.setdefault("AZURE_API_BASE", azure_api_base)
+            os.environ.setdefault("AZURE_API_VERSION", self.azure_api_version)
+
+    async def _call_with_retry(
+        self, call_kwargs: dict[str, Any], model_label: str,
+        response_format: str | None, messages: list[dict[str, Any]],
+    ) -> LLMResponse | None:
+        """Execute a litellm call with automatic retry on transient errors."""
+        import litellm
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = await litellm.acompletion(**call_kwargs)
+                parsed = self._parse_response(response, model_label)
+                trace.llm_call(model_label, messages, parsed,
+                               response_format=response_format)
+                return parsed
+            except Exception as e:
+                if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        f"LLM {model_label} attempt {attempt+1} failed "
+                        f"(retryable): {e}. Retrying in {delay:.1f}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+        return None
+
     async def complete(
         self,
         messages: list[dict[str, Any]],
@@ -68,30 +117,29 @@ class LLMBackend:
         response_format: str | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Send a completion request. Tries primary model, falls back if needed."""
-        import litellm
-
+        """Send a completion request. Retries on transient errors, then falls back."""
         target_model = model or self.default_model
         call_kwargs = self._build_kwargs(messages, target_model, response_format, **kwargs)
 
         try:
-            response = await litellm.acompletion(**call_kwargs)
-            parsed = self._parse_response(response, target_model)
-            trace.llm_call(target_model, messages, parsed, response_format=response_format)
-            return parsed
+            result = await self._call_with_retry(
+                call_kwargs, target_model, response_format, messages)
+            if result is not None:
+                return result
         except Exception as e:
             logger.warning(f"LLM call to {target_model} failed: {e}")
             if self.fallback_model and target_model != self.fallback_model:
                 logger.info(f"Falling back to {self.fallback_model}")
                 call_kwargs["model"] = self.fallback_model
                 try:
-                    response = await litellm.acompletion(**call_kwargs)
-                    parsed = self._parse_response(response, self.fallback_model)
-                    trace.llm_call(self.fallback_model + " (fallback)", messages, parsed, response_format=response_format)
-                    return parsed
+                    result = await self._call_with_retry(
+                        call_kwargs, self.fallback_model + " (fallback)",
+                        response_format, messages)
+                    if result is not None:
+                        return result
                 except Exception as e2:
                     logger.error(f"Fallback also failed: {e2}")
-            return LLMResponse(text=None, model=target_model)
+        return LLMResponse(text=None, model=target_model)
 
     async def complete_with_tools(
         self,
@@ -107,19 +155,29 @@ class LLMBackend:
         call_kwargs = self._build_kwargs(messages, target_model, **kwargs)
         call_kwargs["tools"] = tools
 
-        try:
-            response = await litellm.acompletion(**call_kwargs)
-            return self._parse_response(response, target_model)
-        except Exception as e:
-            logger.warning(f"Tool call to {target_model} failed: {e}")
-            if self.fallback_model and target_model != self.fallback_model:
-                call_kwargs["model"] = self.fallback_model
-                try:
-                    response = await litellm.acompletion(**call_kwargs)
-                    return self._parse_response(response, self.fallback_model)
-                except Exception as e2:
-                    logger.error(f"Fallback tool call also failed: {e2}")
-            return LLMResponse(text=None, model=target_model)
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = await litellm.acompletion(**call_kwargs)
+                return self._parse_response(response, target_model)
+            except Exception as e:
+                if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        f"Tool call {target_model} attempt {attempt+1} "
+                        f"(retryable): {e}. Retrying in {delay:.1f}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(f"Tool call to {target_model} failed: {e}")
+                if self.fallback_model and target_model != self.fallback_model:
+                    call_kwargs["model"] = self.fallback_model
+                    try:
+                        response = await litellm.acompletion(**call_kwargs)
+                        return self._parse_response(response, self.fallback_model)
+                    except Exception as e2:
+                        logger.error(f"Fallback tool call also failed: {e2}")
+                return LLMResponse(text=None, model=target_model)
+        return LLMResponse(text=None, model=target_model)
 
     def _build_kwargs(
         self,
@@ -137,10 +195,20 @@ class LLMBackend:
             "timeout": self.timeout,
         }
         is_anthropic = model.startswith("anthropic/")
-        if self.api_base and not is_anthropic:
-            call_kwargs["api_base"] = self.api_base
-        if self.api_key and not is_anthropic:
-            call_kwargs["api_key"] = self.api_key
+        is_azure = model.startswith("azure/")
+
+        if is_azure:
+            if self.azure_api_base:
+                call_kwargs["api_base"] = self.azure_api_base
+            if self.azure_api_key:
+                call_kwargs["api_key"] = self.azure_api_key
+            call_kwargs["api_version"] = self.azure_api_version
+        elif not is_anthropic:
+            if self.api_base:
+                call_kwargs["api_base"] = self.api_base
+            if self.api_key:
+                call_kwargs["api_key"] = self.api_key
+
         if response_format == "json":
             call_kwargs["response_format"] = {"type": "json_object"}
         call_kwargs.update(kwargs)

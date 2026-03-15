@@ -1,8 +1,6 @@
-"""Four-layer agent team: Manager, Analyzer, Executor, Reasoner."""
+"""Two-agent team: Executor (ReAct tool orchestration) + Reasoner (multimodal fusion)."""
 
-from timeclaw.agents.analyzer import AnalyzerAgent
 from timeclaw.agents.executor import ExecutorAgent
-from timeclaw.agents.manager import ManagerAgent
 from timeclaw.agents.reasoner import ReasonerAgent
 
-__all__ = ["ManagerAgent", "AnalyzerAgent", "ExecutorAgent", "ReasonerAgent"]
+__all__ = ["ExecutorAgent", "ReasonerAgent"]

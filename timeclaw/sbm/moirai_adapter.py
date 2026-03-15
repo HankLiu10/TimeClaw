@@ -11,7 +11,7 @@ from timeclaw.sbm.base import SBMBase, SBMConfig, SBMOutput, SBMTask
 
 MOIRAI_DEFAULT_CONFIG = SBMConfig(
     model_name="moirai",
-    model_path="Salesforce/moirai-1.1-R-small",
+    model_path="Salesforce/moirai-1.1-R-large",
     context_length=512,
     prediction_length=96,
     num_samples=20,
@@ -27,7 +27,7 @@ class MoiraiAdapter(SBMBase):
 
     name: str = "moirai"
     supported_tasks: list[SBMTask] = [SBMTask.FORECAST]
-    requires_gpu: bool = False
+    requires_gpu: bool = True
 
     def load(self) -> None:
         try:
@@ -43,14 +43,16 @@ class MoiraiAdapter(SBMBase):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        model_path = self.config.model_path or "Salesforce/moirai-1.1-R-small"
+        model_path = self.config.model_path or "Salesforce/moirai-1.1-R-large"
         logger.info(f"Loading Moirai from {model_path} on {device}")
 
         module = MoiraiModule.from_pretrained(model_path)
+        if device != "cpu":
+            module = module.to(device)
         self._module = module
         self._device = device
         self._model = True  # flag that model is loaded
-        logger.info("Moirai loaded successfully")
+        logger.info(f"Moirai loaded successfully on {device}")
 
     def forecast(
         self,
@@ -67,30 +69,34 @@ class MoiraiAdapter(SBMBase):
         pred_len = prediction_length or self.config.prediction_length
         num_samples = kwargs.get("num_samples", self.config.num_samples)
 
-        if context.ndim == 1:
-            context = context.reshape(-1, 1)
+        import pandas as pd
+        from gluonts.dataset.pandas import PandasDataset
 
-        n_vars = context.shape[1]
+        if context.ndim == 2:
+            univariate = context[:, 0]
+        else:
+            univariate = context
+
+        ctx_len = min(len(univariate), self.config.context_length)
+        univariate = univariate[-ctx_len:]
 
         model = MoiraiForecast(
             module=self._module,
             prediction_length=pred_len,
-            context_length=min(len(context), self.config.context_length),
+            context_length=ctx_len,
             patch_size="auto",
             num_samples=num_samples,
-            target_dim=n_vars,
+            target_dim=1,
             feat_dynamic_real_dim=0,
             past_feat_dynamic_real_dim=0,
         )
 
-        import pandas as pd
-        from gluonts.dataset.pandas import PandasDataset
-
-        df = pd.DataFrame(
-            context,
-            index=pd.period_range(start="2000-01-01", periods=len(context), freq="h"),
+        s = pd.Series(
+            univariate,
+            index=pd.period_range(start="2000-01-01", periods=len(univariate), freq="h"),
+            name="target",
         )
-        ds = PandasDataset(df, target=list(df.columns))
+        ds = PandasDataset(s)
 
         predictor = model.create_predictor(batch_size=1)
         forecasts = list(predictor.predict(ds))

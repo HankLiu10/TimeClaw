@@ -21,7 +21,13 @@ class NERTool(ClawTool):
 
     name: str = "ner"
     category: ToolCategory = ToolCategory.TEXT
-    description: str = "Extract named entities from text using regex patterns or LLM."
+    description: str = (
+        "Identifies named entities (dates, numbers, organizations, locations, etc.) from text using regex or LLM. "
+        "Input: text data (string or list of text dicts). "
+        "Output: dict with entities grouped by type. "
+        "Use when you need to extract structured facts from unstructured text, e.g. pulling dates and company names from reports. "
+        "Params: entity_types (list of entity categories to extract), model ('light'/'heavy')."
+    )
     io_type: ToolIOType = ToolIOType.T_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

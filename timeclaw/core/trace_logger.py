@@ -22,27 +22,33 @@ from typing import Any
 from loguru import logger
 
 _verbose: bool = False
+_full_dump: bool = False
 
 _SEPARATOR = "═" * 72
 _THIN_SEP = "─" * 60
 
 
-def configure(verbose: bool) -> None:
-    global _verbose
+def configure(verbose: bool, full_dump: bool = False) -> None:
+    global _verbose, _full_dump
     _verbose = verbose
+    _full_dump = full_dump
 
 
 # ── Formatting helpers ──────────────────────────────────────────
 
-def _smart_trunc(obj: Any, limit: int = 300) -> str:
-    """Truncate intelligently: arrays get summarized, dicts get key-listed."""
+def _smart_trunc(obj: Any, limit: int = 2000) -> str:
+    """Truncate intelligently: arrays get summarized, dicts get key-listed.
+
+    Default limit is generous (2000 chars) — logs are important for debugging
+    and post-hoc analysis. Use smaller limits only for dense array previews.
+    """
     import numpy as np
 
     if obj is None:
         return "None"
 
     if isinstance(obj, np.ndarray):
-        if obj.size <= 8:
+        if obj.size <= 50:
             return str(obj.tolist())
         return (
             f"ndarray shape={obj.shape} "
@@ -50,9 +56,9 @@ def _smart_trunc(obj: Any, limit: int = 300) -> str:
             f"mean={float(obj.mean()):.4f}"
         )
 
-    if isinstance(obj, (list, tuple)) and len(obj) > 10:
+    if isinstance(obj, (list, tuple)) and len(obj) > 20:
         try:
-            arr = [float(x) for x in obj[:5]]
+            arr = [float(x) for x in obj[:10]]
             return f"[{', '.join(f'{v:.4f}' for v in arr)}, ... ({len(obj)} items)]"
         except (TypeError, ValueError):
             pass
@@ -60,8 +66,8 @@ def _smart_trunc(obj: Any, limit: int = 300) -> str:
     if isinstance(obj, dict):
         if "forecast" in obj:
             fc = obj["forecast"]
-            if isinstance(fc, (list, tuple)) and len(fc) > 5:
-                preview = [f"{float(v):.4f}" for v in fc[:5]]
+            if isinstance(fc, (list, tuple)) and len(fc) > 10:
+                preview = [f"{float(v):.4f}" for v in fc[:10]]
                 return f"forecast=[{', '.join(preview)}, ...] ({len(fc)} steps)"
             return f"forecast={fc}"
         if "acf" in obj or "pacf" in obj:
@@ -80,6 +86,8 @@ def _format_result_data(data: Any) -> str:
     if data is None:
         return "None"
     if isinstance(data, np.ndarray):
+        if data.size <= 100:
+            return f"ndarray shape={data.shape} values={data.tolist()}"
         return (
             f"ndarray shape={data.shape} "
             f"range=[{float(data.min()):.4f}, {float(data.max()):.4f}] "
@@ -88,15 +96,15 @@ def _format_result_data(data: Any) -> str:
     if isinstance(data, dict):
         lines = []
         for k, v in data.items():
-            lines.append(f"    {k}: {_smart_trunc(v, 200)}")
+            lines.append(f"    {k}: {_smart_trunc(v, 2000)}")
         return "\n".join(lines)
-    return _smart_trunc(data, 500)
+    return _smart_trunc(data, 5000)
 
 
 def _extract_llm_decision(parsed: Any) -> str:
     """Extract the key decision from an LLM response."""
     if not isinstance(parsed, dict):
-        return _smart_trunc(parsed, 300)
+        return _smart_trunc(parsed, 2000)
 
     parts = []
     if "task_type" in parsed:
@@ -116,7 +124,7 @@ def _extract_llm_decision(parsed: Any) -> str:
                 chain.append(str(item))
         parts.append(f"工具链: {' → '.join(chain)}")
     if "reasoning" in parsed:
-        parts.append(f"推理: {_smart_trunc(parsed['reasoning'], 300)}")
+        parts.append(f"推理: {_smart_trunc(parsed['reasoning'], 2000)}")
     if "tool" in parsed and "tool_chain" not in parsed:
         parts.append(f"选择工具: {parsed['tool']}")
         if parsed.get("args"):
@@ -134,7 +142,7 @@ def _extract_llm_decision(parsed: Any) -> str:
     if "confidence" in parsed:
         parts.append(f"置信度: {parsed['confidence']}")
     if "answer" in parsed and parsed["answer"] is not None:
-        parts.append(f"答案: {_smart_trunc(parsed['answer'], 200)}")
+        parts.append(f"答案: {_smart_trunc(parsed['answer'], 2000)}")
     if "consistent" in parsed:
         parts.append(f"一致性: {parsed['consistent']}")
     if "should_reanalyze" in parsed:
@@ -143,7 +151,7 @@ def _extract_llm_decision(parsed: Any) -> str:
         parts.append(f"覆盖谓词: {parsed['covers_predicates']}")
 
     if not parts:
-        return _smart_trunc(parsed, 300)
+        return _smart_trunc(parsed, 2000)
     return "\n    ".join(parts)
 
 
@@ -177,30 +185,48 @@ def llm_call(
     if not _verbose:
         return
 
-    user_msg = ""
-    for msg in messages:
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                user_msg = content[:500]
-            break
-
     resp_parsed = None
     resp_usage = {}
+    resp_text = ""
     if hasattr(response, "parsed"):
         resp_parsed = response.parsed
     if hasattr(response, "usage"):
         resp_usage = response.usage or {}
+    if hasattr(response, "text"):
+        resp_text = response.text or ""
 
     tokens_in = resp_usage.get("prompt_tokens", "?")
     tokens_out = resp_usage.get("completion_tokens", "?")
 
-    decision = _extract_llm_decision(resp_parsed)
-
-    logger.info(
-        f"[{caller}] LLM 返回 (tokens: {tokens_in} in / {tokens_out} out):\n"
-        f"    {decision}"
-    )
+    if _full_dump:
+        parts = [f"\n{_THIN_SEP}", f"[{caller}] LLM 调用详情 (tokens: {tokens_in} in / {tokens_out} out)"]
+        parts.append(f"{_THIN_SEP}")
+        parts.append("【发送的 Prompt】:")
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                    elif isinstance(item, dict) and item.get("type") == "image_url":
+                        text_parts.append("[IMAGE]")
+                content = "\n".join(text_parts)
+            parts.append(f"  --- [{role}] (msg {i+1}/{len(messages)}) ---")
+            parts.append(f"  {content}")
+        parts.append(f"  --- end of prompt ---")
+        parts.append("")
+        parts.append("【LLM 原始返回】:")
+        parts.append(f"  {resp_text}")
+        parts.append(f"{_THIN_SEP}")
+        logger.info("\n".join(parts))
+    else:
+        decision = _extract_llm_decision(resp_parsed)
+        logger.info(
+            f"[{caller}] LLM 返回 (tokens: {tokens_in} in / {tokens_out} out):\n"
+            f"    {decision}"
+        )
 
 
 def llm_prompt_detail(
@@ -216,8 +242,8 @@ def llm_prompt_detail(
         content = msg.get("content", "")
         if isinstance(content, list):
             content = str(content)
-        if len(content) > 500:
-            content = content[:500] + f"… [{len(content)} chars]"
+        if len(content) > 5000:
+            content = content[:5000] + f"… [{len(content)} chars]"
         parts.append(f"    [{role}]: {content}")
     logger.debug(f"[{caller}] LLM Prompt 详情:\n" + "\n".join(parts))
 
@@ -253,7 +279,7 @@ def tool_exec(
     if metadata:
         interesting = {k: v for k, v in metadata.items() if k != "method"}
         if interesting:
-            lines.append(f"    元数据: {_smart_trunc(interesting, 300)}")
+            lines.append(f"    元数据: {_smart_trunc(interesting, 2000)}")
 
     logger.info("\n".join(lines))
 
@@ -268,7 +294,7 @@ def agent_step(
         return
 
     if not isinstance(data, dict):
-        logger.info(f"[{agent}] {phase}: {_smart_trunc(data, 300)}")
+        logger.info(f"[{agent}] {phase}: {_smart_trunc(data, 2000)}")
         return
 
     if phase == "perceive":
@@ -309,7 +335,7 @@ def agent_step(
             intent = data["intent"]
             logger.info(
                 f"[{agent}] 规划:\n"
-                f"    意图: {_smart_trunc(intent, 300)}\n"
+                f"    意图: {_smart_trunc(intent, 2000)}\n"
                 f"    DAG: {' → '.join(data.get('dag_nodes', []))}"
             )
             return
@@ -318,7 +344,7 @@ def agent_step(
             return
         if "diagnosis" in data:
             diag = data["diagnosis"]
-            logger.info(f"[{agent}] 诊断结果:\n    {_smart_trunc(diag, 500)}")
+            logger.info(f"[{agent}] 诊断结果:\n    {_smart_trunc(diag, 5000)}")
             return
 
     if phase == "act":
@@ -328,7 +354,7 @@ def agent_step(
             logger.info(
                 f"[{agent}] 验证结果: {'通过' if data['gate_accepted'] else '未通过'}\n"
                 f"    检查项: {', '.join(check_strs)}\n"
-                f"    预测: {_smart_trunc(data.get('prediction_preview'), 200)}"
+                f"    预测: {_smart_trunc(data.get('prediction_preview'), 2000)}"
             )
             return
         if "prediction_type" in data:
@@ -336,15 +362,15 @@ def agent_step(
                 f"[{agent}] 执行完成:\n"
                 f"    工具: {data.get('tools_passed', 0)}/{data.get('tools_executed', 0)} 通过\n"
                 f"    反归一化: {data.get('denormalized', False)}\n"
-                f"    预测: {_smart_trunc(data.get('prediction_preview'), 200)}"
+                f"    预测: {_smart_trunc(data.get('prediction_preview'), 2000)}"
             )
             return
 
     if phase in ("fusion", "cross_modal_check", "synthesis"):
-        logger.info(f"[{agent}] {phase}:\n    {_smart_trunc(data, 500)}")
+        logger.info(f"[{agent}] {phase}:\n    {_smart_trunc(data, 5000)}")
         return
 
-    logger.info(f"[{agent}] {phase}: {_smart_trunc(data, 400)}")
+    logger.info(f"[{agent}] {phase}: {_smart_trunc(data, 3000)}")
 
 
 def pipeline_stage(
@@ -379,10 +405,10 @@ def reasoning_step(
                 lines.append(f"    思考: {thought.get('reasoning', '?')}")
                 lines.append(f"    → 调用工具: {thought['tool']}({thought.get('args', {})})")
             else:
-                lines.append(f"    思考: {_smart_trunc(thought, 300)}")
+                lines.append(f"    思考: {_smart_trunc(thought, 2000)}")
     if observation is not None:
-        lines.append(f"    观察: {_smart_trunc(observation, 300)}")
+        lines.append(f"    观察: {_smart_trunc(observation, 2000)}")
     if critic:
-        lines.append(f"    评审: {_smart_trunc(critic, 200)}")
+        lines.append(f"    评审: {_smart_trunc(critic, 2000)}")
 
     logger.info("\n".join(lines))

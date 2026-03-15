@@ -31,7 +31,15 @@ class DetectRegimeTool(ClawTool):
 
     name: str = "detect_regime"
     category: ToolCategory = ToolCategory.DETECTION
-    description: str = "Detect regime switches in time series."
+    description: str = (
+        "Detect regime switches in time series by analyzing rolling local statistics (mean, std). "
+        "Identifies distinct operating modes or states within the data. "
+        "Input: 1D numeric array, Series, or single-column DataFrame. "
+        "Output: dict with 'n_regimes' (int), 'regime_boundaries' (list of index positions), "
+        "and 'regime_stats' (list of dicts each with 'mean' and 'std' per segment). "
+        "Use for understanding state changes, switching dynamics, or segmenting data into homogeneous intervals. "
+        "Param 'window' (int, default 30): rolling window size — smaller windows detect finer-grained regime shifts."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_C
     parameters_schema: dict[str, Any] = {
         "type": "object",

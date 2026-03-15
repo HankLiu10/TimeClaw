@@ -33,17 +33,13 @@ class ExecutorAgent(AgentBase):
         *args: Any,
         text_backends: dict[str, Any] | None = None,
         experience_pool: Any | None = None,
+        mcp_manager: Any | None = None,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self._text_backends = text_backends
         self._experience_pool = experience_pool
-        self._tool_insights: dict[str, str] = {}
-        if experience_pool is not None:
-            try:
-                self._tool_insights = experience_pool.load_tool_insights()
-            except Exception:
-                pass
+        self._mcp_manager = mcp_manager
 
     # ── Agent lifecycle ───────────────────────────────────────────────
 
@@ -56,10 +52,10 @@ class ExecutorAgent(AgentBase):
             texts = envelope.environment.text_data
             text_summary = f"{len(texts)} text documents: "
             previews = []
-            for t in texts[:3]:
+            for t in texts[:10]:
                 src = t.get("source", "?")
                 ts = t.get("timestamp", "?")
-                content = str(t.get("content", ""))[:80]
+                content = str(t.get("content", ""))[:2000]
                 previews.append(f"[{src}@{ts}] {content}")
             text_summary += "; ".join(previews)
 
@@ -69,6 +65,7 @@ class ExecutorAgent(AgentBase):
 
         return {
             "task_type": envelope.task.task_type,
+            "task_description": envelope.task.description or "",
             "fingerprint": fingerprint,
             "data_shape": envelope.environment.data_shape,
             "horizon": envelope.task.horizon,
@@ -80,67 +77,127 @@ class ExecutorAgent(AgentBase):
             "text_summary": text_summary,
             "image_summary": image_summary,
             "suggested_strategy": envelope.task.metadata.get("suggested_strategy"),
-            "similar_experiences": envelope.task.metadata.get("similar_experiences", []),
+            "soul_prompt": envelope.task.metadata.get("soul_prompt", ""),
+            "principles_prompt": envelope.task.metadata.get("principles_prompt", ""),
+            "memory_l2": envelope.task.metadata.get("memory_l2", ""),
+            "memory_l1": envelope.task.metadata.get("memory_l1", ""),
+            "tool_notes": envelope.task.metadata.get("tool_notes", {}),
+            "playbook_prompt": envelope.task.metadata.get("playbook_prompt", ""),
+            "_warmup_filter": envelope.task.metadata.get("_warmup_filter"),
+            "domain": envelope.task.metadata.get("domain", ""),
+            "reanalysis_context": envelope.task.metadata.get("reanalysis_context"),
         }
 
     async def plan(self, perception: dict[str, Any]) -> dict[str, Any]:
         """In mini-ReAct, plan just prepares context — actual execution is in act()."""
         modality = perception["modality"]
         task_type = perception["task_type"]
-        candidates = executor_prompt.get_candidate_tools(modality, task_type)
+
+        # Expose ALL registered tools — no modality/task_type filtering.
+        # The agent reads tool descriptions and selects autonomously.
+        if self._mcp_manager:
+            candidates = list(self._mcp_manager.tool_names())
+        else:
+            candidates = executor_prompt.get_all_tool_names()
+
+        warmup_filter = perception.get("_warmup_filter")
+        if warmup_filter:
+            candidates = warmup_filter(candidates)
+
+        tool_notes = perception.get("tool_notes", {})
+        mcp_tool_map = None
+        if self._mcp_manager:
+            mcp_tool_map = {t.name: t for t in self._mcp_manager.list_tools()}
         tool_guide = executor_prompt.build_tool_guide_text(
-            candidates, experience_insights=self._tool_insights,
+            candidates, experience_insights=tool_notes, mcp_tools=mcp_tool_map,
         )
 
         strategy = perception.get("suggested_strategy") or ""
         strategy_section = ""
         if strategy:
             strategy_section = (
-                f"## Analyzer's Suggested Strategy\n"
+                f"## Recommended Strategy\n"
                 f"Recommendation: **{strategy}**\n\n"
             )
 
-        experiences = perception.get("similar_experiences") or []
-        experience_section = ""
-        if experiences:
-            experience_section = "## Similar Past Experiences\n"
-            for exp in experiences[:3]:
-                passed = "PASSED" if exp.get("quality_gate_passed") else "FAILED"
-                chain = exp.get("tool_chain", [])
-                experience_section += (
-                    f"- tools={chain}, quality_gate={passed}\n"
-                )
-            experience_section += "\n"
+        # SOUL (fixed) + PRINCIPLES (learned) + MEMORY → system prompt
+        system_memory = ""
+        soul = perception.get("soul_prompt", "")
+        principles = perception.get("principles_prompt", "")
+        mem = perception.get("memory_l2", "")
+        mem_parts = [p for p in [soul, principles, mem] if p]
+        if mem_parts:
+            system_memory = "\n".join(mem_parts)
 
-        if modality in ("text", "image"):
-            modality_hint = (
-                f"\nYou are the '{modality}' modality branch. "
-                f"Extract insights from {modality} data using {modality} tools only. "
-                f"The fingerprint describes the time-series — ignore it for tool selection."
-            )
-        else:
-            modality_hint = f"\nYou are specialized for the '{modality}' modality."
+        # Daily notes → first-turn user message
+        daily_section = perception.get("memory_l1", "")
+
+        # PLAYBOOK → first-turn user message (scene-specific SOP)
+        skills_section = perception.get("playbook_prompt", "")
+
+        logger.debug(
+            f"[Executor.plan] Memory injection: SOUL={len(soul)}, "
+            f"PRINCIPLES={len(principles)}, MEMORY={len(mem)}, "
+            f"Daily={len(daily_section)}, PLAYBOOK={len(skills_section)}, "
+            f"ToolNotes={len(perception.get('tool_notes', {}))} tools"
+        )
+
+        modality_hint = ""
+        available_data = []
+        if perception.get("has_text") or modality == "text":
+            available_data.append("text")
+        if perception.get("has_images") or modality == "image":
+            available_data.append("image")
+        modalities_detected = perception.get("modalities", [])
+        if modalities_detected and len(modalities_detected) > 1:
+            modality_hint = f"\nDetected modalities: {', '.join(modalities_detected)}. You can use tools for any modality."
 
         data_context = ""
-        if modality == "text" and perception.get("text_summary"):
-            data_context = (
-                f"\n## Your Data\n{perception['text_summary']}\n"
-                f"You MUST use text tools to extract insights. Do NOT declare done without running tools.\n"
+        if perception.get("text_summary"):
+            data_context += f"\n## Text Data\n{perception['text_summary']}\n"
+        if perception.get("image_summary"):
+            data_context += f"\n## Image Data\n{perception['image_summary']}\n"
+
+        reanalysis_section = ""
+        reanalysis_ctx = perception.get("reanalysis_context")
+        if reanalysis_ctx:
+            prev_logs = reanalysis_ctx.get("previous_execution_logs", [])
+            conflict_detail = reanalysis_ctx.get("conflict_details", "")
+            conflict_reason = reanalysis_ctx.get("conflict_reasoning", "")
+            suggested = reanalysis_ctx.get("suggested_tools", [])
+            parts = ["## Previous Analysis (failed cross-modal check)\n"]
+            if conflict_detail:
+                parts.append(f"Conflict: {conflict_detail}\n")
+            if conflict_reason:
+                parts.append(f"Reasoning: {conflict_reason}\n")
+            if suggested:
+                parts.append(f"Suggested alternative tools: {', '.join(suggested)}\n")
+            for plog in prev_logs:
+                tool = plog.get("tool", "?")
+                ok = plog.get("success", False)
+                summ = plog.get("result_summary", "")[:10000]
+                parts.append(f"- {tool}: {'OK' if ok else 'FAIL'} → {summ}")
+            parts.append(
+                "\nPlease try a DIFFERENT approach from the previous round.\n"
             )
-        elif modality == "image" and perception.get("image_summary"):
-            data_context = f"\n## Your Data\n{perception['image_summary']}\n"
+            reanalysis_section = "\n".join(parts) + "\n"
 
         return {
             "modality": modality,
             "task_type": task_type,
+            "task_description": perception.get("task_description", ""),
             "candidates": candidates,
             "tool_guide": tool_guide,
             "strategy_section": strategy_section,
-            "experience_section": experience_section,
+            "skills_section": skills_section,
+            "system_memory": system_memory,
+            "l1_section": daily_section,
             "modality_hint": modality_hint,
             "data_context": data_context,
             "fingerprint": perception["fingerprint"],
             "horizon": perception.get("horizon"),
+            "domain": perception.get("domain", ""),
+            "reanalysis_section": reanalysis_section,
         }
 
     async def act(self, plan: dict[str, Any], envelope: TaskEnvelope) -> dict[str, Any]:
@@ -157,15 +214,21 @@ class ExecutorAgent(AgentBase):
         final_result: Any = None
         norm_inverse: dict[str, Any] | None = None
 
+        system_memory = plan.get("system_memory", "")
         system_prompt = executor_prompt.REACT_SYSTEM_PROMPT.format(
             max_steps=MAX_REACT_STEPS,
         ) + plan["modality_hint"]
+        if system_memory:
+            system_prompt += f"\n\n{system_memory}"
 
         first_user = executor_prompt.REACT_FIRST_TURN.format(
             task_type=plan["task_type"],
-            fingerprint=str(plan["fingerprint"])[:2000],
+            task_description=plan.get("task_description", ""),
+            fingerprint=str(plan["fingerprint"])[:5000],
+            reanalysis_section=plan.get("reanalysis_section", ""),
             strategy_section=plan["strategy_section"],
-            experience_section=plan["experience_section"],
+            skills_section=plan.get("skills_section", ""),
+            l1_section=plan.get("l1_section", ""),
             tool_guide=plan["tool_guide"],
         ) + plan.get("data_context", "")
 
@@ -191,16 +254,6 @@ class ExecutorAgent(AgentBase):
             is_done = decision.get("done", False)
 
             if is_done:
-                if self._needs_forecast_guard(plan, execution_log, step):
-                    history_lines.append(
-                        f"[Step {step}] ⚠ SYSTEM: forecast task requires a *_forecast "
-                        f"tool. You ran analysis/decomposition but no prediction. "
-                        f"Pick a forecast tool now."
-                    )
-                    trace.agent_step("executor", f"react_step_{step}", {
-                        "thought": thought, "override": "forecast_guard_triggered",
-                    })
-                    continue
                 trace.agent_step("executor", f"react_step_{step}", {
                     "thought": thought, "done": True,
                 })
@@ -221,6 +274,9 @@ class ExecutorAgent(AgentBase):
 
             if horizon and tool_name.endswith("_forecast"):
                 tool_args.setdefault("horizon", horizon)
+
+            if plan.get("domain"):
+                tool_args.setdefault("domain", plan["domain"])
 
             result = await self._execute_tool(
                 tool_name, tool_args, current_data, text_data, images,
@@ -249,7 +305,8 @@ class ExecutorAgent(AgentBase):
 
             log_entry = {
                 "tool": tool_name, "args": tool_args, "success": success,
-                "result_summary": result_summary[:300],
+                "result_summary": result_summary[:50000],
+                "output": result.data if success else None,
             }
             execution_log.append(log_entry)
 
@@ -264,7 +321,7 @@ class ExecutorAgent(AgentBase):
 
             trace.agent_step("executor", f"react_step_{step}", {
                 "thought": thought, "tool": tool_name, "args": tool_args,
-                "success": success, "result_preview": result_summary[:200],
+                "success": success, "result_preview": result_summary[:5000],
             })
 
         if norm_inverse and final_result is not None:
@@ -282,7 +339,7 @@ class ExecutorAgent(AgentBase):
             "tools_passed": sum(1 for e in execution_log if e.get("success")),
             "denormalized": norm_inverse is not None,
             "prediction_type": type(final_result).__name__,
-            "prediction_preview": str(final_result)[:500] if final_result else None,
+            "prediction_preview": str(final_result)[:5000] if final_result else None,
         })
         return act_result
 
@@ -299,27 +356,6 @@ class ExecutorAgent(AgentBase):
         if hasattr(result_data, "shape") or isinstance(result_data, (list, np.ndarray)):
             return True
         return False
-
-    _FORECAST_TOOLS = frozenset({
-        "arima_forecast", "ets_forecast", "sbm_forecast",
-        "prophet_forecast", "ensemble_forecast", "checkpoint_forecast",
-    })
-
-    def _needs_forecast_guard(
-        self,
-        plan: dict[str, Any],
-        execution_log: list[dict[str, Any]],
-        step: int,
-    ) -> bool:
-        """Return True if this is a forecast task on timeseries but no forecast tool was run."""
-        if plan.get("task_type") != "forecast":
-            return False
-        if plan.get("modality") != "timeseries":
-            return False
-        if step >= MAX_REACT_STEPS:
-            return False
-        ran_tools = {e["tool"] for e in execution_log if e.get("success")}
-        return not ran_tools.intersection(self._FORECAST_TOOLS)
 
     async def reflect(self, action_result: dict[str, Any]) -> dict[str, Any]:
         log = action_result.get("execution_log", [])
@@ -340,7 +376,31 @@ class ExecutorAgent(AgentBase):
         text_data: Any,
         images: Any,
     ) -> ToolResult | None:
-        """Execute a single tool with proper multimodal data injection."""
+        """Execute a single tool — routes through MCP when available, falls back to in-process."""
+        # ── MCP path ──
+        if self._mcp_manager and self._mcp_manager.get_tool(tool_name):
+            mcp_args: dict[str, Any] = dict(tool_args)
+            if data is not None and "ts_data" not in mcp_args:
+                mcp_args["ts_data"] = data.tolist() if hasattr(data, "tolist") else list(data) if data is not None else None
+            if text_data is not None and "text" not in mcp_args:
+                if isinstance(text_data, list):
+                    import json as _json
+                    mcp_args["text"] = _json.dumps(text_data, ensure_ascii=False, default=str)
+                else:
+                    mcp_args["text"] = str(text_data)
+            if images is not None and "images" not in mcp_args:
+                mcp_args["images"] = images
+
+            r = await self._mcp_manager.call_tool(tool_name, mcp_args)
+            status = "PASS" if r["success"] else f"FAIL | {r['error']}"
+            logger.info(f"[Executor/MCP] {tool_name}: {status}")
+            return ToolResult(
+                success=r["success"],
+                data=r["data"],
+                error=r.get("error"),
+            )
+
+        # ── In-process fallback ──
         try:
             tool = get_tool_instance(tool_name)
         except KeyError:
@@ -373,21 +433,36 @@ class ExecutorAgent(AgentBase):
 
     @staticmethod
     def _summarize_result(data: Any) -> str:
-        """Produce a concise summary of tool output for the LLM's history."""
+        """Produce a summary of tool output for the LLM's history.
+
+        Preserves full data when feasible (GPT-5.1 has 400K token context).
+        Arrays up to 2000 elements are kept in full; larger ones get
+        head-200 + tail-200.  Dict values up to 10K chars each.
+        """
         if data is None:
             return "None"
+        if isinstance(data, np.ndarray):
+            flat = data.ravel()
+            if flat.size <= 2000:
+                vals = ", ".join(f"{v:.4f}" for v in flat)
+                return f"ndarray shape={data.shape} values=[{vals}]"
+            head = ", ".join(f"{v:.4f}" for v in flat[:200])
+            tail = ", ".join(f"{v:.4f}" for v in flat[-200:])
+            return (
+                f"ndarray shape={data.shape} "
+                f"range=[{float(data.min()):.4f}, {float(data.max()):.4f}] "
+                f"values=[{head}, ..., {tail}]"
+            )
         if isinstance(data, dict):
             parts = []
-            for k, v in list(data.items())[:8]:
+            for k, v in list(data.items())[:20]:
                 v_str = str(v)
-                if len(v_str) > 120:
-                    v_str = v_str[:120] + "..."
+                if len(v_str) > 10000:
+                    v_str = v_str[:10000] + "..."
                 parts.append(f"{k}={v_str}")
             return ", ".join(parts)
-        if isinstance(data, np.ndarray):
-            return f"ndarray shape={data.shape} range=[{data.min():.4f}, {data.max():.4f}]"
         s = str(data)
-        return s[:300] if len(s) > 300 else s
+        return s[:50000] if len(s) > 50000 else s
 
     @staticmethod
     def _fmt_args(args: dict[str, Any]) -> str:
@@ -397,8 +472,8 @@ class ExecutorAgent(AgentBase):
         parts = []
         for k, v in args.items():
             v_str = str(v)
-            if len(v_str) > 50:
-                v_str = v_str[:50] + "..."
+            if len(v_str) > 500:
+                v_str = v_str[:500] + "..."
             parts.append(f"{k}={v_str}")
         return ", ".join(parts)
 

@@ -25,7 +25,10 @@ class VectorStore:
     def __init__(self, db_path: str | Path = ".timeclaw/vector_store.db"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn = sqlite3.connect(str(self.db_path), timeout=30,
+                                     check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._init_schema()
         self._tfidf_vocab: dict[str, int] | None = None
         self._idf: np.ndarray | None = None
@@ -49,11 +52,20 @@ class VectorStore:
     def add(self, id: str, text: str, vector: np.ndarray, metadata: dict[str, Any] | None = None) -> None:
         vec_bytes = vector.astype(np.float32).tobytes()
         meta_json = json.dumps(metadata or {})
-        self._conn.execute(
-            "INSERT OR REPLACE INTO vectors (id, text, vector, metadata) VALUES (?, ?, ?, ?)",
-            (id, text, vec_bytes, meta_json),
-        )
-        self._conn.commit()
+        for attempt in range(5):
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO vectors (id, text, vector, metadata) VALUES (?, ?, ?, ?)",
+                    (id, text, vec_bytes, meta_json),
+                )
+                self._conn.commit()
+                return
+            except sqlite3.OperationalError:
+                if attempt < 4:
+                    import time as _time
+                    _time.sleep(0.1 * (attempt + 1))
+                else:
+                    raise
 
     def search(
         self,
@@ -149,6 +161,26 @@ class VectorStore:
     def size(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM vectors").fetchone()
         return row[0] if row else 0
+
+    def delete(self, ids: list[str]) -> int:
+        """Delete entries by ID. Returns number of rows deleted."""
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        for attempt in range(5):
+            try:
+                cursor = self._conn.execute(
+                    f"DELETE FROM vectors WHERE id IN ({placeholders})", ids,
+                )
+                self._conn.commit()
+                return cursor.rowcount
+            except sqlite3.OperationalError:
+                if attempt < 4:
+                    import time as _time
+                    _time.sleep(0.1 * (attempt + 1))
+                else:
+                    raise
+        return 0
 
     def clear(self) -> None:
         self._conn.execute("DELETE FROM vectors")

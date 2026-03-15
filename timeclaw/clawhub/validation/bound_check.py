@@ -19,7 +19,13 @@ class BoundCheckTool(ClawTool):
 
     name: str = "bound_check"
     category: ToolCategory = ToolCategory.VALIDATION
-    description: str = "Check if time series or prediction values are within lower/upper bounds."
+    description: str = (
+        "Validates that all values in a time series or prediction fall within specified lower and upper bounds. "
+        "Input: time-series or prediction array. "
+        "Output: dict with 'passed' boolean and list of any 'violations' (indices and values outside bounds). "
+        "Use for sanity-checking predictions against known physical limits or acceptable ranges. "
+        "Params: lower (lower bound value), upper (upper bound value)."
+    )
     io_type: ToolIOType = ToolIOType.XP_TO_ACCEPT
     parameters_schema: dict[str, Any] = {
         "type": "object",

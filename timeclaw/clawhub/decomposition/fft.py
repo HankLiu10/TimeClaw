@@ -20,7 +20,15 @@ class FFTSpectrumTool(ClawTool):
 
     name: str = "fft_spectrum"
     category: ToolCategory = ToolCategory.DECOMPOSITION
-    description: str = "Compute FFT frequency spectrum (frequencies and magnitudes) of time series."
+    description: str = (
+        "Transform a time series from the time domain into the frequency domain using the Fast "
+        "Fourier Transform (FFT). Input: univariate time series array (uses the first channel if "
+        "multivariate). Output: dict with 'frequencies' array and 'magnitudes' array representing "
+        "the amplitude at each frequency bin. Use when you need to identify dominant periodicities, "
+        "discover hidden frequency components, or determine whether a signal is dominated by "
+        "low-frequency trends or high-frequency noise. Unlike wavelet_transform, FFT provides a "
+        "global frequency view without time localization. No required parameters."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

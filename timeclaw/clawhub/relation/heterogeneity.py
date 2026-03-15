@@ -30,7 +30,15 @@ class HeterogeneityScoreTool(ClawTool):
 
     name: str = "heterogeneity_score"
     category: ToolCategory = ToolCategory.RELATION
-    description: str = "Compute heterogeneity score across time series channels."
+    description: str = (
+        "Compute a heterogeneity score that measures how different multivariate time series "
+        "channels are from each other at each time step, using the mean coefficient of "
+        "variation across rows. Input: multivariate time series with at least 2 channels "
+        "(2-D array or DataFrame). Output: dict with 'heterogeneity_score' (higher means more "
+        "diverse channels), 'channel_means', 'channel_stds', and 'n_channels'. Use when you "
+        "need to assess whether channels behave similarly or diverge, e.g., before deciding "
+        "to aggregate channels or to flag disparate behavior. No required parameters."
+    )
     io_type: ToolIOType = ToolIOType.XK_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

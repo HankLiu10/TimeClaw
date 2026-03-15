@@ -19,7 +19,15 @@ class ARIMAForecastTool(ClawTool):
 
     name: str = "arima_forecast"
     category: ToolCategory = ToolCategory.PREDICTION
-    description: str = "Forecast time series using ARIMA model."
+    description: str = (
+        "Forecast a univariate time series using the ARIMA (AutoRegressive Integrated Moving Average) model. "
+        "Input: 1-D numeric array (minimum 10 observations). "
+        "Output: dict with 'forecast' (array of predicted values), 'horizon', and 'order'. "
+        "Strengths: fast, lightweight, and effective on stationary or near-stationary series with linear dynamics. "
+        "Best when the series has no strong seasonal component or when differencing can remove the trend. "
+        "Key params: 'order' — tuple (p, d, q) controlling autoregressive, differencing, and moving-average terms "
+        "(default (1,1,1)); 'horizon' — number of steps ahead to forecast (default 10)."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

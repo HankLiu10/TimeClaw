@@ -31,7 +31,16 @@ class CointegrationTestTool(ClawTool):
 
     name: str = "cointegration_test"
     category: ToolCategory = ToolCategory.RELATION
-    description: str = "Test cointegration between time series channels (e.g., Engle-Granger)."
+    description: str = (
+        "Test whether two non-stationary time series share a long-run equilibrium relationship "
+        "using the Engle-Granger cointegration test. Input: multivariate time series with at "
+        "least 2 channels (tests the first two columns). Output: dict with 'cointegrated' "
+        "(bool, true if p < 0.05), 'test_statistic', 'p_value', and 'critical_values' at 1%, "
+        "5%, and 10% significance levels. Use when you need to determine if two series move "
+        "together in the long run despite being individually non-stationary — e.g., for pairs "
+        "trading, identifying co-moving economic indicators, or validating long-run "
+        "relationships. No required parameters."
+    )
     io_type: ToolIOType = ToolIOType.XK_TO_C
     parameters_schema: dict[str, Any] = {
         "type": "object",

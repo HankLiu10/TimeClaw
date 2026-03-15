@@ -66,7 +66,7 @@ class MultimodalQATask(BenchmarkTask):
                 answer = str(result.get("answer", ""))
             elif hasattr(pipeline, "complete"):
                 prompt = (
-                    f"Context: {text_context[:500]}\n"
+                    f"Context: {text_context[:10000]}\n"
                     f"Question: {question_text}\n"
                     f"Answer:"
                 )

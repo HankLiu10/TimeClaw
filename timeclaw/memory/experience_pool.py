@@ -32,6 +32,7 @@ class ExperienceEntry(BaseModel):
     prediction_summary: str = ""
     timestamp: float = Field(default_factory=time.time)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    ground_truth_metrics: dict[str, Any] = Field(default_factory=dict)
 
     def to_search_text(self) -> str:
         """Combine key fields into a single searchable text blob."""
@@ -194,7 +195,7 @@ class ExperiencePool:
                     "passed": entry.quality_gate_passed,
                     "task_type": entry.task_type,
                     "chain": entry.tool_chain,
-                    "fingerprint": entry.fingerprint_summary[:200],
+                    "fingerprint": entry.fingerprint_summary[:1000],
                 })
 
         stats: dict[str, dict[str, Any]] = {}

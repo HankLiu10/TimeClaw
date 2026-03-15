@@ -32,7 +32,17 @@ class WaveletTransformTool(ClawTool):
 
     name: str = "wavelet_transform"
     category: ToolCategory = ToolCategory.DECOMPOSITION
-    description: str = "Decompose time series using wavelet transform (e.g., pywt)."
+    description: str = (
+        "Decompose a time series using the discrete wavelet transform, providing time-frequency "
+        "analysis that reveals how frequency content changes over time (unlike FFT which gives "
+        "only a global frequency view). Input: univariate time series array. Output: dict with "
+        "'coefficients' (list of coefficient arrays — first element is the approximation "
+        "coefficients, remaining are detail coefficients from coarsest to finest scale), "
+        "'wavelet', 'levels', and 'lengths'. Use when you need to analyze localized frequency "
+        "behavior, detect transient events, or denoise a signal at specific scales. Key params: "
+        "wavelet (str, default 'db4') — wavelet family (e.g., 'db4', 'haar', 'sym5'); level "
+        "(int, default auto) — decomposition depth."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",

@@ -20,7 +20,16 @@ class NormalizeTool(ClawTool):
 
     name: str = "normalize"
     category: ToolCategory = ToolCategory.PROCESSING
-    description: str = "Normalize time series using z-score or min-max scaling."
+    description: str = (
+        "Normalize a 1-D numeric time-series array using z-score or min-max scaling. "
+        "Input: a 1-D numeric array (list, np.ndarray, or single-column DataFrame). "
+        "Output: the transformed array of the same shape plus inverse-transform metadata "
+        "(stored in result.metadata['inverse']) that can be passed to "
+        "NormalizeTool.denormalize() to recover original scale. "
+        "Use this as a preprocessing step before feeding data into forecast or anomaly-detection "
+        "models that are sensitive to value range, and denormalize predictions afterward. "
+        "Parameters: method ('zscore' | 'minmax', default 'zscore')."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",
@@ -42,7 +51,9 @@ class NormalizeTool(ClawTool):
         "normalize": "zscore",
     }
 
-    def _resolve_method(self, raw: str) -> str:
+    def _resolve_method(self, raw: str | None) -> str:
+        if not raw:
+            return "zscore"
         return self._METHOD_ALIASES.get(raw.lower().strip(), "zscore")
 
     async def execute(

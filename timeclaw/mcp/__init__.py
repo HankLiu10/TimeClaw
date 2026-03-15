@@ -1,12 +1,23 @@
-"""MCP (Model Context Protocol) compatibility layer for TimeClaw.
+"""MCP (Model Context Protocol) integration for TimeClaw.
 
-Provides:
-- ClawHubMCPServer: exposes ClawHub tools as MCP tools via stdio/HTTP
-- MCPToolWrapper: wraps remote MCP tools as local ClawTool instances
-- register_mcp_tools: connects to external MCP servers and registers their tools
+Architecture:
+    - 9 category-based MCP Servers (stdio transport) expose all 63 ClawHub tools
+    - MCPManager manages server lifecycle and provides unified tool API
+    - PipelineRunner and Executor route tool calls through MCPManager
+
+Components:
+    - server_factory: Wraps ClawTool instances as FastMCP tools
+    - servers/: Entry scripts for each category server
+    - manager: MCPManager lifecycle + dispatch
+    - server/client: Legacy compatibility (retained for external MCP)
 """
 
-from timeclaw.mcp.server import ClawHubMCPServer
-from timeclaw.mcp.client import MCPToolWrapper, register_mcp_tools
+from timeclaw.mcp.manager import MCPManager, MCPServerConfig, ToolDescriptor
+from timeclaw.mcp.server_factory import create_category_server
 
-__all__ = ["ClawHubMCPServer", "MCPToolWrapper", "register_mcp_tools"]
+__all__ = [
+    "MCPManager",
+    "MCPServerConfig",
+    "ToolDescriptor",
+    "create_category_server",
+]

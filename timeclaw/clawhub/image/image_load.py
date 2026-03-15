@@ -14,7 +14,13 @@ class ImageLoadTool(ClawTool):
 
     name: str = "image_load"
     category: ToolCategory = ToolCategory.IMAGE
-    description: str = "Load an image file and return metadata (size, mode, basic pixel stats)."
+    description: str = (
+        "Loads an image from a file path or base64 string and extracts basic metadata. "
+        "Input: image file path or base64-encoded image string. "
+        "Output: dict with width, height, mode, and pixel statistics. "
+        "Use as the first step in any image analysis pipeline to inspect image properties before further processing. "
+        "Params: path (file path to image), b64 (base64-encoded image string); provide one of the two."
+    )
     io_type: ToolIOType = ToolIOType.I_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",
@@ -36,6 +42,8 @@ class ImageLoadTool(ClawTool):
             if isinstance(first, dict):
                 path = first.get("path", path)
                 b64_data = first.get("data", b64_data)
+            elif isinstance(first, str):
+                path = first
 
         try:
             from PIL import Image

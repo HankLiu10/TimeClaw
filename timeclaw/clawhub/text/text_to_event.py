@@ -13,7 +13,13 @@ class TextToEventTool(ClawTool):
 
     name: str = "text_to_event"
     category: ToolCategory = ToolCategory.TEXT
-    description: str = "Extract structured events (type, timestamp, description) from text."
+    description: str = (
+        "Parses narrative text into structured event records with timestamps. "
+        "Input: text data (string or list of text dicts). "
+        "Output: list of dicts, each with 'event', 'timestamp', and 'type' fields. "
+        "Use when you need to align news, reports, or logs with time-series data by extracting discrete events. "
+        "Params: event_types (list of event categories to look for), model ('light'/'heavy')."
+    )
     io_type: ToolIOType = ToolIOType.T_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

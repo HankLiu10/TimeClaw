@@ -30,7 +30,16 @@ class MutualInformationTool(ClawTool):
 
     name: str = "mutual_information"
     category: ToolCategory = ToolCategory.RELATION
-    description: str = "Compute mutual information between time series channels."
+    description: str = (
+        "Compute the mutual information (MI) between two time series channels, measuring "
+        "general (including nonlinear) statistical dependence. Unlike correlation, MI captures "
+        "any kind of relationship, not just linear or monotonic. Input: multivariate time "
+        "series with at least 2 channels (uses the first two columns). Output: dict with "
+        "'mutual_information' (raw MI in nats) and 'normalized_mi' (scaled to [0, 1]). Use "
+        "when you suspect nonlinear dependencies that Pearson/Spearman correlation would miss, "
+        "or when you need a single dependency score without assuming a relationship form. Key "
+        "param: bins (int, default 20) — number of histogram bins for density estimation."
+    )
     io_type: ToolIOType = ToolIOType.XK_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

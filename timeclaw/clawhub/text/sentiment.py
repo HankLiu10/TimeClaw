@@ -35,7 +35,13 @@ class SentimentTool(ClawTool):
 
     name: str = "sentiment"
     category: ToolCategory = ToolCategory.TEXT
-    description: str = "Analyze sentiment polarity (positive/negative/neutral) of text."
+    description: str = (
+        "Determines the emotional tone of text, classifying it as positive, negative, or neutral. "
+        "Input: text data (string or list of text dicts). "
+        "Output: dict with 'sentiment' label and numeric 'score' (-1 to 1). "
+        "Use when you need to understand market sentiment, event impact, or opinion polarity from text. "
+        "Params: model ('light' for fast/short text, 'heavy' for accurate/complex text)."
+    )
     io_type: ToolIOType = ToolIOType.T_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",

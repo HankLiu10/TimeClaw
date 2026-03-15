@@ -18,7 +18,16 @@ class EnsembleForecastTool(ClawTool):
 
     name: str = "ensemble_forecast"
     category: ToolCategory = ToolCategory.PREDICTION
-    description: str = "Combine multiple forecast models into an ensemble."
+    description: str = (
+        "Combine forecasts from multiple models into a single ensemble prediction. "
+        "Input: requires 'forecasts' param — a list of at least 2 numeric forecast arrays "
+        "produced by previous forecast tool steps (e.g. arima_forecast, ets_forecast). "
+        "Output: dict with 'forecast' (blended prediction array), 'method', and 'n_models'. "
+        "Aggregation methods: 'mean' (simple average, default), 'median', or 'weighted' (requires 'weights' param). "
+        "Use this tool after running two or more individual forecast tools to produce "
+        "a more robust blended prediction that reduces single-model variance. "
+        "Key params: 'forecasts' (required list of arrays); 'method'; 'weights' (required when method='weighted')."
+    )
     io_type: ToolIOType = ToolIOType.X_TO_X
     parameters_schema: dict[str, Any] = {
         "type": "object",
