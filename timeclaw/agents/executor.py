@@ -22,7 +22,7 @@ from timeclaw.core.evidence import EvidenceEntry
 from timeclaw.core.message import AgentRole
 from timeclaw.core.tea_protocol import TaskEnvelope
 
-MAX_REACT_STEPS = 6
+MAX_REACT_STEPS = 10
 
 
 class ExecutorAgent(AgentBase):
@@ -50,18 +50,26 @@ class ExecutorAgent(AgentBase):
         text_summary = ""
         if envelope.environment.text_data:
             texts = envelope.environment.text_data
-            text_summary = f"{len(texts)} text documents: "
-            previews = []
+            parts = [f"{len(texts)} text documents:\n"]
             for t in texts[:10]:
                 src = t.get("source", "?")
                 ts = t.get("timestamp", "?")
-                content = str(t.get("content", ""))[:2000]
-                previews.append(f"[{src}@{ts}] {content}")
-            text_summary += "; ".join(previews)
+                content = str(t.get("content", t.get("text", "")))[:5000]
+                parts.append(f"### [{src} @ {ts}]\n{content}\n")
+            text_summary = "\n".join(parts)
 
         image_summary = ""
         if envelope.environment.images:
-            image_summary = f"{len(envelope.environment.images)} images available"
+            imgs = envelope.environment.images
+            img_parts = [f"{len(imgs)} images:"]
+            for img in imgs[:10]:
+                if isinstance(img, dict):
+                    path = img.get("path", img.get("url", "unknown"))
+                    desc = img.get("description", "")
+                    img_parts.append(f"- {path}" + (f": {desc}" if desc else ""))
+                else:
+                    img_parts.append(f"- {str(img)[:200]}")
+            image_summary = "\n".join(img_parts)
 
         return {
             "task_type": envelope.task.task_type,
@@ -213,6 +221,9 @@ class ExecutorAgent(AgentBase):
         current_data = data
         final_result: Any = None
         norm_inverse: dict[str, Any] | None = None
+        agent_answer_type: str = ""
+        agent_confidence: float | None = None
+        agent_reasoning: str = ""
 
         system_memory = plan.get("system_memory", "")
         system_prompt = executor_prompt.REACT_SYSTEM_PROMPT.format(
@@ -254,8 +265,17 @@ class ExecutorAgent(AgentBase):
             is_done = decision.get("done", False)
 
             if is_done:
+                agent_answer = decision.get("answer")
+                agent_answer_type = decision.get("answer_type", "")
+                agent_confidence = decision.get("confidence")
+                agent_reasoning = decision.get("reasoning", thought)
+                if agent_answer is not None:
+                    final_result = agent_answer
                 trace.agent_step("executor", f"react_step_{step}", {
                     "thought": thought, "done": True,
+                    "answer_type": agent_answer_type,
+                    "confidence": agent_confidence,
+                    "has_answer": agent_answer is not None,
                 })
                 break
 
@@ -330,6 +350,10 @@ class ExecutorAgent(AgentBase):
 
         act_result = {
             "prediction": final_result,
+            "answer": final_result,
+            "answer_type": agent_answer_type,
+            "confidence": agent_confidence,
+            "reasoning": agent_reasoning,
             "execution_log": execution_log,
             "method_used": f"mini-react ({len(execution_log)} steps)",
             "modality": plan["modality"],
@@ -340,6 +364,8 @@ class ExecutorAgent(AgentBase):
             "denormalized": norm_inverse is not None,
             "prediction_type": type(final_result).__name__,
             "prediction_preview": str(final_result)[:5000] if final_result else None,
+            "answer_type": act_result.get("answer_type"),
+            "confidence": act_result.get("confidence"),
         })
         return act_result
 

@@ -50,19 +50,21 @@ def _get_final_llm():
     if _final_llm is None:
         cfg = TimeClawConfig.load()
         router = ModelRouter(cfg.llm)
-        _final_llm = router.get_backend("reasoner")
+        _final_llm = router.get_backend("executor")
     return _final_llm
 
 
 
 def _extract_tool_chain(result: dict[str, Any]) -> list[str]:
     """Extract the list of tools used from pipeline result."""
+    chain = result.get("tool_chain")
+    if chain:
+        return [t for t in chain if t]
     tools = []
-    for mod_result in result.get("per_modality_results", {}).values():
-        for entry in mod_result.get("execution_log", []):
-            t = entry.get("tool", "")
-            if t and entry.get("success"):
-                tools.append(t)
+    for entry in result.get("execution_log", []):
+        t = entry.get("tool", "")
+        if t and entry.get("success"):
+            tools.append(t)
     return tools
 
 
@@ -75,11 +77,8 @@ def _build_pipeline_analysis_summary(result: dict[str, Any]) -> str:
     """
     parts: list[str] = []
 
-    per_mod = result.get("per_modality_results", {})
-    for modality, mod_result in per_mod.items():
-        exec_log = mod_result.get("execution_log", [])
-        if not exec_log:
-            continue
+    exec_log = result.get("execution_log", [])
+    if exec_log:
         tool_lines = []
         for entry in exec_log:
             tool_name = entry.get("tool", "unknown")
@@ -97,7 +96,7 @@ def _build_pipeline_analysis_summary(result: dict[str, Any]) -> str:
                     out_str = out_str[:50000] + "..."
                 tool_lines.append(f"  - {tool_name}: {out_str}")
         if tool_lines:
-            parts.append(f"[{modality} modality tools]")
+            parts.append("[Tool execution log]")
             parts.extend(tool_lines)
 
     ev = result.get("evidence_summary")
@@ -317,7 +316,7 @@ async def _eval_forecast(
                 ground_truth=json.dumps([float(x) for x in sample.output_window[:50]]),
                 correct=(mae < 5.0),
                 metrics={k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
-                pipeline_summary=str(result.get("analysis", ""))[:2000],
+                pipeline_summary=str(result.get("evidence_summary", ""))[:2000],
                 data_fingerprint=f"horizon={horizon},last5={[float(x) for x in sample.input_window[-5:]]}",
             )
         return {"metrics": metrics, "trace_id": result.get("trace_id")}

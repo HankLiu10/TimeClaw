@@ -82,6 +82,8 @@ Each turn, you see the results of all previous steps. You then decide:
    appropriate for the data and task — there are no modality restrictions.
 
 ## Output Format (strict JSON)
+
+To call a tool:
 {{
   "thought": "what I learned from previous results and what I should do next",
   "done": false,
@@ -89,11 +91,19 @@ Each turn, you see the results of all previous steps. You then decide:
   "args": {{"key": "value"}}
 }}
 
-When done:
+When done — you MUST include `answer` with the final result:
 {{
-  "thought": "summary of what was accomplished",
-  "done": true
+  "thought": "summary of analysis and reasoning for the final answer",
+  "done": true,
+  "answer": "<the final result — array for forecast, dict for indicator, label for classification, text for QA>",
+  "answer_type": "forecast | indicator | classification | qa | correlation",
+  "confidence": 0.85,
+  "reasoning": "brief explanation of how the answer was derived from tool outputs"
 }}
+
+IMPORTANT: `done: true` without `answer` is INVALID. You must always provide a
+concrete answer. If tools failed, still give your best-effort result based on
+available information.
 """
 
 REACT_FIRST_TURN = """\

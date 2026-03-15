@@ -1,6 +1,5 @@
-"""Two-agent team: Executor (ReAct tool orchestration) + Reasoner (multimodal fusion)."""
+"""Single-agent architecture: Executor (ReAct tool orchestration across all modalities)."""
 
 from timeclaw.agents.executor import ExecutorAgent
-from timeclaw.agents.reasoner import ReasonerAgent
 
-__all__ = ["ExecutorAgent", "ReasonerAgent"]
+__all__ = ["ExecutorAgent"]
