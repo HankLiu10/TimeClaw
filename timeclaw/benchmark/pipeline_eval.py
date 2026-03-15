@@ -278,10 +278,33 @@ async def _eval_forecast(
     if sample.text:
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
 
+    input_days = len(sample.input_window) // 24
+    horizon_days = horizon // 24
+    ds = getattr(sample, "dataset", "")
+
+    if sample.domain == "weather":
+        desc = (
+            f"The input time-series represents temperature readings from a location "
+            f"in the United States, where summers are hot and winters are cold. "
+            f"Weather conditions can also be affected by storms, heavy rain, and cold fronts. "
+            f"The daytime is usually warmer than the nighttime. "
+            f"Every 24 temperature readings represent a full day from 00:00 to 23:00. "
+            f"Predict the next {horizon_days} day(s) of hourly temperature readings "
+            f"({horizon} values). Return a JSON array of {horizon} numbers."
+        )
+    else:
+        input_desc = "7 days at 5-minute intervals" if "short" in ds else "30 days of daily prices"
+        output_desc = f"next {'1 day' if horizon_days <= 1 else f'{horizon_days} days'}"
+        desc = (
+            f"Time Series Stock Price Data recorded at {input_desc}. "
+            f"Predict the stock prices for the {output_desc} ({horizon} values). "
+            f"Return a JSON array of {horizon} numbers."
+        )
+
     result = await pipeline.run(
         data=sample.input_window,
         task_type="forecast",
-        description=f"{sample.domain} forecast",
+        description=desc,
         horizon=horizon,
         text_data=text_data,
         verbose=verbose,
@@ -333,10 +356,16 @@ async def _eval_mcqa(
     if sample.text:
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
 
+    mcqa_desc = (
+        f"{sample.question[:5000]}\n\n"
+        f"Answer the multiple-choice question by choosing exactly one of A, B, C, or D. "
+        'Return ONLY JSON: {"answer": "X"}'
+    )
+
     result = await pipeline.run(
         data=sample.input_window,
         task_type="qa",
-        description=sample.question[:5000],
+        description=mcqa_desc,
         text_data=text_data,
         verbose=verbose,
         domain=sample.domain,
@@ -396,10 +425,31 @@ async def _eval_trend(
     if sample.text:
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
 
+    if sample.domain == "weather":
+        trend_desc = (
+            "The input time-series represents temperature readings from a US location. "
+            "Every 24 readings represent a full day from 00:00 to 23:00. "
+            "Predict the temperature trend for the next 1 day. "
+            "Calculate the mean temperature of the last 24-hour period and compare it "
+            "with the mean temperature of the first predicted day. "
+            "If the difference is >= 0.5, classify as 'increasing'. "
+            "If the difference is <= -0.5, classify as 'decreasing'. "
+            "Otherwise, classify as 'stable'. "
+            'Return ONLY JSON: {"trend": "increasing" or "decreasing" or "stable"}'
+        )
+    else:
+        trend_desc = (
+            "Time Series Stock Price Data. "
+            "Predict the stock trend and categorize the future percentage change into "
+            'one of: "<-4%", "-2% ~ -4%", "-2% ~ +2%", "+2% ~ +4%", ">+4%". '
+            "Analyze the provided time-series data and news to identify future trends. "
+            'Return ONLY JSON: {"trend": "<label>"}'
+        )
+
     result = await pipeline.run(
         data=sample.input_window,
         task_type="classification",
-        description=f"{sample.domain} trend classification",
+        description=trend_desc,
         text_data=text_data,
         verbose=verbose,
         domain=sample.domain,
@@ -527,8 +577,15 @@ async def _eval_weather_indicator(
         data=sample.input_window,
         task_type="indicator",
         description=(
-            f"Predict the next {n_days} day(s) highest temperature, lowest temperature, "
-            f"and the difference between them (max, min, diff) from hourly temperature readings."
+            f"The input time-series represents temperature readings from a location "
+            f"in the United States, where summers are hot and winters are cold. "
+            f"Weather conditions can also be affected by storms, heavy rain, and cold fronts. "
+            f"The daytime is usually warmer than the nighttime. "
+            f"Every 24 temperature readings represent a full day from 00:00 to 23:00. "
+            f"Analyze the past 7 days' temperature trend and predict the next {n_days} day(s) "
+            f"highest temperature, lowest temperature, and the temperature difference "
+            f"between them. "
+            f'Return ONLY JSON: {{"max": number, "min": number, "diff": number}}'
         ),
         horizon=n_hours,
         text_data=text_data,
@@ -614,14 +671,25 @@ async def _eval_stock_indicator(
     if gt_bb is not None:
         indicator_names.append("upper Bollinger Band")
 
+    ds = getattr(sample, "dataset", "")
+    input_desc = "7 days at 5-minute intervals" if "short" in ds else "30 days of daily prices"
+    schema_parts = []
+    if gt_macd is not None:
+        schema_parts.append('"macd": <number>')
+    if gt_bb is not None:
+        schema_parts.append('"upper_bb": <number>')
+    target_schema = "{" + ", ".join(schema_parts) + "}"
+
     result = await pipeline.run(
         data=sample.input_window,
         task_type="indicator",
         description=(
-            f"Stock price analysis: predict the following technical indicators for the "
-            f"NEXT trading day: {', '.join(indicator_names)}. "
-            f"MACD = EMA(12) - EMA(26) of closing price. "
-            f"Upper Bollinger Band = SMA(20) + 2 * StdDev(20)."
+            f"Stock price data recorded at {input_desc}. "
+            f"Predict the following technical indicators for the NEXT trading day: "
+            f"{', '.join(indicator_names)}. "
+            f"MACD (Moving Average Convergence Divergence) = EMA(12) - EMA(26) of closing price. "
+            f"Upper Bollinger Band = SMA(20) + 2 * StdDev(20). "
+            f"Return ONLY JSON: {target_schema}"
         ),
         horizon=len(sample.output_window) if sample.output_window is not None else 78,
         text_data=text_data,
@@ -742,7 +810,16 @@ async def _eval_correlation(
     result = await pipeline.run(
         data=sample.input_window,
         task_type="qa",
-        description="Analyze the correlation between news sentiment and stock price movement",
+        description=(
+            "Predict the correlation between the stock's price fluctuations in the "
+            "next 7 days and the analysis sentiment. Positive correlation indicates "
+            "that positive analysis leads to price increase and negative analysis "
+            "leads to price decrease. Take into account external factors or market "
+            "conditions that might affect stock price movement. "
+            "Choose one of: Strong Positive Correlation, Moderate Positive Correlation, "
+            "No Correlation, Moderate Negative Correlation, Strong Negative Correlation. "
+            'Return ONLY JSON: {"correlation": "<label>"}'
+        ),
         text_data=text_data,
         verbose=verbose,
         domain="finance",
