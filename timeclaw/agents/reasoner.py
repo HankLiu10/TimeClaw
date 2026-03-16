@@ -116,14 +116,14 @@ class ReasonerAgent(AgentBase):
             # Step 3: LLM synthesizes final answer from all modality evidence
             #
             # If the executor already produced a structured dict from an
-            # LLM-based tool (e.g. llm_indicator), pass it through directly
+            # LLM-based tool (e.g. llm_reasoning), pass it through directly
             # to avoid degrading precision via re-synthesis.
             ts_pred = pmr.get("timeseries", {}).get("prediction")
             ts_exec_log = pmr.get("timeseries", {}).get("execution_log", [])
             last_tool = ts_exec_log[-1].get("tool", "") if ts_exec_log else ""
             skip_synthesis = (
                 isinstance(ts_pred, dict)
-                and last_tool in ("llm_indicator",)
+                and last_tool in ("llm_reasoning", "llm_indicator")
                 and len(ts_pred) > 0
             )
 
@@ -450,11 +450,6 @@ class ReasonerAgent(AgentBase):
             )
 
         domain_block = ""
-        if domain:
-            from timeclaw.clawhub.prediction.llm_indicator import _DOMAIN_CONTEXT
-            ctx = _DOMAIN_CONTEXT.get(domain, "")
-            if ctx:
-                domain_block = f"\n=== DOMAIN CONTEXT ({domain}) ===\n{ctx}\n"
 
         text_context = ""
         if text_data:

@@ -129,6 +129,7 @@ class MCPConfig(BaseModel):
         MCPServerEntry(name="timeclaw-validation", args=["-m", "timeclaw.mcp.servers.validation"]),
         MCPServerEntry(name="timeclaw-text", args=["-m", "timeclaw.mcp.servers.text"]),
         MCPServerEntry(name="timeclaw-image", args=["-m", "timeclaw.mcp.servers.image"]),
+        MCPServerEntry(name="timeclaw-generic-llm", args=["-m", "timeclaw.mcp.servers.generic_llm"]),
     ])
     extra_servers: list[MCPServerEntry] = Field(default_factory=list)
 

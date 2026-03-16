@@ -20,6 +20,7 @@ class ToolCategory(str, Enum):
     TEXT = "text"
     IMAGE = "image"
     MULTIMODAL = "multimodal"
+    GENERIC_LLM = "generic_llm"
 
 
 class ToolIOType(str, Enum):

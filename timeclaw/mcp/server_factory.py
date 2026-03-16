@@ -122,6 +122,10 @@ def register_tool(mcp: Any, tool: ClawTool) -> None:
         images = kwargs.pop("images", None)
         # Remove None-valued optional params so tool defaults take effect
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        # Auto-serialize dict/list values for params declared as string
+        for k, v in list(kwargs.items()):
+            if isinstance(v, (dict, list)) and annotations.get(k) is str:
+                kwargs[k] = json.dumps(v, ensure_ascii=False)
         result = await _tool.execute(ts_data, text=text, images=images, **kwargs)
         if result.success:
             return _serialize(result.data)

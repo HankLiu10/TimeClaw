@@ -74,11 +74,12 @@ async def _cmd_run(args: Any) -> None:
     from timeclaw.clawhub.tool_registry import discover_and_register
     discover_and_register()
 
-    from timeclaw.clawhub.prediction.sbm_wrapper import SBMForecastTool
-    tool = SBMForecastTool()
+    from timeclaw.clawhub.tool_registry import get_tool_instance
+    model_name = args.model or "chronos"
+    tool_name = f"{model_name}_forecast"
+    tool = get_tool_instance(tool_name)
     result = await tool.execute(
         ts_data=train,
-        model_name=args.model,
         horizon=args.horizon,
     )
 

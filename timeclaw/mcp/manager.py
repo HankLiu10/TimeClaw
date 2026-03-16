@@ -13,15 +13,36 @@ tool namespace to the rest of TimeClaw:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+
+def _build_subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build environment dict for MCP sub-processes.
+
+    Ensures the conda lib directory containing a compatible libstdc++ is
+    prepended to LD_LIBRARY_PATH so that native extensions (matplotlib,
+    torch, etc.) find the correct GLIBCXX symbols even when other
+    libraries (gluonts, prophet) are loaded first in the same process.
+    """
+    env = dict(os.environ)
+    conda_prefix = env.get("CONDA_PREFIX") or str(Path(sys.executable).parent.parent)
+    conda_lib = str(Path(conda_prefix) / "lib")
+    current_ld = env.get("LD_LIBRARY_PATH", "")
+    if conda_lib not in current_ld:
+        env["LD_LIBRARY_PATH"] = f"{conda_lib}:{current_ld}" if current_ld else conda_lib
+    if extra:
+        env.update(extra)
+    return env
 
 
 @dataclass
@@ -159,7 +180,7 @@ class MCPManager:
         params = StdioServerParameters(
             command=cfg.command,
             args=cfg.args,
-            env=cfg.env,
+            env=_build_subprocess_env(cfg.env),
         )
 
         # stdio_client is an async context manager that yields (read, write)
@@ -246,5 +267,10 @@ DEFAULT_SERVERS: list[MCPServerConfig] = [
         name="timeclaw-image",
         command=sys.executable,
         args=["-m", "timeclaw.mcp.servers.image"],
+    ),
+    MCPServerConfig(
+        name="timeclaw-generic-llm",
+        command=sys.executable,
+        args=["-m", "timeclaw.mcp.servers.generic_llm"],
     ),
 ]

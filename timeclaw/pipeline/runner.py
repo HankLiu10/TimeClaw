@@ -293,11 +293,13 @@ class PipelineRunner:
         executor_result = await executor.run(branch_envelope)
         result = executor_result["result"]
 
-        prediction = result.get("answer") or result.get("prediction")
+        raw_prediction = result.get("answer") or result.get("prediction")
         answer_type = result.get("answer_type", "")
         confidence = result.get("confidence")
         reasoning = result.get("reasoning", "")
         execution_log = result.get("execution_log", [])
+
+        prediction = self._extract_prediction(raw_prediction, task_type, horizon)
 
         execute_ms = int((time.time() - t_exec) * 1000)
         timeline["execute"] = {
@@ -499,6 +501,44 @@ class PipelineRunner:
 
     def memory_summary(self) -> dict:
         return self.memory.summary()
+
+    # -- Prediction extraction (generic, no task-specific logic) ----------
+
+    @staticmethod
+    def _extract_prediction(
+        raw: Any,
+        task_type: str,
+        horizon: int | None,
+    ) -> Any:
+        """Extract the usable prediction from the agent's raw answer.
+
+        For forecast tasks, the agent may wrap the array in a dict with
+        various key names. This method finds and extracts numeric arrays
+        from nested dicts so that downstream evaluation receives a plain
+        list/array.
+
+        For non-forecast tasks, the raw answer is returned as-is since it
+        should already be in the format requested by the description.
+        """
+        if raw is None:
+            return raw
+
+        if task_type == "forecast" and isinstance(raw, dict):
+            # Look for the longest numeric array value in the dict
+            best_key, best_arr = None, None
+            for k, v in raw.items():
+                if isinstance(v, (list, np.ndarray)):
+                    try:
+                        arr = np.asarray(v, dtype=float)
+                        if arr.ndim == 1 and (best_arr is None or len(arr) > len(best_arr)):
+                            best_key, best_arr = k, arr
+                    except (ValueError, TypeError):
+                        continue
+            if best_arr is not None:
+                logger.debug(f"[Pipeline] Extracted forecast array from key '{best_key}' (len={len(best_arr)})")
+                return best_arr.tolist()
+
+        return raw
 
     # -- Post-process helpers (pure code, no LLM) -----------------------
 

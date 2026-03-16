@@ -8,6 +8,7 @@ parameter passing (e.g., detect_seasonality → stl_decompose(period=N)).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import numpy as np
@@ -23,6 +24,9 @@ from timeclaw.core.message import AgentRole
 from timeclaw.core.tea_protocol import TaskEnvelope
 
 MAX_REACT_STEPS = 10
+MAX_SUB_REACT_STEPS = 5
+MAX_CONCURRENT_SUBAGENTS = 4
+SUBAGENT_TIMEOUT_SECONDS = 120
 
 
 class ExecutorAgent(AgentBase):
@@ -217,7 +221,6 @@ class ExecutorAgent(AgentBase):
         horizon = plan.get("horizon")
 
         execution_log: list[dict[str, Any]] = []
-        history_lines: list[str] = []
         current_data = data
         final_result: Any = None
         norm_inverse: dict[str, Any] | None = None
@@ -228,6 +231,7 @@ class ExecutorAgent(AgentBase):
         system_memory = plan.get("system_memory", "")
         system_prompt = executor_prompt.REACT_SYSTEM_PROMPT.format(
             max_steps=MAX_REACT_STEPS,
+            max_subagents=MAX_CONCURRENT_SUBAGENTS,
         ) + plan["modality_hint"]
         if system_memory:
             system_prompt += f"\n\n{system_memory}"
@@ -243,23 +247,24 @@ class ExecutorAgent(AgentBase):
             tool_guide=plan["tool_guide"],
         ) + plan.get("data_context", "")
 
+        conversation: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": first_user},
+        ]
+
         for step in range(1, MAX_REACT_STEPS + 1):
-            if step == 1:
-                user_msg = first_user
-            else:
-                user_msg = executor_prompt.REACT_NEXT_TURN.format(
+            if step > 1:
+                follow_up = executor_prompt.REACT_NEXT_TURN.format(
                     step=step,
                     max_steps=MAX_REACT_STEPS,
-                    history="\n".join(history_lines),
                 )
+                conversation.append({"role": "user", "content": follow_up})
 
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ]
-
-            response = await self.llm.complete(messages, response_format="json")
+            response = await self.llm.complete(conversation, response_format="json")
             decision = response.parsed or {"done": True, "thought": "LLM parse failed"}
+
+            # Record assistant reply in conversation for multi-turn context
+            conversation.append({"role": "assistant", "content": response.text or ""})
 
             thought = decision.get("thought", "")
             is_done = decision.get("done", False)
@@ -269,6 +274,36 @@ class ExecutorAgent(AgentBase):
                 agent_answer_type = decision.get("answer_type", "")
                 agent_confidence = decision.get("confidence")
                 agent_reasoning = decision.get("reasoning", thought)
+
+                # Self-correction: if the declared answer_type doesn't match
+                # the requested task_type and we have steps remaining, ask the
+                # agent to fix it instead of accepting a wrong-typed answer.
+                requested_type = plan["task_type"]
+                type_mismatch = (
+                    requested_type
+                    and agent_answer_type
+                    and agent_answer_type != requested_type
+                    and step < MAX_REACT_STEPS
+                )
+                if type_mismatch:
+                    logger.info(
+                        f"[Executor] Self-correction: task requires '{requested_type}' "
+                        f"but agent returned '{agent_answer_type}', retrying"
+                    )
+                    correction_msg = (
+                        f"Self-correction: the task requires "
+                        f"answer_type='{requested_type}' but you declared "
+                        f"answer_type='{agent_answer_type}'. Please continue "
+                        f"processing to produce a '{requested_type}' result."
+                    )
+                    conversation.append({"role": "user", "content": correction_msg})
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "thought": thought, "done": True,
+                        "self_correction": True,
+                        "mismatch": f"{agent_answer_type} != {requested_type}",
+                    })
+                    continue
+
                 if agent_answer is not None:
                     final_result = agent_answer
                 trace.agent_step("executor", f"react_step_{step}", {
@@ -282,21 +317,53 @@ class ExecutorAgent(AgentBase):
             tool_name = decision.get("tool", "")
             tool_args = decision.get("args", {})
 
-            if tool_name not in candidates:
-                history_lines.append(
-                    f"[Step {step}] ✗ Tool '{tool_name}' not in candidate list. "
-                    f"Available: {candidates}"
+            # ── Sub-agent spawn (special built-in tool) ──
+            if tool_name == "spawn_subagent":
+                sub_results = await self._spawn_subagents(
+                    tool_args, plan, envelope,
                 )
+                observation_msg = sub_results["observation"]
+                conversation.append({"role": "user", "content": observation_msg})
+                execution_log.append({
+                    "tool": "spawn_subagent",
+                    "args": {"n_tasks": sub_results["n_tasks"]},
+                    "success": sub_results["n_success"] > 0,
+                    "result_summary": observation_msg[:5000],
+                    "output": sub_results["results"],
+                })
+                trace.agent_step("executor", f"react_step_{step}", {
+                    "thought": thought, "tool": "spawn_subagent",
+                    "n_tasks": sub_results["n_tasks"],
+                    "n_success": sub_results["n_success"],
+                })
+                continue
+
+            if tool_name not in candidates:
+                err_msg = (
+                    f"Tool '{tool_name}' not available. "
+                    f"Choose from the tools listed in the first message."
+                )
+                conversation.append({"role": "user", "content": err_msg})
                 trace.agent_step("executor", f"react_step_{step}", {
                     "thought": thought, "tool": tool_name, "error": "not in candidates",
                 })
                 continue
 
             if horizon and tool_name.endswith("_forecast"):
-                tool_args.setdefault("horizon", horizon)
+                tool_args["horizon"] = horizon
 
             if plan.get("domain"):
                 tool_args.setdefault("domain", plan["domain"])
+
+            if tool_name == "llm_reasoning":
+                desc = plan.get("task_description", "")
+                if desc:
+                    existing_ctx = tool_args.get("context", "")
+                    tool_args["context"] = (
+                        f"Task description: {desc}\n{existing_ctx}"
+                        if existing_ctx
+                        else f"Task description: {desc}"
+                    )
 
             result = await self._execute_tool(
                 tool_name, tool_args, current_data, text_data, images,
@@ -318,10 +385,12 @@ class ExecutorAgent(AgentBase):
                 error_msg = result.error if result else "tool not found"
                 result_summary = f"ERROR: {error_msg}"
 
-            history_lines.append(
+            # Feed tool execution result back into conversation
+            observation_msg = (
                 f"[Step {step}] {status_icon} {tool_name}({self._fmt_args(tool_args)})\n"
-                f"  → {result_summary}"
+                f"→ {result_summary}"
             )
+            conversation.append({"role": "user", "content": observation_msg})
 
             log_entry = {
                 "tool": tool_name, "args": tool_args, "success": success,
@@ -392,7 +461,165 @@ class ExecutorAgent(AgentBase):
             "modality": action_result.get("modality"),
         }
 
+    # ── Sub-agent spawning ─────────────────────────────────────────────
+
+    async def _spawn_subagents(
+        self,
+        tool_args: dict[str, Any],
+        plan: dict[str, Any],
+        envelope: TaskEnvelope,
+    ) -> dict[str, Any]:
+        """Spawn up to MAX_CONCURRENT_SUBAGENTS parallel sub-agents.
+
+        Each sub-agent is an independent mini-ReAct loop that inherits:
+          - Full hierarchical memory (SOUL, PRINCIPLES, MEMORY, tool_notes)
+          - Same data and tool set as the main agent
+          - Its own conversation context
+        """
+        tasks_spec = tool_args.get("tasks", [])
+        if not tasks_spec:
+            return {"n_tasks": 0, "n_success": 0, "results": [], "observation": "No tasks specified."}
+
+        tasks_spec = tasks_spec[:MAX_CONCURRENT_SUBAGENTS]
+        n_tasks = len(tasks_spec)
+        logger.info(f"[Executor] Spawning {n_tasks} sub-agents")
+
+        coros = []
+        for i, task in enumerate(tasks_spec):
+            sub_desc = task.get("task", f"sub-task-{i}")
+            tools_hint = task.get("tools_hint", "")
+            coros.append(self._run_sub_executor(i, sub_desc, tools_hint, plan, envelope))
+
+        done_results = await asyncio.gather(*coros, return_exceptions=True)
+
+        results = []
+        n_success = 0
+        observation_parts = [f"Sub-agent results ({n_tasks} tasks):\n"]
+
+        for i, r in enumerate(done_results):
+            if isinstance(r, Exception):
+                results.append({"sub_task": i, "success": False, "error": str(r)})
+                observation_parts.append(f"  Sub-agent {i}: FAILED — {str(r)[:500]}")
+            else:
+                results.append({"sub_task": i, "success": True, "result": r})
+                n_success += 1
+                answer = r.get("answer", r.get("prediction"))
+                reasoning = r.get("reasoning", "")
+                observation_parts.append(
+                    f"  Sub-agent {i}: SUCCESS — answer={str(answer)[:2000]}, "
+                    f"reasoning={reasoning[:500]}"
+                )
+
+        return {
+            "n_tasks": n_tasks,
+            "n_success": n_success,
+            "results": results,
+            "observation": "\n".join(observation_parts),
+        }
+
+    async def _run_sub_executor(
+        self,
+        idx: int,
+        task_description: str,
+        tools_hint: str,
+        plan: dict[str, Any],
+        envelope: TaskEnvelope,
+    ) -> dict[str, Any]:
+        """Run a single sub-agent ReAct loop with full memory injection."""
+        data = envelope.environment.data
+        text_data = envelope.environment.text_data or None
+        images = envelope.environment.images or None
+        candidates = plan["candidates"]
+
+        system_memory = plan.get("system_memory", "")
+        system_prompt = executor_prompt.SUBAGENT_SYSTEM_PROMPT.format(
+            max_steps=MAX_SUB_REACT_STEPS,
+        )
+        if system_memory:
+            system_prompt += f"\n\n{system_memory}"
+        system_prompt += plan.get("modality_hint", "")
+
+        memory_section = ""
+        l1 = plan.get("l1_section", "")
+        skills = plan.get("skills_section", "")
+        mem_parts = [p for p in [l1, skills] if p]
+        if mem_parts:
+            memory_section = "\n".join(mem_parts) + "\n"
+
+        first_user = executor_prompt.SUBAGENT_FIRST_TURN.format(
+            task_description=task_description,
+            fingerprint=str(plan["fingerprint"])[:3000],
+            memory_section=memory_section,
+            tool_guide=plan["tool_guide"],
+        ) + plan.get("data_context", "")
+
+        conversation: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": first_user},
+        ]
+
+        horizon = plan.get("horizon")
+        current_data = data
+        final_result: dict[str, Any] = {}
+
+        for step in range(1, MAX_SUB_REACT_STEPS + 1):
+            if step > 1:
+                follow_up = executor_prompt.REACT_NEXT_TURN.format(
+                    step=step, max_steps=MAX_SUB_REACT_STEPS,
+                )
+                conversation.append({"role": "user", "content": follow_up})
+
+            response = await self.llm.complete(conversation, response_format="json")
+            decision = response.parsed or {"done": True, "thought": "parse failed"}
+            conversation.append({"role": "assistant", "content": response.text or ""})
+
+            if decision.get("done", False):
+                final_result = {
+                    "answer": decision.get("answer"),
+                    "answer_type": decision.get("answer_type", ""),
+                    "confidence": decision.get("confidence"),
+                    "reasoning": decision.get("reasoning", decision.get("thought", "")),
+                }
+                break
+
+            tool_name = decision.get("tool", "")
+            tool_args = decision.get("args", {})
+
+            if tool_name == "spawn_subagent":
+                conversation.append({"role": "user", "content": "Sub-agents cannot spawn further sub-agents."})
+                continue
+
+            if tool_name not in candidates:
+                conversation.append({
+                    "role": "user",
+                    "content": f"Tool '{tool_name}' not available.",
+                })
+                continue
+
+            if horizon and tool_name.endswith("_forecast"):
+                tool_args["horizon"] = horizon
+
+            result = await self._execute_tool(tool_name, tool_args, current_data, text_data, images)
+            success = result is not None and result.success
+            result_summary = self._summarize_result(result.data) if success else (result.error if result else "not found")
+
+            observation = (
+                f"[Sub-{idx} Step {step}] {'OK' if success else 'FAIL'} {tool_name}\n"
+                f"→ {result_summary}"
+            )
+            conversation.append({"role": "user", "content": observation})
+
+            if success and self._is_passthrough_transform(tool_name, result.data):
+                current_data = result.data
+
+        logger.info(f"[Executor] Sub-agent {idx} done: {final_result.get('answer_type', '?')}")
+        return final_result
+
     # ── Tool execution ────────────────────────────────────────────────
+
+    _SBM_TOOLS = frozenset({
+        "timesfm_forecast", "chronos_forecast", "timer_forecast", "moirai_forecast",
+    })
 
     async def _execute_tool(
         self,
@@ -403,8 +630,15 @@ class ExecutorAgent(AgentBase):
         images: Any,
     ) -> ToolResult | None:
         """Execute a single tool — routes through MCP when available, falls back to in-process."""
+        # SBM foundation models must run in-process (GPU models can't load
+        # inside MCP stdio sub-processes which lack GPU memory / deps).
+        use_mcp = (
+            self._mcp_manager
+            and self._mcp_manager.get_tool(tool_name)
+            and tool_name not in self._SBM_TOOLS
+        )
         # ── MCP path ──
-        if self._mcp_manager and self._mcp_manager.get_tool(tool_name):
+        if use_mcp:
             mcp_args: dict[str, Any] = dict(tool_args)
             if data is not None and "ts_data" not in mcp_args:
                 mcp_args["ts_data"] = data.tolist() if hasattr(data, "tolist") else list(data) if data is not None else None
