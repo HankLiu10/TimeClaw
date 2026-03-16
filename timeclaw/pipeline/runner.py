@@ -18,10 +18,10 @@ Architecture:
        - No LLM calls -- deterministic validation only
 
 Memory injection:
-    - SOUL (fixed identity) + PRINCIPLES (learned) + MEMORY -> system prompt
+    - SOUL (fixed identity) + MEMORY (per-scope + cross_domain) -> system prompt
     - Daily notes -> first-turn user message (semantic retrieval)
     - TOOLS.md -> Tool guide annotations (per-tool experience notes)
-    - PLAYBOOKS/ -> first-turn user message (scene-specific SOP)
+    - SKILLS/ -> first-turn user message (scene-specific SOP)
 """
 
 from __future__ import annotations
@@ -71,13 +71,12 @@ class PipelineRunner:
     autonomously. It produces a structured answer with confidence and reasoning.
     Post-processing applies deterministic quality checks (bounds, constraints).
 
-    Memory Architecture (six components):
-        - SOUL.md: Fixed agent identity and behavioral guidelines (human-written)
+    Memory Architecture (five components, aligned with OpenClaw):
+        - SOUL.md: Fixed agent identity and behavioral guidelines
         - Daily Notes: Raw experience log, semantically indexed
-        - MEMORY.md: Causal insights distilled from daily notes
-        - PRINCIPLES.md: Cross-domain strategies distilled from MEMORY
-        - TOOLS.md: Per-tool usage notes distilled from daily notes
-        - PLAYBOOKS/: Scene-specific SOPs distilled from MEMORY
+        - MEMORY: Causal insights (per-scope + cross_domain)
+        - TOOLS.md: Per-tool usage experience notes
+        - SKILLS/: Scene-specific SOPs
     """
 
     def __init__(self, config: TimeClawConfig | None = None, disable_memory: bool = False):
@@ -222,18 +221,16 @@ class PipelineRunner:
             fp_summary = str(fingerprint)[:2000] if fingerprint else ""
             query = f"{task_type} {description} {fp_summary}"
             soul_prompt = self.memory.soul_text or ""
-            principles_prompt = self.memory.principles.get_prompt_section() if self.memory.principles else ""
             memory_prompt = self.memory.memory.get_prompt_section(domain, task_type) if self.memory.memory else ""
             daily_prompt = self.memory.daily.get_prompt_section(query, domain=domain or None, task=task_type or None) if self.memory.daily else ""
             tool_notes = self.memory.get_tool_notes(domain=domain, task=task_type)
-            playbook_prompt = self.memory.get_playbook(domain, task_type)
+            skill_prompt = self.memory.get_skill(domain, task_type)
 
             envelope.task.metadata["soul_prompt"] = soul_prompt
-            envelope.task.metadata["principles_prompt"] = principles_prompt
             envelope.task.metadata["memory_l2"] = memory_prompt
             envelope.task.metadata["memory_l1"] = daily_prompt
             envelope.task.metadata["tool_notes"] = tool_notes
-            envelope.task.metadata["playbook_prompt"] = playbook_prompt
+            envelope.task.metadata["skill_prompt"] = skill_prompt
 
         envelope.task.metadata["domain"] = domain
         envelope.task.metadata["modality"] = (
@@ -509,7 +506,6 @@ class PipelineRunner:
             pipeline_summary=summary,
             data_fingerprint="",
             predicted=str(raw_answer)[:2000] if raw_answer else "",
-            ground_truth=str(eval_gt)[:2000] if eval_gt is not None else "",
             metrics=best_metrics,
             correct=correct,
             description=description,

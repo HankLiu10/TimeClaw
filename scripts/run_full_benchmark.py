@@ -1,7 +1,7 @@
 """Full benchmark pipeline: clean → split → train → distill → test → baseline → compare.
 
 Ensures a fair comparison by:
-1. Clearing ALL learned state (memory, playbooks, experiences, strategies) before training
+1. Clearing ALL learned state (memory, skills, experiences, strategies) before training
 2. Splitting datasets 70/30 by time (no overlap for time-series data)
 3. Training on train split only (pipeline runs + hierarchical memory recording)
 4. Distilling memory (L1→L2→L3) after training
@@ -100,7 +100,7 @@ def _clean_memory_state() -> None:
     for f in FILES_TO_CLEAN:
         if f.exists():
             f.unlink()
-    logger.info("[Clean] Memory/playbooks/experiences cleared for next dataset")
+    logger.info("[Clean] Memory/skills/experiences cleared for next dataset")
 
 
 async def run_train_on_train_split(concurrency: int = 80) -> dict[str, Any]:

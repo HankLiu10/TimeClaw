@@ -43,12 +43,24 @@ class FOLCheckTool(ClawTool):
     is_stub: bool = False
 
     async def _run(self, ts_data: Any, **params: Any) -> Any:
-        prediction = np.asarray(params.get("prediction", ts_data), dtype=float)
+        raw_pred = params.get("prediction", ts_data)
+        try:
+            prediction = np.asarray(raw_pred, dtype=float).ravel()
+        except (ValueError, TypeError) as e:
+            return {"passed": False, "error": f"Invalid prediction input: {e}", "violations": [], "n_constraints": 0, "n_violations": 0}
+
+        if len(prediction) == 0:
+            return {"passed": False, "error": "prediction must be a non-empty array", "violations": [], "n_constraints": 0, "n_violations": 0}
+
         constraints = params.get("constraints", [])
 
         violations: list[dict[str, Any]] = []
 
         for constraint in constraints:
+            if isinstance(constraint, str):
+                constraint = {"type": constraint}
+            if not isinstance(constraint, dict):
+                continue
             ctype = constraint.get("type", "")
 
             if ctype == "monotonic_increasing":

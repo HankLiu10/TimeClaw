@@ -74,7 +74,7 @@ async def run_timeclaw_full(
     mem = HierarchicalMemory(enabled=True)
     await mem.force_distill()
     mem_summary = mem.summary()
-    n_playbooks = mem_summary.get("playbooks", 0)
+    n_skills = mem_summary.get("skills", 0)
     logger.info(f"[TimeClaw] Distillation done: {mem_summary}")
 
     # ── Step 3: Evaluate on test set ──────────────────────────────
@@ -93,7 +93,7 @@ async def run_timeclaw_full(
 
     return {
         "train": train_result,
-        "playbooks_count": n_playbooks,
+        "skills_count": n_skills,
         "test": test_result,
         "train_elapsed_s": round(train_elapsed, 1),
         "test_elapsed_s": round(test_elapsed, 1),

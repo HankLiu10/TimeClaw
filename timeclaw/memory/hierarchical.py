@@ -1,36 +1,37 @@
 """Agent Memory System — OpenClaw-inspired file-first architecture.
 
-Six components:
+Five components (aligned with OpenClaw naming):
 
 SOUL.md (fixed, human-written):
-    Agent identity and behavioral guidelines. Defines what TimeClaw is,
-    how it approaches problems, and core behavioral principles.
+    Agent identity and behavioral guidelines.  Corresponds to OpenClaw SOUL.md.
     Not learned — maintained by developers.
 
 Daily Notes (auto-recorded):
     Natural-language summaries of each pipeline run + outcome.
     Append-only, stored as daily log files, indexed in a vector store
-    for semantic retrieval.
+    for semantic retrieval.  Corresponds to OpenClaw memory/YYYY-MM-DD.md.
 
-MEMORY.md (auto-distilled from daily notes):
+MEMORY (auto-distilled from daily notes):
     LLM-distilled causal attributions explaining WHY certain patterns of
-    success/failure occur.  Scoped to a domain, task, or cross-cutting concern.
-
-PRINCIPLES.md (auto-distilled from MEMORY):
-    Cross-domain, cross-task transferable operating strategies.
-    Very few, very stable.
+    success/failure occur.  Scoped to (domain, task).  Additionally holds
+    a special ``cross_domain`` scope for universal operating strategies
+    distilled across all scopes (replaces the former PRINCIPLES layer).
+    Corresponds to OpenClaw MEMORY.md, but auto-distilled rather than
+    manually curated.
 
 TOOLS.md (auto-distilled from daily notes):
     Per-tool usage notes learned from experience — when each tool works
-    well or poorly.
+    well or poorly, helping the agent distinguish between functionally
+    similar tools.  Corresponds to OpenClaw TOOLS.md.
 
-PLAYBOOKS/ (auto-distilled from MEMORY):
+SKILLS/ (auto-distilled from MEMORY):
     Scene-specific SOPs (Standard Operating Procedures) per (domain, task).
-    Step-by-step operational guides.
+    Step-by-step operational guides.  Corresponds to OpenClaw SKILLS.md.
 
 Distillation chain:
-    Daily Notes  ──→  MEMORY.md  ──→  PRINCIPLES.md
-                 └──→  TOOLS.md       └──→  PLAYBOOKS/
+    Daily Notes  ──→  MEMORY (per-scope + cross_domain)
+                 └──→  TOOLS.md
+                 └──→  SKILLS/
 """
 
 from __future__ import annotations
@@ -49,14 +50,15 @@ from timeclaw.memory.vector_store import TFIDFEmbedder, VectorStore
 MEMORY_ROOT = Path(".timeclaw/hierarchical_memory")
 DAILY_DIR = MEMORY_ROOT / "daily"
 MEMORY_DIR = MEMORY_ROOT / "memory"
-PRINCIPLES_DIR = MEMORY_ROOT / "principles"
 TOOLS_FILE = MEMORY_ROOT / "TOOLS.md"
-PLAYBOOKS_DIR = MEMORY_ROOT / "playbooks"
+SKILLS_DIR = MEMORY_ROOT / "skills"
 SOUL_FILE = Path("timeclaw/memory/SOUL.md")
 VECTOR_DB = MEMORY_ROOT / "notes_vectors.db"
 
+CROSS_DOMAIN_SCOPE = "cross_domain"
+
 _DISTILL_L1_TO_L2 = 10
-_DISTILL_L2_TO_L3 = 20
+_DISTILL_L2_TO_CROSS = 20
 _L1_RETRIEVAL_K = 5
 
 
@@ -124,11 +126,11 @@ class DailyNotes:
         tools = ctx.get("tool_chain", [])
         tools_str = " → ".join(tools[:20]) if tools else "none"
         predicted = str(ctx.get("predicted", ""))[:500]
-        ground_truth = str(ctx.get("ground_truth", ""))[:500]
         metrics = ctx.get("metrics") or {}
+        _GT_KEYS = {"ground_truth_label", "ground_truth", "correct"}
         metrics_str = ", ".join(
             f"{k}={v:.4f}" for k, v in metrics.items()
-            if isinstance(v, (int, float))
+            if isinstance(v, (int, float)) and k not in _GT_KEYS
         ) if metrics else ""
         fingerprint = ctx.get("data_fingerprint", "")[:500]
         description = ctx.get("description", "")[:200]
@@ -141,7 +143,7 @@ class DailyNotes:
         if description:
             parts.append(f"Task: {description}")
         parts.append(f"Tools: {tools_str}")
-        parts.append(f"Pred: {predicted} | GT: {ground_truth}")
+        parts.append(f"Pred: {predicted}")
         if metrics_str:
             parts.append(f"Metrics: {metrics_str}")
         if fingerprint:
@@ -369,16 +371,27 @@ class MemoryStore:
         path = MEMORY_DIR / f"{scope}.json"
         path.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
 
+    def get_cross_domain_entries(self) -> list[dict]:
+        return self.get_entries(CROSS_DOMAIN_SCOPE)
+
     def get_prompt_section(self, domain: str, task: str) -> str:
         scope = f"{domain}_{task}"
         entries = self.get_entries(scope)
         domain_entries = self.get_entries(domain)
+        cross_entries = self.get_cross_domain_entries()
         all_entries = entries + domain_entries
-        if not all_entries:
+        if not all_entries and not cross_entries:
             return ""
-        lines = ["## MEMORY — Causal Insights (learned from analyzing past errors)\n"]
-        for e in all_entries[-8:]:
-            lines.append(f"- {e['insight']}")
+        lines = ["## MEMORY — Learned Insights\n"]
+        if cross_entries:
+            lines.append("### Cross-Domain Strategies")
+            for e in cross_entries[-6:]:
+                lines.append(f"- {e['insight']}")
+            lines.append("")
+        if all_entries:
+            lines.append(f"### {domain}/{task} Specific")
+            for e in all_entries[-8:]:
+                lines.append(f"- {e['insight']}")
         lines.append("")
         return "\n".join(lines)
 
@@ -392,60 +405,6 @@ def load_soul() -> str:
     if SOUL_FILE.exists():
         return SOUL_FILE.read_text(encoding="utf-8").strip()
     return ""
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# PRINCIPLES.md — Cross-domain strategies distilled from MEMORY
-# ═══════════════════════════════════════════════════════════════════════
-
-class PrinciplesStore:
-    """PRINCIPLES.md — very few, very stable cross-domain strategies."""
-
-    def __init__(self):
-        PRINCIPLES_DIR.mkdir(parents=True, exist_ok=True)
-        self._principles: list[str] = []
-        self._load()
-
-    def _load(self) -> None:
-        path = PRINCIPLES_DIR / "principles.json"
-        if path.exists():
-            try:
-                self._principles = json.loads(path.read_text())
-            except Exception:
-                self._principles = []
-
-    def get_principles(self) -> list[str]:
-        return list(self._principles)
-
-    def total(self) -> int:
-        return len(self._principles)
-
-    def add_principles(self, new_principles: list[str],
-                       removed_texts: list[str] | None = None) -> None:
-        if removed_texts:
-            removed_set = set(removed_texts)
-            before = len(self._principles)
-            self._principles = [p for p in self._principles if p not in removed_set]
-            n_removed = before - len(self._principles)
-            if n_removed:
-                logger.info(f"[PRINCIPLES] Removed {n_removed} contradicted principles")
-
-        existing = set(self._principles)
-        for s in new_principles:
-            if s not in existing:
-                self._principles.append(s)
-                existing.add(s)
-        path = PRINCIPLES_DIR / "principles.json"
-        path.write_text(json.dumps(self._principles, indent=2, ensure_ascii=False))
-
-    def get_prompt_section(self) -> str:
-        if not self._principles:
-            return ""
-        lines = ["## PRINCIPLES — Learned Operating Strategies\n"]
-        for i, s in enumerate(self._principles[-6:], 1):
-            lines.append(f"{i}. {s}")
-        lines.append("")
-        return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -522,47 +481,48 @@ class ToolsStore:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# PLAYBOOKS/ — Scene-specific SOPs distilled from MEMORY insights
+# SKILLS/ — Scene-specific SOPs distilled from MEMORY insights
 # ═══════════════════════════════════════════════════════════════════════
 
-class PlaybooksStore:
-    """PLAYBOOKS/ — per (domain, task) operational guides.
+class SkillsStore:
+    """SKILLS/ — per (domain, task) operational guides.
 
-    Each playbook is a natural-language SOP describing how to approach
+    Each skill is a natural-language SOP describing how to approach
     a specific task type: steps, tool combinations, and pitfalls.
+    Corresponds to OpenClaw SKILLS.md.
     """
 
     def __init__(self):
-        PLAYBOOKS_DIR.mkdir(parents=True, exist_ok=True)
-        self._playbooks: dict[str, str] = {}
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        self._skills: dict[str, str] = {}
         self._load()
 
     def _load(self) -> None:
-        for f in PLAYBOOKS_DIR.glob("*.md"):
+        for f in SKILLS_DIR.glob("*.md"):
             try:
-                self._playbooks[f.stem] = f.read_text()
+                self._skills[f.stem] = f.read_text()
             except Exception:
                 pass
 
-    def get_playbook(self, scope: str) -> str:
-        return self._playbooks.get(scope, "")
+    def get_skill(self, scope: str) -> str:
+        return self._skills.get(scope, "")
 
     def total(self) -> int:
-        return len(self._playbooks)
+        return len(self._skills)
 
-    def update_playbook(self, scope: str, content: str) -> None:
-        self._playbooks[scope] = content
-        path = PLAYBOOKS_DIR / f"{scope}.md"
+    def update_skill(self, scope: str, content: str) -> None:
+        self._skills[scope] = content
+        path = SKILLS_DIR / f"{scope}.md"
         path.write_text(content)
-        logger.info(f"[PLAYBOOKS] Updated SOP for {scope}")
+        logger.info(f"[SKILLS] Updated SOP for {scope}")
 
     def get_prompt_section(self, domain: str, task: str) -> str:
         scope = f"{domain}_{task}"
-        playbook = self._playbooks.get(scope, "")
-        if not playbook:
+        skill = self._skills.get(scope, "")
+        if not skill:
             return ""
-        lines = [f"## PLAYBOOK — Operational Guide for {domain}/{task}\n"]
-        lines.append(playbook)
+        lines = [f"## SKILL — Operational Guide for {domain}/{task}\n"]
+        lines.append(skill)
         lines.append("")
         return "\n".join(lines)
 
@@ -620,6 +580,12 @@ RULES:
 - Max 8 rules per scope — keep only the most actionable
 - Every rule MUST specify both a data condition AND a tool recommendation
 - Merge overlapping rules rather than keeping duplicates
+- **CRITICAL**: Rules must NEVER reference ground truth values, ground truth
+  distributions, or label frequencies (e.g. "60% of GT is decreasing").
+  Ground truth is used only during training evaluation — the agent will NOT
+  have access to it at test time.  Rules must be based on INPUT data
+  characteristics (patterns, seasonality, trend shape, series length) and
+  TOOL behavior (which tool produced lower error), not on output label stats.
 
 Return JSON: {{
   "insights": ["rule 1", "rule 2", ...],
@@ -627,51 +593,41 @@ Return JSON: {{
 }}
 """
 
-MEMORY_TO_PRINCIPLES_PROMPT = """\
+MEMORY_TO_CROSS_DOMAIN_PROMPT = """\
 You are synthesizing domain-specific decision rules into universal
-operating principles for a multimodal time-series analysis agent.
+cross-domain insights for a multimodal time-series analysis agent.
 
 ## All Domain-Task Rules
 {all_memory_entries}
 
-## Existing Principles (review and update)
-{existing_principles}
+## Existing Cross-Domain Insights (review and update)
+{existing_cross_domain}
 
 ## Your Task
-Produce an UPDATED set of cross-domain operating principles.
+Produce an UPDATED set of cross-domain insights using the same format
+as per-scope rules:
 
-Each principle must be:
+"[WHEN data-condition across domains] → [DO tool-category/strategy] \
+(BECAUSE reason; EVIDENCE: cross-domain metric comparison)"
+
+Each insight must be:
 1. **Actionable**: A concrete rule the agent can follow immediately
 2. **Cross-domain**: Applies across weather, finance, energy, etc.
 3. **Strategy-level**: References tool *categories* (foundation models,
    statistical models, decomposition tools, LLM reasoning) rather than
    specific tool names
 
-FORMAT: "[RULE]: [action]. [RATIONALE]: [cross-domain evidence]"
-
-EXAMPLES of GOOD principles:
-- "RULE: When data shows strong periodicity, apply seasonal decomposition
-  before forecasting. RATIONALE: Across weather (24h cycle) and finance
-  (weekly cycle), decomposition reduces forecast MAE by 15-30%."
-- "RULE: For indicator tasks, prefer LLM reasoning over forecast+derive
-  pipelines. RATIONALE: Statistical models over-smooth extremes in both
-  temperature and price data, inflating min/max errors."
-- "RULE: Always try at least one foundation model and one classical model
-  for forecasting, then compare. RATIONALE: No single model category
-  dominates across all data patterns."
-
-EXAMPLES of BAD principles:
-- "Use good tools" (no action)
-- "Chronos is best for weather" (too specific, not cross-domain)
-
 RULES:
-- Review existing principles against new evidence: REMOVE outdated ones
-- Max 6 principles total
-- Every principle MUST give a concrete, testable action
+- Review existing insights against new evidence: REMOVE outdated ones
+- Max 6 insights total
+- Every insight MUST give a concrete, testable action
+- **CRITICAL**: Insights must NEVER reference ground truth values or label
+  distributions.  Base all guidance on input data characteristics and tool
+  performance metrics, not on output label frequencies.
 
 Return JSON: {{
-  "principles": ["principle 1", ...],
-  "removed": ["exact text of any removed principle", ...]
+  "insights": ["insight 1", ...],
+  "removed": ["exact text of any removed insight", ...]
 }}
 """
 
@@ -698,24 +654,29 @@ Return JSON: {{
 }}
 """
 
-MEMORY_TO_PLAYBOOKS_PROMPT = """\
-You are creating an operational guide (SOP) for a time-series agent.
+MEMORY_TO_SKILLS_PROMPT = """\
+You are creating an operational guide (skill) for a time-series agent.
 Based on the causal insights learned for this specific (domain, task),
 produce a step-by-step guide the agent can follow.
 
 ## Domain/Task: {scope}
 
-## Causal Insights (from MEMORY.md)
+## Causal Insights (from MEMORY)
 {memory_entries}
 
-## Existing SOP (review and update)
-{existing_playbook}
+## Existing Skill (review and update)
+{existing_skill}
 
 ## Your Task
 Write a concise operational guide in Markdown. Include:
 1. **Steps**: Numbered procedure for this task type
 2. **Pitfalls**: Common failure modes to watch for
 3. **Tool Notes**: Which tools are relevant and when
+
+**CRITICAL**: The guide must NEVER reference ground truth values, ground
+truth distributions, or label base rates.  The agent will NOT have access
+to ground truth at test time.  All guidance must be based on input data
+characteristics and observed tool behavior, not on output label statistics.
 
 FORMAT: Plain Markdown (not JSON). Keep it under 300 words.
 
@@ -739,18 +700,17 @@ class DistillationAgent:
     """Orchestrates bottom-up knowledge distillation.
 
     Distillation chain:
-        Daily Notes  ──→  MEMORY.md  ──→  PRINCIPLES.md
-                     └──→  TOOLS.md       └──→  PLAYBOOKS/
+        Daily Notes  ──→  MEMORY (per-scope + cross_domain)
+                     └──→  TOOLS.md
+                     └──→  SKILLS/
     """
 
     def __init__(self, daily: DailyNotes, memory: MemoryStore,
-                 principles: PrinciplesStore, tools: ToolsStore,
-                 playbooks: PlaybooksStore):
+                 tools: ToolsStore, skills: SkillsStore):
         self.daily = daily
         self.memory = memory
-        self.principles = principles
         self.tools = tools
-        self.playbooks = playbooks
+        self.skills = skills
         self._notes_distilled_at: dict[str, int] = {}
         self._memory_distilled_at: int = 0
         self._llm = None
@@ -1025,14 +985,14 @@ class DistillationAgent:
         for scope, counts in scope_tool_counts.items():
             self.tools.record_scope_usage(scope, counts)
 
-    # ── MEMORY → PRINCIPLES.md ──────────────────────────────────────────
+    # ── MEMORY → cross_domain scope ──────────────────────────────────────
 
-    async def maybe_distill_memory_to_principles(self) -> bool:
+    async def maybe_distill_memory_to_cross_domain(self) -> bool:
         current = self.memory.total()
-        if current - self._memory_distilled_at < _DISTILL_L2_TO_L3:
+        if current - self._memory_distilled_at < _DISTILL_L2_TO_CROSS:
             return False
 
-        logger.info(f"[Distill MEMORY→PRINCIPLES] {current} entries (+{current - self._memory_distilled_at})")
+        logger.info(f"[Distill MEMORY→cross_domain] {current} entries (+{current - self._memory_distilled_at})")
         self._memory_distilled_at = current
 
         all_memory = self.memory.get_all_entries()
@@ -1044,52 +1004,63 @@ class DistillationAgent:
             for e in all_memory[-60:]
         )
 
-        existing_principles = self.principles.get_principles()
+        existing_cross = self.memory.get_cross_domain_entries()
         existing_text = "\n".join(
-            f"  - {s}" for s in existing_principles
-        ) if existing_principles else "(none yet)"
+            f"  - {e['insight']}" for e in existing_cross
+        ) if existing_cross else "(none yet)"
 
-        prompt = MEMORY_TO_PRINCIPLES_PROMPT.format(
+        prompt = MEMORY_TO_CROSS_DOMAIN_PROMPT.format(
             all_memory_entries=memory_text,
-            existing_principles=existing_text,
+            existing_cross_domain=existing_text,
         )
 
         llm = await self._get_llm()
         try:
             resp = await llm.complete(
                 [{"role": "system",
-                  "content": "You review and update universal principles based on new insights. Return JSON."},
+                  "content": "You synthesize cross-domain insights from per-scope rules. Return JSON."},
                  {"role": "user", "content": prompt}],
                 response_format="json",
             )
-            if resp.parsed and "principles" in resp.parsed:
-                new = resp.parsed["principles"]
+            if resp.parsed and "insights" in resp.parsed:
                 removed = resp.parsed.get("removed", [])
-                self.principles.add_principles(new, removed_texts=removed)
+                new_entries = [
+                    MemoryEntry(
+                        scope=CROSS_DOMAIN_SCOPE,
+                        insight=a,
+                        evidence_count=len(all_memory),
+                    ).to_dict()
+                    for a in resp.parsed["insights"]
+                ]
+                self.memory.add_entries(
+                    CROSS_DOMAIN_SCOPE, new_entries,
+                    removed_texts=removed,
+                )
+                n_cross = len(self.memory.get_cross_domain_entries())
                 logger.info(
-                    f"[Distill MEMORY→PRINCIPLES] Updated to {self.principles.total()} principles "
+                    f"[Distill MEMORY→cross_domain] Updated to {n_cross} cross-domain insights "
                     f"(removed {len(removed)})"
                 )
                 return True
         except Exception as e:
-            logger.warning(f"[Distill MEMORY→PRINCIPLES] failed: {e}")
+            logger.warning(f"[Distill MEMORY→cross_domain] failed: {e}")
         return False
 
     # ── MEMORY → PLAYBOOKS/ ────────────────────────────────────────────
 
-    async def maybe_distill_memory_to_playbooks(self, scope: str) -> bool:
-        """Generate/update a PLAYBOOKS/ SOP from MEMORY insights for a scope."""
+    async def maybe_distill_memory_to_skills(self, scope: str) -> bool:
+        """Generate/update a SKILLS/ SOP from MEMORY insights for a scope."""
         entries = self.memory.get_entries(scope)
         if len(entries) < 3:
             return False
 
         entries_text = "\n".join(f"- {e['insight']}" for e in entries)
-        existing_playbook = self.playbooks.get_playbook(scope)
+        existing_skill = self.skills.get_skill(scope)
 
-        prompt = MEMORY_TO_PLAYBOOKS_PROMPT.format(
+        prompt = MEMORY_TO_SKILLS_PROMPT.format(
             scope=scope,
             memory_entries=entries_text,
-            existing_playbook=existing_playbook or "(none yet)",
+            existing_skill=existing_skill or "(none yet)",
         )
 
         llm = await self._get_llm()
@@ -1100,11 +1071,11 @@ class DistillationAgent:
                  {"role": "user", "content": prompt}],
             )
             if resp.text and len(resp.text.strip()) > 50:
-                self.playbooks.update_playbook(scope, resp.text.strip())
-                logger.info(f"[Distill MEMORY→PLAYBOOKS] Updated SOP for {scope}")
+                self.skills.update_skill(scope, resp.text.strip())
+                logger.info(f"[Distill MEMORY→SKILLS] Updated SOP for {scope}")
                 return True
         except Exception as e:
-            logger.warning(f"[Distill MEMORY→PLAYBOOKS] {scope} failed: {e}")
+            logger.warning(f"[Distill MEMORY→SKILLS] {scope} failed: {e}")
         return False
 
     # ── Orchestration ─────────────────────────────────────────────────
@@ -1113,9 +1084,9 @@ class DistillationAgent:
         """Called after each daily note is added. Triggers distillation cascade."""
         did_memory = await self.maybe_distill_notes_to_memory(domain, task)
         if did_memory:
-            await self.maybe_distill_memory_to_principles()
+            await self.maybe_distill_memory_to_cross_domain()
             scope = f"{domain}_{task}"
-            await self.maybe_distill_memory_to_playbooks(scope)
+            await self.maybe_distill_memory_to_skills(scope)
             await self.maybe_distill_notes_to_tools()
 
     async def force_distill_all(self) -> None:
@@ -1132,14 +1103,16 @@ class DistillationAgent:
                         scopes.add(f"{parts[0]}_{parts[1]}")
 
         for scope in scopes:
+            if scope == CROSS_DOMAIN_SCOPE:
+                continue
             parts = scope.split("_", 1)
             if len(parts) == 2:
                 self._notes_distilled_at[scope] = 0
                 await self.maybe_distill_notes_to_memory(parts[0], parts[1])
-                await self.maybe_distill_memory_to_playbooks(scope)
+                await self.maybe_distill_memory_to_skills(scope)
 
         self._memory_distilled_at = 0
-        await self.maybe_distill_memory_to_principles()
+        await self.maybe_distill_memory_to_cross_domain()
         await self.maybe_distill_notes_to_tools()
 
 
@@ -1148,15 +1121,14 @@ class DistillationAgent:
 # ═══════════════════════════════════════════════════════════════════════
 
 class HierarchicalMemory:
-    """Unified interface for TimeClaw's six-component memory system.
+    """Unified interface for TimeClaw's five-component memory system.
 
-    Components:
-        soul_text   — Fixed SOUL.md (agent identity, human-written)
+    Components (aligned with OpenClaw naming):
+        soul_text   — Fixed SOUL.md (agent identity)
         daily       — DailyNotes (raw experience log)
-        memory      — MemoryStore (MEMORY.md, causal insights)
-        principles  — PrinciplesStore (PRINCIPLES.md, cross-domain strategies)
-        tools       — ToolsStore (TOOLS.md, per-tool usage notes)
-        playbooks   — PlaybooksStore (PLAYBOOKS/, scene-specific SOPs)
+        memory      — MemoryStore (causal insights, per-scope + cross_domain)
+        tools       — ToolsStore (per-tool usage experience notes)
+        skills      — SkillsStore (scene-specific SOPs)
     """
 
     def __init__(self, enabled: bool = True):
@@ -1166,31 +1138,29 @@ class HierarchicalMemory:
             self.soul_text = load_soul()
             self.daily = DailyNotes()
             self.memory = MemoryStore()
-            self.principles = PrinciplesStore()
             self.tools = ToolsStore()
-            self.playbooks = PlaybooksStore()
+            self.skills = SkillsStore()
             self.distiller = DistillationAgent(
-                self.daily, self.memory, self.principles,
-                self.tools, self.playbooks,
+                self.daily, self.memory,
+                self.tools, self.skills,
             )
             n_daily = self.daily.total
             n_memory = self.memory.total()
-            n_principles = self.principles.total()
+            n_cross = len(self.memory.get_cross_domain_entries())
             n_tools = self.tools.total()
-            n_playbooks = self.playbooks.total()
-            if n_daily + n_memory + n_principles > 0:
+            n_skills = self.skills.total()
+            if n_daily + n_memory > 0:
                 logger.info(
                     f"[AgentMemory] Loaded: "
-                    f"daily={n_daily}, MEMORY={n_memory}, PRINCIPLES={n_principles}, "
-                    f"TOOLS={n_tools}, PLAYBOOKS={n_playbooks}"
+                    f"daily={n_daily}, MEMORY={n_memory} (cross_domain={n_cross}), "
+                    f"TOOLS={n_tools}, SKILLS={n_skills}"
                 )
         else:
             self.soul_text = ""
             self.daily = None
             self.memory = None
-            self.principles = None
             self.tools = None
-            self.playbooks = None
+            self.skills = None
             self.distiller = None
 
     # Backward compatibility aliases
@@ -1203,16 +1173,14 @@ class HierarchicalMemory:
         return self.memory
 
     @property
-    def l3(self):
-        return self.principles
+    def principles(self):
+        """Backward compat: returns memory store (cross_domain is inside)."""
+        return self.memory
 
     @property
-    def soul(self):
-        return self.principles
-
-    @property
-    def skills(self):
-        return self.playbooks
+    def playbooks(self):
+        """Backward compat: renamed to skills."""
+        return self.skills
 
     async def record(self, **run_context) -> None:
         if not self.enabled:
@@ -1229,9 +1197,6 @@ class HierarchicalMemory:
         parts = []
         if self.soul_text:
             parts.append(self.soul_text)
-        principles = self.principles.get_prompt_section()
-        if principles:
-            parts.append(principles)
         mem = self.memory.get_prompt_section(domain, task) if domain and task else ""
         if mem:
             parts.append(mem)
@@ -1253,14 +1218,14 @@ class HierarchicalMemory:
             list(self.tools.get_notes().keys()), scope,
         )
 
-    def get_playbook(self, domain: str, task: str) -> str:
-        if not self.enabled or not self.playbooks:
-            return ""
-        return self.playbooks.get_prompt_section(domain, task)
-
     def get_skill(self, domain: str, task: str) -> str:
-        """Backward compatibility alias for get_playbook."""
-        return self.get_playbook(domain, task)
+        if not self.enabled or not self.skills:
+            return ""
+        return self.skills.get_prompt_section(domain, task)
+
+    def get_playbook(self, domain: str, task: str) -> str:
+        """Backward compatibility alias for get_skill."""
+        return self.get_skill(domain, task)
 
     def flush(self) -> None:
         pass
@@ -1276,7 +1241,7 @@ class HierarchicalMemory:
             "enabled": True,
             "daily_notes": self.daily.total,
             "memory_insights": self.memory.total(),
-            "principles": self.principles.total(),
+            "cross_domain_insights": len(self.memory.get_cross_domain_entries()),
             "tool_notes": self.tools.total(),
-            "playbooks": self.playbooks.total(),
+            "skills": self.skills.total(),
         }

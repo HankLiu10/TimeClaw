@@ -1011,10 +1011,10 @@ async def run_pipeline_eval(
                     try:
                         adapter.load()
                     except Exception as e:
-                        logger.warning(f"[SBM pre-load] {name} failed: {e}")
-            logger.info(f"[SBM pre-load] {len(reg.list_available())} models ready")
+                        logger.warning(f"[Model pre-load] {name} failed: {e}")
+            logger.info(f"[Model pre-load] {len(reg.list_available())} models ready")
         except Exception as e:
-            logger.warning(f"[SBM pre-load] skipped: {e}")
+            logger.warning(f"[Model pre-load] skipped: {e}")
 
         global _record_enabled
         _record_enabled = (split == "train")

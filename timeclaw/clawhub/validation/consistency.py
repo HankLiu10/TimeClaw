@@ -43,8 +43,17 @@ class ConsistencyCheckTool(ClawTool):
     is_stub: bool = False
 
     async def _run(self, ts_data: Any, **params: Any) -> Any:
-        prediction = np.asarray(params.get("prediction", []), dtype=float)
-        historical = np.asarray(params.get("historical", ts_data), dtype=float)
+        raw_pred = params.get("prediction", [])
+        raw_hist = params.get("historical", ts_data)
+
+        try:
+            prediction = np.asarray(raw_pred, dtype=float).ravel()
+            historical = np.asarray(raw_hist, dtype=float).ravel()
+        except (ValueError, TypeError) as e:
+            return {"consistent": False, "error": f"Invalid input: {e}", "checks": [], "n_passed": 0, "n_total": 0}
+
+        if len(prediction) == 0 or len(historical) == 0:
+            return {"consistent": False, "error": "prediction and historical must be non-empty arrays", "checks": [], "n_passed": 0, "n_total": 0}
 
         checks: list[dict[str, Any]] = []
 

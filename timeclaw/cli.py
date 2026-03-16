@@ -35,11 +35,6 @@ def main() -> None:
     tools_parser.add_argument("--category", type=str, default=None, help="Filter by category")
     tools_parser.add_argument("--run", type=str, default=None, help="Run a specific tool by name")
 
-    # timeclaw models
-    models_parser = subparsers.add_parser("models", help="List or manage SBM models")
-    models_parser.add_argument("--list", action="store_true", help="List available models")
-    models_parser.add_argument("--register", action="store_true", help="Auto-register all models")
-
     args = parser.parse_args()
 
     if args.command is None:
@@ -52,8 +47,6 @@ def main() -> None:
         asyncio.run(_cmd_bench(args))
     elif args.command == "tools":
         _cmd_tools(args)
-    elif args.command == "models":
-        _cmd_models(args)
 
 
 async def _cmd_run(args: Any) -> None:
@@ -108,17 +101,6 @@ async def _cmd_bench(args: Any) -> None:
         "naive_trend": NaiveTrend(),
     }
 
-    try:
-        from timeclaw.sbm.registry import get_global_registry, auto_register
-        auto_register()
-        for name in get_global_registry().list_available():
-            try:
-                pipelines[f"sbm_{name}"] = get_global_registry().get(name)
-            except Exception:
-                pass
-    except ImportError:
-        pass
-
     runner = MTBenchRunner(tasks=args.tasks, output_dir=args.output)
     results = await runner.run(pipelines)
     report = runner.generate_report(results, format=args.format)
@@ -152,30 +134,6 @@ def _cmd_tools(args: Any) -> None:
             print(f"  Schema: {tool.parameters_schema}")
         except KeyError as e:
             print(f"Error: {e}")
-
-
-def _cmd_models(args: Any) -> None:
-    """List or manage SBM models."""
-    from timeclaw.sbm.registry import get_global_registry, auto_register
-
-    if args.register:
-        n = auto_register()
-        print(f"Registered {n} SBM models")
-
-    registry = get_global_registry()
-
-    if args.list or not args.register:
-        if not registry.list_available():
-            auto_register()
-
-        profiles = registry.get_profiles()
-        print(f"\nSBM Models ({len(profiles)} available):")
-        print(f"{'Name':<15} {'Loaded':<8} {'Tasks':<30}")
-        print("-" * 53)
-        for p in profiles:
-            loaded = "Yes" if p.get("is_loaded") else "No"
-            tasks = ", ".join(p.get("tasks", []))
-            print(f"{p['name']:<15} {loaded:<8} {tasks:<30}")
 
 
 # Entry point for pyproject.toml [project.scripts]

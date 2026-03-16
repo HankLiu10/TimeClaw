@@ -48,7 +48,8 @@ async def main():
 
         mem = pipeline.memory_summary()
         print(f"  Memory: daily={mem.get('daily_notes',0)}, L2={mem.get('memory_insights',0)}, "
-              f"L3={mem.get('principles',0)}, tools={mem.get('tool_notes',0)}")
+              f"cross_domain={mem.get('cross_domain_insights',0)}, tools={mem.get('tool_notes',0)}, "
+              f"skills={mem.get('skills',0)}")
         print()
 
     print("\n=== Final Memory State ===")

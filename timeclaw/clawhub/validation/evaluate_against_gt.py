@@ -94,6 +94,16 @@ class EvaluateAgainstGTTool(ClawTool):
 
     @staticmethod
     def _forecast_metrics(pred: Any, gt: Any) -> dict[str, float]:
+        if isinstance(pred, dict):
+            for key in ("point_forecast", "forecast", "prediction", "values"):
+                if key in pred and isinstance(pred[key], (list, np.ndarray)):
+                    pred = pred[key]
+                    break
+        if isinstance(gt, dict):
+            for key in ("point_forecast", "forecast", "values"):
+                if key in gt and isinstance(gt[key], (list, np.ndarray)):
+                    gt = gt[key]
+                    break
         y_pred = np.asarray(pred, dtype=np.float64).ravel()
         y_true = np.asarray(gt, dtype=np.float64).ravel()
         n = min(len(y_true), len(y_pred))

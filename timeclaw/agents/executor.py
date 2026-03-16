@@ -88,11 +88,10 @@ class ExecutorAgent(AgentBase):
             "image_summary": image_summary,
             "suggested_strategy": envelope.task.metadata.get("suggested_strategy"),
             "soul_prompt": envelope.task.metadata.get("soul_prompt", ""),
-            "principles_prompt": envelope.task.metadata.get("principles_prompt", ""),
+            "skill_prompt": envelope.task.metadata.get("skill_prompt", ""),
             "memory_l2": envelope.task.metadata.get("memory_l2", ""),
             "memory_l1": envelope.task.metadata.get("memory_l1", ""),
             "tool_notes": envelope.task.metadata.get("tool_notes", {}),
-            "playbook_prompt": envelope.task.metadata.get("playbook_prompt", ""),
             "domain": envelope.task.metadata.get("domain", ""),
             "reanalysis_context": envelope.task.metadata.get("reanalysis_context"),
             "_mode": envelope.task.metadata.get("_mode", "test"),
@@ -134,25 +133,24 @@ class ExecutorAgent(AgentBase):
                 f"Recommendation: **{strategy}**\n\n"
             )
 
-        # SOUL (fixed) + PRINCIPLES (learned) + MEMORY → system prompt
+        # SOUL (fixed) + MEMORY (per-scope + cross_domain) → system prompt
         system_memory = ""
         soul = perception.get("soul_prompt", "")
-        principles = perception.get("principles_prompt", "")
         mem = perception.get("memory_l2", "")
-        mem_parts = [p for p in [soul, principles, mem] if p]
+        mem_parts = [p for p in [soul, mem] if p]
         if mem_parts:
             system_memory = "\n".join(mem_parts)
 
         # Daily notes → first-turn user message
         daily_section = perception.get("memory_l1", "")
 
-        # PLAYBOOK → first-turn user message (scene-specific SOP)
-        skills_section = perception.get("playbook_prompt", "")
+        # SKILL → first-turn user message (scene-specific SOP)
+        skills_section = perception.get("skill_prompt", "")
 
         logger.debug(
             f"[Executor.plan] Memory injection: SOUL={len(soul)}, "
-            f"PRINCIPLES={len(principles)}, MEMORY={len(mem)}, "
-            f"Daily={len(daily_section)}, PLAYBOOK={len(skills_section)}, "
+            f"MEMORY={len(mem)}, Daily={len(daily_section)}, "
+            f"SKILL={len(skills_section)}, "
             f"ToolNotes={len(perception.get('tool_notes', {}))} tools"
         )
 
@@ -270,7 +268,7 @@ class ExecutorAgent(AgentBase):
                 conversation.append({"role": "user", "content": follow_up})
 
             response = await self.llm.complete(conversation, response_format="json")
-            decision = response.parsed or {"done": True, "thought": "LLM parse failed"}
+            decision = response.parsed if isinstance(response.parsed, dict) else {"done": True, "thought": "LLM parse failed"}
 
             # Record assistant reply in conversation for multi-turn context
             conversation.append({"role": "assistant", "content": response.text or ""})
@@ -497,7 +495,7 @@ class ExecutorAgent(AgentBase):
         """Spawn up to MAX_CONCURRENT_SUBAGENTS parallel sub-agents.
 
         Each sub-agent is an independent mini-ReAct loop that inherits:
-          - Full hierarchical memory (SOUL, PRINCIPLES, MEMORY, tool_notes)
+          - Full hierarchical memory (SOUL, MEMORY, SKILLS, tool_notes)
           - Same data and tool set as the main agent
           - Its own conversation context
         """
@@ -642,8 +640,9 @@ class ExecutorAgent(AgentBase):
 
     # ── Tool execution ────────────────────────────────────────────────
 
-    _SBM_TOOLS = frozenset({
+    _FORCE_INPROCESS = frozenset({
         "timesfm_forecast", "chronos_forecast", "timer_forecast", "moirai_forecast",
+        "evaluate_against_gt",
     })
 
     async def _execute_tool(
@@ -655,12 +654,10 @@ class ExecutorAgent(AgentBase):
         images: Any,
     ) -> ToolResult | None:
         """Execute a single tool — routes through MCP when available, falls back to in-process."""
-        # SBM foundation models must run in-process (GPU models can't load
-        # inside MCP stdio sub-processes which lack GPU memory / deps).
         use_mcp = (
             self._mcp_manager
             and self._mcp_manager.get_tool(tool_name)
-            and tool_name not in self._SBM_TOOLS
+            and tool_name not in self._FORCE_INPROCESS
         )
         # ── MCP path ──
         if use_mcp:

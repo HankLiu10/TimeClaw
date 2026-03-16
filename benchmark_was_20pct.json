@@ -1,0 +1,55 @@
+{
+  "train": {
+    "label": "train",
+    "results": {
+      "weather_aligned_short": {
+        "total": 867,
+        "elapsed_s": 3478.3,
+        "summary": {
+          "forecast": {},
+          "trend": {
+            "avg_accuracy": 0.1246,
+            "n": 289
+          },
+          "indicator": {
+            "avg_max_mae": 4.5847,
+            "n": 157,
+            "avg_min_mae": 3.7866,
+            "avg_diff_mae": 6.5089
+          }
+        }
+      }
+    }
+  },
+  "timeclaw": {
+    "label": "timeclaw",
+    "results": {
+      "weather_aligned_short": {
+        "total": 306,
+        "elapsed_s": 120.7,
+        "summary": {
+          "forecast": {},
+          "trend": {
+            "avg_accuracy": 0.1569,
+            "n": 102
+          },
+          "indicator": {}
+        }
+      }
+    }
+  },
+  "baseline": {
+    "weather_aligned_short": {
+      "total": 306,
+      "elapsed_s": 32.0,
+      "summary": {
+        "forecast": {},
+        "trend": {
+          "avg_accuracy": 0.0,
+          "n": 102
+        },
+        "indicator": {}
+      }
+    }
+  }
+}
