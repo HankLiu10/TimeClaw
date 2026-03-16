@@ -46,8 +46,17 @@ def _find_split_year(samples: list[MTBenchSample], target_train_ratio: float = 0
 def split_dataset(
     dataset_name: str,
     split_year: int | None = None,
+    sample_ratio: float = 1.0,
+    seed: int = 42,
 ) -> dict[str, Any]:
     """Split a single dataset by time.
+
+    Args:
+        sample_ratio: Fraction of samples to keep in each split (0, 1].
+                      Applied *after* the temporal split so the train/test
+                      boundary is unchanged.  A ratio of 0.2 means each
+                      split keeps 20 % of its original samples.
+        seed: Random seed for reproducible sub-sampling.
 
     Returns dict with train/test sample lists and metadata.
     """
@@ -60,6 +69,21 @@ def split_dataset(
 
     train = [s for s in samples if s.start_year < split_year]
     test = [s for s in samples if s.start_year >= split_year]
+
+    if 0 < sample_ratio < 1.0:
+        rng = np.random.RandomState(seed)
+        n_train = max(1, int(len(train) * sample_ratio))
+        n_test = max(1, int(len(test) * sample_ratio))
+        if len(train) > n_train:
+            idx = rng.choice(len(train), n_train, replace=False)
+            train = [train[i] for i in sorted(idx)]
+        if len(test) > n_test:
+            idx = rng.choice(len(test), n_test, replace=False)
+            test = [test[i] for i in sorted(idx)]
+        logger.info(
+            f"[Split] {dataset_name}: sub-sampled {sample_ratio:.0%} → "
+            f"train {n_train}, test {n_test}"
+        )
 
     if not train:
         logger.warning(
@@ -79,6 +103,7 @@ def split_dataset(
         "train_count": len(train),
         "test_count": len(test),
         "total": len(samples),
+        "sample_ratio": sample_ratio,
     }
 
 
@@ -139,11 +164,13 @@ def load_split(
 
 def split_all_datasets(
     split_years: dict[str, int] | None = None,
+    sample_ratio: float = 1.0,
 ) -> dict[str, dict[str, Any]]:
     """Split all available MTBench datasets.
 
     Args:
         split_years: Optional per-dataset split year overrides.
+        sample_ratio: Fraction of samples to keep per split (0, 1].
     """
     overrides = split_years or {}
     results = {}
@@ -151,7 +178,7 @@ def split_all_datasets(
     for name in DATASET_REGISTRY:
         try:
             year = overrides.get(name)
-            result = split_dataset(name, split_year=year)
+            result = split_dataset(name, split_year=year, sample_ratio=sample_ratio)
             save_split(name, result["train"], result["test"], result["split_year"])
             results[name] = {
                 "split_year": result["split_year"],

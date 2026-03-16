@@ -1,8 +1,8 @@
 {
   "dataset": "finance_aligned_short",
   "split_year": 2023,
-  "train_count": 529,
-  "test_count": 221,
+  "train_count": 105,
+  "test_count": 44,
   "domain": "finance",
   "task_types": [
     "forecast",

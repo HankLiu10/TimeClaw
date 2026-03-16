@@ -36,13 +36,11 @@ class ExecutorAgent(AgentBase):
         self,
         *args: Any,
         text_backends: dict[str, Any] | None = None,
-        experience_pool: Any | None = None,
         mcp_manager: Any | None = None,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self._text_backends = text_backends
-        self._experience_pool = experience_pool
         self._mcp_manager = mcp_manager
 
     # ── Agent lifecycle ───────────────────────────────────────────────
@@ -95,9 +93,10 @@ class ExecutorAgent(AgentBase):
             "memory_l1": envelope.task.metadata.get("memory_l1", ""),
             "tool_notes": envelope.task.metadata.get("tool_notes", {}),
             "playbook_prompt": envelope.task.metadata.get("playbook_prompt", ""),
-            "_warmup_filter": envelope.task.metadata.get("_warmup_filter"),
             "domain": envelope.task.metadata.get("domain", ""),
             "reanalysis_context": envelope.task.metadata.get("reanalysis_context"),
+            "_mode": envelope.task.metadata.get("_mode", "test"),
+            "_ground_truth": envelope.task.metadata.get("_ground_truth"),
         }
 
     async def plan(self, perception: dict[str, Any]) -> dict[str, Any]:
@@ -112,9 +111,12 @@ class ExecutorAgent(AgentBase):
         else:
             candidates = executor_prompt.get_all_tool_names()
 
-        warmup_filter = perception.get("_warmup_filter")
-        if warmup_filter:
-            candidates = warmup_filter(candidates)
+        run_mode = perception.get("_mode", "test")
+        if run_mode == "train":
+            if "evaluate_against_gt" not in candidates:
+                candidates.append("evaluate_against_gt")
+        else:
+            candidates = [c for c in candidates if c != "evaluate_against_gt"]
 
         tool_notes = perception.get("tool_notes", {})
         mcp_tool_map = None
@@ -210,6 +212,8 @@ class ExecutorAgent(AgentBase):
             "horizon": perception.get("horizon"),
             "domain": perception.get("domain", ""),
             "reanalysis_section": reanalysis_section,
+            "_mode": run_mode,
+            "_ground_truth": perception.get("_ground_truth"),
         }
 
     async def act(self, plan: dict[str, Any], envelope: TaskEnvelope) -> dict[str, Any]:
@@ -236,6 +240,10 @@ class ExecutorAgent(AgentBase):
         if system_memory:
             system_prompt += f"\n\n{system_memory}"
 
+        is_train = plan.get("_mode") == "train"
+        if is_train:
+            system_prompt += executor_prompt.TRAIN_MODE_HINT
+
         first_user = executor_prompt.REACT_FIRST_TURN.format(
             task_type=plan["task_type"],
             task_description=plan.get("task_description", ""),
@@ -251,6 +259,7 @@ class ExecutorAgent(AgentBase):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": first_user},
         ]
+        _gt_obs_idx: int | None = None
 
         for step in range(1, MAX_REACT_STEPS + 1):
             if step > 1:
@@ -266,6 +275,13 @@ class ExecutorAgent(AgentBase):
             # Record assistant reply in conversation for multi-turn context
             conversation.append({"role": "assistant", "content": response.text or ""})
 
+            # GT sanitisation: after the LLM has seen and analysed the
+            # evaluate_against_gt result (this step), strip the ground_truth
+            # values from the tool observation so subsequent steps can't see them.
+            if _gt_obs_idx is not None:
+                self._sanitise_gt_observation(conversation, _gt_obs_idx)
+                _gt_obs_idx = None
+
             thought = decision.get("thought", "")
             is_done = decision.get("done", False)
 
@@ -278,11 +294,13 @@ class ExecutorAgent(AgentBase):
                 # Self-correction: if the declared answer_type doesn't match
                 # the requested task_type and we have steps remaining, ask the
                 # agent to fix it instead of accepting a wrong-typed answer.
+                # In training mode, "learning_summary" is always accepted.
                 requested_type = plan["task_type"]
                 type_mismatch = (
                     requested_type
                     and agent_answer_type
                     and agent_answer_type != requested_type
+                    and agent_answer_type != "learning_summary"
                     and step < MAX_REACT_STEPS
                 )
                 if type_mismatch:
@@ -365,6 +383,9 @@ class ExecutorAgent(AgentBase):
                         else f"Task description: {desc}"
                     )
 
+            if tool_name == "evaluate_against_gt" and is_train:
+                tool_args["_ground_truth"] = plan.get("_ground_truth")
+
             result = await self._execute_tool(
                 tool_name, tool_args, current_data, text_data, images,
             )
@@ -392,10 +413,14 @@ class ExecutorAgent(AgentBase):
             )
             conversation.append({"role": "user", "content": observation_msg})
 
+            if tool_name == "evaluate_against_gt":
+                _gt_obs_idx = len(conversation) - 1
+
             log_entry = {
                 "tool": tool_name, "args": tool_args, "success": success,
                 "result_summary": result_summary[:50000],
                 "output": result.data if success else None,
+                "observation": result.data if success else None,
             }
             execution_log.append(log_entry)
 
@@ -529,7 +554,7 @@ class ExecutorAgent(AgentBase):
         data = envelope.environment.data
         text_data = envelope.environment.text_data or None
         images = envelope.environment.images or None
-        candidates = plan["candidates"]
+        candidates = [c for c in plan["candidates"] if c != "evaluate_against_gt"]
 
         system_memory = plan.get("system_memory", "")
         system_prompt = executor_prompt.SUBAGENT_SYSTEM_PROMPT.format(
@@ -736,6 +761,45 @@ class ExecutorAgent(AgentBase):
                 v_str = v_str[:500] + "..."
             parts.append(f"{k}={v_str}")
         return ", ".join(parts)
+
+    @staticmethod
+    def _sanitise_gt_observation(
+        conversation: list[dict[str, str]], obs_idx: int,
+    ) -> None:
+        """Remove ground_truth values from an evaluate_against_gt observation.
+
+        After the LLM has analysed the full tool output (metrics + GT) in the
+        current step, we strip the GT from the conversation so that subsequent
+        steps only see the metrics and the agent's own analysis text.
+        """
+        import json as _json
+        import re
+
+        msg = conversation[obs_idx]
+        content = msg.get("content", "")
+
+        # The observation looks like:  "[Step N] ... → metrics=..., ground_truth=..."
+        # Try to parse the result_summary part as JSON-ish and remove ground_truth.
+        try:
+            arrow_idx = content.find("→ ")
+            if arrow_idx < 0:
+                return
+            prefix = content[: arrow_idx + 2]
+            payload = content[arrow_idx + 2 :]
+
+            # result_summary from _summarize_result for a dict looks like:
+            #   "metrics={...}, ground_truth=[...]"
+            # We strip the ground_truth=... part.
+            cleaned = re.sub(
+                r",?\s*ground_truth=[^\n]*", "", payload
+            )
+            conversation[obs_idx] = {
+                "role": msg["role"],
+                "content": prefix + cleaned,
+            }
+            logger.debug("[Executor] Sanitised GT from conversation")
+        except Exception:
+            pass
 
     @staticmethod
     def _denormalize_prediction(prediction: Any, inv: dict[str, Any]) -> Any:

@@ -52,13 +52,14 @@ def clean_all_state() -> None:
     logger.info("[Clean] All learned state cleared")
 
 
-def run_split() -> dict[str, Any]:
-    """Split all datasets 70/30 by time."""
+def run_split(sample_ratio: float = 1.0) -> dict[str, Any]:
+    """Split all datasets 70/30 by time, optionally sub-sampling."""
     from timeclaw.benchmark.dataset_split import split_all_datasets
-    results = split_all_datasets()
+    results = split_all_datasets(sample_ratio=sample_ratio)
     total_train = sum(r["train"] for r in results.values())
     total_test = sum(r["test"] for r in results.values())
-    logger.info(f"[Split] {len(results)} datasets: {total_train} train, {total_test} test")
+    logger.info(f"[Split] {len(results)} datasets: {total_train} train, {total_test} test"
+                f" (sample_ratio={sample_ratio:.0%})")
     for name, r in results.items():
         ratio = r["train"] / (r["train"] + r["test"]) * 100 if (r["train"] + r["test"]) else 0
         logger.info(f"  {name}: train={r['train']}, test={r['test']}, "
@@ -389,6 +390,8 @@ async def main():
                         help="Skip baseline evaluation")
     parser.add_argument("--skip-clean", action="store_true",
                         help="Skip cleaning (reuse existing state)")
+    parser.add_argument("--sample-ratio", type=float, default=1.0,
+                        help="Fraction of samples to keep per split (e.g. 0.2 for 20%%)")
     args = parser.parse_args()
 
     logger.info("=" * 70)
@@ -405,8 +408,8 @@ async def main():
         logger.info("\n[Phase 0] Skipping clean (--skip-clean)")
 
     # Phase 1: Split
-    logger.info("\n[Phase 1] Splitting datasets 70/30 by time...")
-    split_info = run_split()
+    logger.info(f"\n[Phase 1] Splitting datasets 70/30 by time (sample_ratio={args.sample_ratio:.0%})...")
+    split_info = run_split(sample_ratio=args.sample_ratio)
 
     # Phase 2: Train + per-dataset test/baseline comparison
     if not args.skip_train:

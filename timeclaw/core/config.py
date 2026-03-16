@@ -161,7 +161,7 @@ class TimeClawConfig(BaseModel):
         if path is None:
             path = os.environ.get("TIMECLAW_CONFIG")
         if path is None:
-            for candidate in ("configs/gpt51.yaml", "configs/gpt5.yaml", "configs/cloud.yaml", "configs/default.yaml"):
+            for candidate in ("configs/claude_proxy.yaml", "configs/gpt51.yaml", "configs/gpt5.yaml", "configs/cloud.yaml", "configs/default.yaml"):
                 if Path(candidate).exists():
                     path = candidate
                     break

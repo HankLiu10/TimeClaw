@@ -1,8 +1,8 @@
 {
   "dataset": "finance_qa_long",
   "split_year": 2023,
-  "train_count": 368,
-  "test_count": 148,
+  "train_count": 73,
+  "test_count": 29,
   "domain": "finance",
   "task_types": [
     "mcqa",

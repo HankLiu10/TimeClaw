@@ -55,7 +55,8 @@ PLAYBOOKS_DIR = MEMORY_ROOT / "playbooks"
 SOUL_FILE = Path("timeclaw/memory/SOUL.md")
 VECTOR_DB = MEMORY_ROOT / "notes_vectors.db"
 
-_DISTILL_BATCH = 30
+_DISTILL_L1_TO_L2 = 10
+_DISTILL_L2_TO_L3 = 20
 _L1_RETRIEVAL_K = 5
 
 
@@ -130,18 +131,50 @@ class DailyNotes:
             if isinstance(v, (int, float))
         ) if metrics else ""
         fingerprint = ctx.get("data_fingerprint", "")[:500]
-        pipeline_summary = ctx.get("pipeline_summary", "")[:2000]
+        description = ctx.get("description", "")[:200]
+        pipeline_summary = ctx.get("pipeline_summary", "")[:500]
+
+        all_evals = ctx.get("all_eval_metrics") or []
+        approaches_str = self._format_approaches(tools, all_evals)
 
         parts = [f"[{domain}/{task}] {outcome}"]
+        if description:
+            parts.append(f"Task: {description}")
         parts.append(f"Tools: {tools_str}")
         parts.append(f"Pred: {predicted} | GT: {ground_truth}")
         if metrics_str:
             parts.append(f"Metrics: {metrics_str}")
         if fingerprint:
-            parts.append(f"Data: {fingerprint}")
+            parts.append(f"Fingerprint: {fingerprint}")
+        if approaches_str:
+            parts.append(f"Approaches: {approaches_str}")
         if pipeline_summary:
             parts.append(f"Analysis: {pipeline_summary}")
         return " | ".join(parts)
+
+    @staticmethod
+    def _format_approaches(
+        tool_chain: list[str], all_evals: list[dict[str, Any]],
+    ) -> str:
+        """Build a compact comparison string from multiple eval results.
+
+        Pairs each evaluate_against_gt call with the tool that preceded it,
+        sorted by MAE ascending so the best approach comes first.
+        """
+        if not all_evals:
+            return ""
+        pred_tools = [t for t in tool_chain if t != "evaluate_against_gt" and t != "spawn_subagent"]
+        pairs: list[tuple[str, float]] = []
+        for i, m in enumerate(all_evals):
+            mae = m.get("mae") or m.get("avg_mae") or m.get("accuracy")
+            if mae is None:
+                continue
+            tool_name = pred_tools[i] if i < len(pred_tools) else f"approach_{i}"
+            pairs.append((tool_name, float(mae)))
+        if not pairs:
+            return ""
+        pairs.sort(key=lambda x: x[1])
+        return " > ".join(f"{t}(mae={v:.2f})" for t, v in pairs)
 
     def _append_to_daily_log(self, note: str, ctx: dict[str, Any]) -> None:
         today = time.strftime("%Y-%m-%d")
@@ -325,11 +358,13 @@ class MemoryStore:
             self._entries[scope] = existing
 
         existing = self._entries.get(scope, [])
-        existing_texts = {e["insight"] for e in existing}
+        existing_texts = {str(e["insight"]) for e in existing}
         for entry in new_entries:
-            if entry["insight"] not in existing_texts:
+            text = str(entry["insight"]) if not isinstance(entry["insight"], str) else entry["insight"]
+            entry["insight"] = text
+            if text not in existing_texts:
                 existing.append(entry)
-                existing_texts.add(entry["insight"])
+                existing_texts.add(text)
         self._entries[scope] = existing
         path = MEMORY_DIR / f"{scope}.json"
         path.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
@@ -420,29 +455,47 @@ class PrinciplesStore:
 class ToolsStore:
     """TOOLS.md — per-tool experience notes, distilled from daily notes.
 
-    Stores a dict {tool_name: usage_note} where each note describes
-    when the tool works well/poorly, based on observed statistics.
+    Global notes describe each tool's general behaviour.  Per-scope
+    counters track how many times each tool has been used in a given
+    (domain, task) scope so we can flag under-explored tools.
     """
+
+    _MIN_RUNS = 5
 
     def __init__(self):
         MEMORY_ROOT.mkdir(parents=True, exist_ok=True)
         self._notes: dict[str, str] = {}
+        self._scope_counts: dict[str, dict[str, int]] = {}
         self._load()
 
     def _load(self) -> None:
         if TOOLS_FILE.exists():
             try:
-                self._notes = json.loads(TOOLS_FILE.read_text())
+                raw = json.loads(TOOLS_FILE.read_text())
+                if isinstance(raw, dict) and "_scope_counts" in raw:
+                    self._notes = raw.get("notes", {})
+                    self._scope_counts = raw.get("_scope_counts", {})
+                else:
+                    self._notes = raw if isinstance(raw, dict) else {}
             except Exception:
                 self._notes = {}
+
+    def _save(self) -> None:
+        payload = {"notes": self._notes, "_scope_counts": self._scope_counts}
+        TOOLS_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
     def get_notes(self) -> dict[str, str]:
         return dict(self._notes)
 
     def update(self, notes: dict[str, str]) -> None:
         self._notes.update(notes)
-        TOOLS_FILE.write_text(json.dumps(self._notes, indent=2, ensure_ascii=False))
+        self._save()
         logger.info(f"[TOOLS] Updated usage notes for {len(notes)} tools")
+
+    def record_scope_usage(self, scope: str, tool_counts: dict[str, int]) -> None:
+        """Replace per-tool usage counts for a scope from the latest scan."""
+        self._scope_counts[scope] = dict(tool_counts)
+        self._save()
 
     def total(self) -> int:
         return len(self._notes)
@@ -450,12 +503,22 @@ class ToolsStore:
     def get_tool_note(self, tool_name: str) -> str:
         return self._notes.get(tool_name, "")
 
-    def get_prompt_for_tools(self, tool_names: list[str]) -> dict[str, str]:
-        return {
-            name: self._notes[name]
-            for name in tool_names
-            if name in self._notes
-        }
+    def get_prompt_for_tools(
+        self, tool_names: list[str], scope: str = "",
+    ) -> dict[str, str]:
+        """Return notes for the given tools, appending an 'Insufficient data'
+        tag for tools with fewer than ``_MIN_RUNS`` uses in this scope."""
+        result: dict[str, str] = {}
+        scope_data = self._scope_counts.get(scope, {}) if scope else {}
+        for name in tool_names:
+            note = self._notes.get(name, "")
+            if scope and scope_data.get(name, 0) < self._MIN_RUNS:
+                tag = (f" [Insufficient data for {scope} — "
+                       f"only {scope_data.get(name, 0)} runs, try exploring]")
+                note = (note + tag) if note else f"Insufficient data for {scope}"
+            if note:
+                result[name] = note
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -509,8 +572,8 @@ class PlaybooksStore:
 # ═══════════════════════════════════════════════════════════════════════
 
 NOTES_TO_MEMORY_PROMPT = """\
-You are a strategy analyst for a time-series analysis agent.
-Analyze the experience data below and produce ACTIONABLE insights.
+You are a strategy analyst for a multimodal time-series analysis agent.
+Analyze the experience data below and produce ACTIONABLE decision rules.
 
 ## Context
 Scope: {scope}
@@ -526,47 +589,49 @@ Total runs analyzed: {total}
 {existing_memory}
 
 ## Your Task
-Produce an UPDATED set of insights. Each insight must be:
-1. **Tool-aware**: Reference which tools/strategies work or fail
-2. **Actionable**: Tell the agent WHAT TO DO, not just why it fails
-3. **Evidence-based**: Grounded in the statistics above
+Produce an UPDATED set of decision rules. Each rule must be:
+1. **Data-condition-aware**: Specify WHEN this rule applies — include data
+   characteristics (frequency, seasonality, trend, series length, domain)
+2. **Tool-aware**: Name the specific tools or tool categories to use/avoid
+3. **Quantitative**: Include concrete metric comparisons from the evidence
+4. **Concise**: One rule = one sentence (max 2). No narratives.
 
-FORMAT for each insight — MUST follow this structure:
-"[WHEN condition] → [DO action] (BECAUSE reason). [EVIDENCE: stats]"
+FORMAT — follow strictly:
+"[WHEN data-condition] → [DO tool/strategy] (BECAUSE reason; EVIDENCE: metric comparison)"
 
-EXAMPLES of GOOD insights:
-- "When predicting temperature indicators, use prophet_forecast or
-  timesfm_forecast instead of arima_forecast for the base prediction,
-  because ARIMA over-smooths daily range. (Evidence: ARIMA diff_mae=5.2
-  vs Prophet diff_mae=3.1 in 45 runs)"
-- "For weather trend classification with textual context, weight the
-  text-based sentiment signal higher than the numerical trend detection,
-  because detect_trend frequently misreads short-term noise as trends.
-  (Evidence: trend acc=18% when relying on detect_trend alone vs 35%
-  when text context agrees)"
+EXAMPLES of GOOD rules:
+- "[WHEN hourly data with 24h seasonality, forecast horizon<=24] → \
+prefer chronos_forecast over arima_forecast \
+(BECAUSE ARIMA flattens diurnal cycle; EVIDENCE: avg MAE chronos=2.3 vs arima=2.9 over 10 runs)"
+- "[WHEN indicator task on weather data] → use llm_reasoning directly \
+instead of forecast+derive \
+(BECAUSE forecast models over-smooth min/max; EVIDENCE: llm_reasoning avg_mae=1.8 vs forecast-derived=3.5)"
+- "[WHEN classification/trend task with text context available] → \
+weight text signal over numerical detect_trend \
+(BECAUSE detect_trend misreads short-term noise; EVIDENCE: acc 35% with text vs 18% without)"
 
-EXAMPLES of BAD insights (DO NOT produce these):
-- "The agent exhibits a persistent prior bias toward interpreting
-  ambiguous signals as warming" (too abstract, no action)
-- "Errors in predicted minimum propagate into range errors" (obvious
-  tautology, no tool guidance)
+EXAMPLES of BAD rules (DO NOT produce):
+- "ARIMA tends to produce flat forecasts" (no data condition, no action)
+- "Chronos outperforms Timer on this dataset" (too narrow, not reusable)
+- "Foundation models are generally better" (too vague, no specifics)
 
 RULES:
-- Review existing insights against new evidence: REMOVE contradicted ones
-- Max 8 insights per scope
-- Every insight MUST mention specific tools or strategies
+- Review existing rules against new evidence: REMOVE contradicted or obsolete ones
+- Max 8 rules per scope — keep only the most actionable
+- Every rule MUST specify both a data condition AND a tool recommendation
+- Merge overlapping rules rather than keeping duplicates
 
 Return JSON: {{
-  "insights": ["insight 1", "insight 2", ...],
-  "removed": ["exact text of any removed insight", ...]
+  "insights": ["rule 1", "rule 2", ...],
+  "removed": ["exact text of any removed rule", ...]
 }}
 """
 
 MEMORY_TO_PRINCIPLES_PROMPT = """\
-You are synthesizing tool-aware insights from multiple domains/tasks
-into universal operating principles for a time-series analysis agent.
+You are synthesizing domain-specific decision rules into universal
+operating principles for a multimodal time-series analysis agent.
 
-## All Domain-Task Insights
+## All Domain-Task Rules
 {all_memory_entries}
 
 ## Existing Principles (review and update)
@@ -576,33 +641,33 @@ into universal operating principles for a time-series analysis agent.
 Produce an UPDATED set of cross-domain operating principles.
 
 Each principle must be:
-1. **Actionable**: A concrete operating rule the agent can follow
-2. **Cross-domain**: Works for weather AND finance (and future domains)
-3. **Tool-aware**: References tool categories or strategies (not specific
-   tool names, but categories like "statistical models", "deep learning
-   forecasters", "text analysis tools")
+1. **Actionable**: A concrete rule the agent can follow immediately
+2. **Cross-domain**: Applies across weather, finance, energy, etc.
+3. **Strategy-level**: References tool *categories* (foundation models,
+   statistical models, decomposition tools, LLM reasoning) rather than
+   specific tool names
 
-FORMAT: "[RULE]: [action]. [RATIONALE]: [why this works across domains]"
+FORMAT: "[RULE]: [action]. [RATIONALE]: [cross-domain evidence]"
 
 EXAMPLES of GOOD principles:
-- "RULE: For classification tasks, compute and compare the base rate of
-  each label before making predictions. RATIONALE: Both weather trends
-  and stock trends can have skewed distributions; checking the base rate
-  helps calibrate prediction frequency."
-- "RULE: Before running prediction tools, check data quality (missing
-  values, outlier ratio) and preprocess if needed. RATIONALE: Garbage-in-
-  garbage-out applies across all domains; tools perform differently on
-  clean vs noisy inputs."
+- "RULE: When data shows strong periodicity, apply seasonal decomposition
+  before forecasting. RATIONALE: Across weather (24h cycle) and finance
+  (weekly cycle), decomposition reduces forecast MAE by 15-30%."
+- "RULE: For indicator tasks, prefer LLM reasoning over forecast+derive
+  pipelines. RATIONALE: Statistical models over-smooth extremes in both
+  temperature and price data, inflating min/max errors."
+- "RULE: Always try at least one foundation model and one classical model
+  for forecasting, then compare. RATIONALE: No single model category
+  dominates across all data patterns."
 
 EXAMPLES of BAD principles:
-- "Preserve and expose decision evidence" (too vague, no action)
-- "Separate short-term fluctuation from long-term structure" (describes
-  a concept, not a rule to follow)
+- "Use good tools" (no action)
+- "Chronos is best for weather" (too specific, not cross-domain)
 
 RULES:
-- Review existing principles against new insights: REMOVE outdated ones
+- Review existing principles against new evidence: REMOVE outdated ones
 - Max 6 principles total
-- Every principle MUST give a concrete action
+- Every principle MUST give a concrete, testable action
 
 Return JSON: {{
   "principles": ["principle 1", ...],
@@ -722,8 +787,9 @@ class DistillationAgent:
             tools_match = re.search(r"Tools:\s*(.+?)(?:\s*\|)", note)
             if tools_match:
                 chain = [t.strip() for t in tools_match.group(1).split("→")]
+                _skip = {"evaluate_against_gt", "spawn_subagent", "none"}
                 for t in chain:
-                    if t and t != "none":
+                    if t and t not in _skip:
                         (tool_ok if is_ok else tool_fail)[t] += 1
 
             pred_match = re.search(r"Pred:\s*(.+?)\s*\|\s*GT:\s*(.+?)(?:\s*\||$)", note)
@@ -802,8 +868,9 @@ class DistillationAgent:
                         except ValueError:
                             pass
 
+            _FRAMEWORK_TOOLS = {"evaluate_against_gt", "spawn_subagent", "none"}
             for t in chain:
-                if t and t != "none":
+                if t and t not in _FRAMEWORK_TOOLS:
                     (tool_ok if is_ok else tool_fail)[t] += 1
                     for mk, mv in metric_vals.items():
                         tool_metrics[t][mk].append(mv)
@@ -833,7 +900,7 @@ class DistillationAgent:
         key = f"{domain}_{task}"
         current = self.daily.total
         last = self._notes_distilled_at.get(key, 0)
-        if current - last < _DISTILL_BATCH:
+        if current - last < _DISTILL_L1_TO_L2:
             return False
 
         logger.info(f"[Distill Notes→MEMORY] {key}: {current} notes (+{current - last})")
@@ -897,10 +964,17 @@ class DistillationAgent:
     # ── Notes → TOOLS.md ──────────────────────────────────────────────
 
     async def maybe_distill_notes_to_tools(self) -> bool:
-        """Distill per-tool usage notes from daily notes statistics."""
+        """Distill per-tool usage notes from daily notes statistics.
+
+        Also updates per-scope tool usage counts used for the
+        'Insufficient data' tag at injection time.
+        """
         all_notes = self.daily.get_recent_notes(100)
         if len(all_notes) < 10:
             return False
+
+        full_notes = self.daily.get_recent_notes(10000)
+        self._update_scope_counts(full_notes)
 
         tool_stats = self._compute_tool_stats(all_notes)
         existing_text = "\n".join(
@@ -928,11 +1002,34 @@ class DistillationAgent:
             logger.warning(f"[Distill Notes→TOOLS] failed: {e}")
         return False
 
+    def _update_scope_counts(self, notes: list[str]) -> None:
+        """Parse notes and rebuild per-scope tool usage counters."""
+        import re
+        _FRAMEWORK_TOOLS = {"evaluate_against_gt", "spawn_subagent", "none"}
+        scope_tool_counts: dict[str, dict[str, int]] = {}
+
+        for note in notes:
+            scope_match = re.match(r"\[(\S+?)/(\S+?)\]", note)
+            if not scope_match:
+                continue
+            scope = f"{scope_match.group(1)}_{scope_match.group(2)}"
+            tools_match = re.search(r"Tools:\s*(.+?)(?:\s*\|)", note)
+            if not tools_match:
+                continue
+            chain = [t.strip() for t in tools_match.group(1).split("→")]
+            bucket = scope_tool_counts.setdefault(scope, {})
+            for t in chain:
+                if t and t not in _FRAMEWORK_TOOLS:
+                    bucket[t] = bucket.get(t, 0) + 1
+
+        for scope, counts in scope_tool_counts.items():
+            self.tools.record_scope_usage(scope, counts)
+
     # ── MEMORY → PRINCIPLES.md ──────────────────────────────────────────
 
     async def maybe_distill_memory_to_principles(self) -> bool:
         current = self.memory.total()
-        if current - self._memory_distilled_at < _DISTILL_BATCH:
+        if current - self._memory_distilled_at < _DISTILL_L2_TO_L3:
             return False
 
         logger.info(f"[Distill MEMORY→PRINCIPLES] {current} entries (+{current - self._memory_distilled_at})")
@@ -1123,7 +1220,7 @@ class HierarchicalMemory:
         count = await self.daily.add(run_context)
         domain = run_context.get("domain", "")
         task = run_context.get("task", "")
-        if count % _DISTILL_BATCH == 0 and domain and task:
+        if count % _DISTILL_L1_TO_L2 == 0 and domain and task:
             asyncio.create_task(self.distiller.on_new_note(domain, task))
 
     def get_memory(self, query: str, domain: str = "", task: str = "") -> str:
@@ -1143,10 +1240,18 @@ class HierarchicalMemory:
             parts.append(daily)
         return "\n".join(parts)
 
-    def get_tool_notes(self) -> dict[str, str]:
+    def get_tool_notes(
+        self, domain: str = "", task: str = "",
+        tool_names: list[str] | None = None,
+    ) -> dict[str, str]:
         if not self.enabled or not self.tools:
             return {}
-        return self.tools.get_notes()
+        scope = f"{domain}_{task}" if domain and task else ""
+        if tool_names:
+            return self.tools.get_prompt_for_tools(tool_names, scope)
+        return self.tools.get_prompt_for_tools(
+            list(self.tools.get_notes().keys()), scope,
+        )
 
     def get_playbook(self, domain: str, task: str) -> str:
         if not self.enabled or not self.playbooks:

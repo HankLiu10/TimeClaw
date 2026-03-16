@@ -59,6 +59,7 @@ def discover_and_register() -> int:
         "validation",
         "text",
         "image",
+        "generic_llm",
     ]:
         try:
             pkg = importlib.import_module(f"timeclaw.clawhub.{sub_pkg}")
@@ -80,28 +81,6 @@ def discover_and_register() -> int:
 
     logger.info(f"ClawHub: discovered and registered {count} tools")
     return count
-
-
-async def discover_and_register_mcp(server_configs: list[dict] | None = None) -> int:
-    """Discover and register tools from external MCP servers.
-
-    Args:
-        server_configs: List of dicts, each with 'command' (list[str]) and optional 'env' (dict).
-
-    Returns:
-        Total number of MCP tools registered.
-    """
-    if not server_configs:
-        return 0
-
-    from timeclaw.mcp.client import register_mcp_tools
-
-    total = 0
-    for config in server_configs:
-        count = await register_mcp_tools(config)
-        total += count
-    logger.info(f"ClawHub: registered {total} MCP tools from {len(server_configs)} servers")
-    return total
 
 
 def clear_registry() -> None:

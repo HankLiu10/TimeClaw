@@ -31,7 +31,8 @@ class MoiraiAdapter(SBMBase):
 
     def load(self) -> None:
         try:
-            from uni2ts.model.moirai import MoiraiForecast, MoiraiModule
+            from uni2ts.model.moirai.forecast import MoiraiForecast  # noqa: F401
+            from uni2ts.model.moirai.module import MoiraiModule
         except ImportError:
             raise ImportError(
                 "uni2ts is required: pip install uni2ts"
@@ -63,7 +64,7 @@ class MoiraiAdapter(SBMBase):
         if not self.is_loaded:
             self.load()
 
-        from uni2ts.model.moirai import MoiraiForecast
+        from uni2ts.model.moirai.forecast import MoiraiForecast
         import torch
 
         pred_len = prediction_length or self.config.prediction_length

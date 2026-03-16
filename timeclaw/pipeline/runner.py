@@ -26,6 +26,7 @@ Memory injection:
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 from uuid import uuid4
@@ -49,7 +50,6 @@ from timeclaw.core import trace_logger as trace
 from timeclaw.fingerprint.extractor import FingerprintExtractor
 from timeclaw.fingerprint.matcher import FingerprintMatcher
 from timeclaw.llm.router import ModelRouter
-from timeclaw.memory.experience_pool import ExperiencePool
 from timeclaw.memory.hierarchical import HierarchicalMemory
 from timeclaw.multimodal.detector import ModalityDetector
 
@@ -87,12 +87,8 @@ class PipelineRunner:
         self.router = ModelRouter(self.config.llm)
 
         if disable_memory:
-            self.experience_pool = None
             self.memory = HierarchicalMemory(enabled=False)
         else:
-            self.experience_pool = ExperiencePool(
-                storage_dir=f"{self.config.workspace_dir}/experiences"
-            )
             self.memory = HierarchicalMemory(enabled=True)
 
         self._text_backends = self.router.get_text_backends()
@@ -103,8 +99,6 @@ class PipelineRunner:
         self._quality_gate = QualityGate()
         self._tools_registered = False
         self._mcp_started = False
-        self._run_counter = 0
-        self._total_train_samples = 0
 
         # MCP tool servers
         import sys
@@ -141,7 +135,6 @@ class PipelineRunner:
         return ExecutorAgent(
             self.router.get_backend("executor"),
             text_backends=self._text_backends,
-            experience_pool=self.experience_pool if not self._disable_memory else None,
             mcp_manager=self._mcp_manager,
         )
 
@@ -150,48 +143,6 @@ class PipelineRunner:
         if self._mcp_manager and self._mcp_started:
             await self._mcp_manager.shutdown()
             self._mcp_started = False
-
-    # ── Tool warmup (progressive exposure for training) ────────────
-
-    HOMOGENEOUS_GROUPS: dict[str, list[str]] = {
-        "forecast": [
-            "timesfm_forecast", "chronos_forecast", "timer_forecast",
-            "moirai_forecast", "ets_forecast", "arima_forecast",
-            "prophet_forecast",
-        ],
-    }
-
-    def set_training_size(self, total: int) -> None:
-        """Call before training loop to enable progressive tool warmup."""
-        self._total_train_samples = total
-        self._run_counter = 0
-
-    def _apply_warmup_filter(self, candidates: list[str]) -> list[str]:
-        """During training warmup, progressively expose homogeneous tools."""
-        import random
-
-        total = self._total_train_samples
-        if total <= 0:
-            return candidates
-
-        warmup_end = int(total * 0.5)
-        idx = self._run_counter
-
-        if warmup_end <= 0 or idx >= warmup_end:
-            return candidates
-
-        progress = idx / warmup_end
-        filtered = list(candidates)
-
-        for _group_name, group_tools in self.HOMOGENEOUS_GROUPS.items():
-            present = [t for t in group_tools if t in filtered]
-            if len(present) <= 1:
-                continue
-            n_visible = max(1, min(len(present), int(1 + progress * len(present))))
-            exposed = set(random.sample(present, n_visible))
-            filtered = [t for t in filtered if t not in present or t in exposed]
-
-        return filtered
 
     # ── Main entry point ──────────────────────────────────────────────
 
@@ -208,9 +159,19 @@ class PipelineRunner:
         verbose: bool | None = None,
         full_dump: bool | None = None,
         domain: str = "",
+        mode: str = "test",
+        ground_truth: Any = None,
     ) -> dict[str, Any]:
-        """Execute the pipeline: Preprocess -> Execute -> Post-process -> Deliver."""
-        self._run_counter += 1
+        """Execute the pipeline: Preprocess -> Execute -> Post-process -> Deliver.
+
+        Args:
+            mode: ``"test"`` (default) or ``"train"``.  In train mode the
+                  system prompt gets a learning-mode hint, ground truth is
+                  stored internally for ``evaluate_against_gt``, and that
+                  tool is added to the candidate list.
+            ground_truth: The ground-truth value for this sample.  Only used
+                          when ``mode="train"``; ignored otherwise.
+        """
         if verbose is not None:
             current_full_dump = full_dump if full_dump is not None else trace._full_dump
             trace.configure(verbose, full_dump=current_full_dump)
@@ -264,7 +225,7 @@ class PipelineRunner:
             principles_prompt = self.memory.principles.get_prompt_section() if self.memory.principles else ""
             memory_prompt = self.memory.memory.get_prompt_section(domain, task_type) if self.memory.memory else ""
             daily_prompt = self.memory.daily.get_prompt_section(query, domain=domain or None, task=task_type or None) if self.memory.daily else ""
-            tool_notes = self.memory.get_tool_notes()
+            tool_notes = self.memory.get_tool_notes(domain=domain, task=task_type)
             playbook_prompt = self.memory.get_playbook(domain, task_type)
 
             envelope.task.metadata["soul_prompt"] = soul_prompt
@@ -279,9 +240,12 @@ class PipelineRunner:
             detected_modalities[0] if len(detected_modalities) == 1 else "multimodal"
         )
 
-        envelope.task.metadata["_warmup_filter"] = (
-            self._apply_warmup_filter if self._total_train_samples > 0 else None
-        )
+        # -- Training mode injection --
+        if mode == "train":
+            envelope.task.metadata["_mode"] = "train"
+            if ground_truth is not None:
+                envelope.task.metadata["_ground_truth"] = ground_truth
+            logger.info("[Pipeline] Training mode: GT injected, evaluate_against_gt enabled")
 
         # -- Step 3: Single Executor (ReAct loop, all modalities) --
         t_exec = time.time()
@@ -298,6 +262,18 @@ class PipelineRunner:
         confidence = result.get("confidence")
         reasoning = result.get("reasoning", "")
         execution_log = result.get("execution_log", [])
+
+        # -- Training mode: save learning insights to memory --
+        if mode == "train" and not self._disable_memory:
+            await self._save_learning_outcome(
+                answer_type=answer_type,
+                raw_answer=raw_prediction,
+                execution_log=execution_log,
+                task_type=task_type,
+                description=description,
+                domain=domain,
+                reasoning=reasoning,
+            )
 
         prediction = self._extract_prediction(raw_prediction, task_type, horizon)
 
@@ -480,6 +456,65 @@ class PipelineRunner:
             logger.debug(f"[Preprocess] Tool '{tool_name}' not registered, skipping")
         except Exception as e:
             logger.warning(f"[Preprocess] Tool '{tool_name}' error: {e}")
+
+    # -- Training: save learning insights --------------------------------
+
+    async def _save_learning_outcome(
+        self,
+        answer_type: str,
+        raw_answer: Any,
+        execution_log: list[dict[str, Any]],
+        task_type: str,
+        description: str,
+        domain: str,
+        reasoning: str,
+    ) -> None:
+        """Persist training-mode learning outcomes into hierarchical memory (L1).
+
+        All information — tool chain, metrics from every evaluate_against_gt
+        call, agent analysis — is written to a single L1 Daily Note.  L2/L3
+        are populated exclusively by the DistillationAgent (triggered every
+        N notes).
+        """
+        tool_chain = [e.get("tool", "") for e in execution_log if e.get("tool")]
+
+        all_evals: list[dict[str, Any]] = []
+        eval_gt: Any = None
+        for entry in execution_log:
+            if entry.get("tool") == "evaluate_against_gt":
+                obs = entry.get("observation", {})
+                if isinstance(obs, dict):
+                    all_evals.append(obs.get("metrics", {}))
+                    eval_gt = obs.get("ground_truth")
+
+        best_metrics = all_evals[-1] if all_evals else {}
+        correct = bool(best_metrics) and best_metrics.get("mae", 999) < 5
+
+        analysis = ""
+        if answer_type == "learning_summary" and isinstance(raw_answer, dict):
+            insight = raw_answer.get("insight", "")
+            if not isinstance(insight, str):
+                insight = json.dumps(insight, ensure_ascii=False) if insight else ""
+            rec = raw_answer.get("recommendation", "")
+            if not isinstance(rec, str):
+                rec = json.dumps(rec, ensure_ascii=False) if rec else ""
+            analysis = f"{insight}\n{rec}".strip()
+
+        summary = analysis or reasoning or str(raw_answer)[:3000]
+
+        await self.memory.record(
+            domain=domain,
+            task=task_type,
+            tool_chain=tool_chain,
+            pipeline_summary=summary,
+            data_fingerprint="",
+            predicted=str(raw_answer)[:2000] if raw_answer else "",
+            ground_truth=str(eval_gt)[:2000] if eval_gt is not None else "",
+            metrics=best_metrics,
+            correct=correct,
+            description=description,
+            all_eval_metrics=all_evals,
+        )
 
     # -- Hierarchical Memory Interface ----------------------------------
 

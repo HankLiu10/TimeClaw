@@ -28,6 +28,13 @@ def _is_retryable(exc: Exception) -> bool:
                                    "connection", "overloaded"))
 
 
+def _is_empty(resp: "LLMResponse | None") -> bool:
+    """True if response has no usable content (text or tool calls)."""
+    if resp is None:
+        return True
+    return not resp.text and not resp.tool_calls
+
+
 class LLMResponse(BaseModel):
     """Standardized LLM response."""
 
@@ -84,6 +91,130 @@ class LLMBackend:
             os.environ.setdefault("AZURE_API_BASE", azure_api_base)
             os.environ.setdefault("AZURE_API_VERSION", self.azure_api_version)
 
+    def _use_native_openai(self, model: str) -> bool:
+        """Whether to use the native OpenAI SDK instead of litellm.
+
+        litellm's ``openai/`` provider can corrupt responses from some
+        third-party OpenAI-compatible proxies (empty content).  When we
+        detect this pattern we use the openai SDK directly.
+        """
+        return (
+            model.startswith("openai/")
+            and self.api_base is not None
+            and self.api_key is not None
+        )
+
+    def _get_openai_client(self):
+        """Lazily create a shared AsyncOpenAI client for proxy calls."""
+        if not hasattr(self, "_oai_client") or self._oai_client is None:
+            from openai import AsyncOpenAI
+            self._oai_client = AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.api_base,
+                timeout=self.timeout,
+            )
+        return self._oai_client
+
+    async def _call_native_openai(
+        self, call_kwargs: dict[str, Any], model_label: str,
+        response_format: str | None, messages: list[dict[str, Any]],
+    ) -> LLMResponse | None:
+        """Call via the native ``openai`` SDK for proxy compatibility.
+
+        Tries non-streaming first; if the proxy forces SSE (returns a
+        string instead of a ChatCompletion), falls back to streaming
+        and reassembles the full response.
+        """
+        client = self._get_openai_client()
+
+        raw_model = call_kwargs["model"]
+        if raw_model.startswith("openai/"):
+            raw_model = raw_model[len("openai/"):]
+
+        oai_kwargs: dict[str, Any] = {
+            "model": raw_model,
+            "messages": messages,
+            "temperature": call_kwargs.get("temperature", self.temperature),
+            "max_tokens": call_kwargs.get("max_tokens", self.max_tokens),
+        }
+        rf = call_kwargs.get("response_format")
+        if rf:
+            oai_kwargs["response_format"] = rf
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = await client.chat.completions.create(**oai_kwargs)
+                if not hasattr(response, "choices"):
+                    response = await self._stream_to_completion(
+                        client, oai_kwargs, raw_model)
+                parsed = self._parse_response(response, model_label)
+                if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
+                    logger.warning(
+                        f"LLM {model_label} attempt {attempt+1}: empty response, "
+                        f"retrying in {_RETRY_BASE_DELAY * (2 ** attempt):.1f}s..."
+                    )
+                    await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+                    continue
+                trace.llm_call(model_label, messages, parsed,
+                               response_format=response_format)
+                return parsed
+            except Exception as e:
+                if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        f"LLM {model_label} attempt {attempt+1} failed "
+                        f"(retryable): {e}. Retrying in {delay:.1f}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                if attempt == 0 and "stream" not in str(e).lower():
+                    try:
+                        response = await self._stream_to_completion(
+                            client, oai_kwargs, raw_model)
+                        parsed = self._parse_response(response, model_label)
+                        trace.llm_call(model_label, messages, parsed,
+                                       response_format=response_format)
+                        return parsed
+                    except Exception:
+                        pass
+                raise
+        return None
+
+    @staticmethod
+    async def _stream_to_completion(client, oai_kwargs: dict, model: str):
+        """Collect a streaming response into a fake ChatCompletion object."""
+        oai_kwargs_stream = {**oai_kwargs, "stream": True}
+        stream = await client.chat.completions.create(**oai_kwargs_stream)
+        content_parts: list[str] = []
+        tool_calls_agg: list[Any] = []
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content_parts.append(delta.content)
+            if getattr(delta, "tool_calls", None):
+                tool_calls_agg.extend(delta.tool_calls)
+
+        class _Msg:
+            def __init__(self):
+                self.content = "".join(content_parts)
+                self.role = "assistant"
+                self.tool_calls = tool_calls_agg or None
+
+        class _Choice:
+            def __init__(self):
+                self.message = _Msg()
+                self.finish_reason = "stop"
+
+        class _FakeResp:
+            def __init__(self):
+                self.choices = [_Choice()]
+                self.model = model
+                self.usage = None
+
+        return _FakeResp()
+
     async def _call_with_retry(
         self, call_kwargs: dict[str, Any], model_label: str,
         response_format: str | None, messages: list[dict[str, Any]],
@@ -95,6 +226,13 @@ class LLMBackend:
             try:
                 response = await litellm.acompletion(**call_kwargs)
                 parsed = self._parse_response(response, model_label)
+                if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
+                    logger.warning(
+                        f"LLM {model_label} attempt {attempt+1}: empty response, "
+                        f"retrying in {_RETRY_BASE_DELAY * (2 ** attempt):.1f}s..."
+                    )
+                    await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+                    continue
                 trace.llm_call(model_label, messages, parsed,
                                response_format=response_format)
                 return parsed
@@ -121,8 +259,14 @@ class LLMBackend:
         target_model = model or self.default_model
         call_kwargs = self._build_kwargs(messages, target_model, response_format, **kwargs)
 
+        caller = (
+            self._call_native_openai
+            if self._use_native_openai(target_model)
+            else self._call_with_retry
+        )
+
         try:
-            result = await self._call_with_retry(
+            result = await caller(
                 call_kwargs, target_model, response_format, messages)
             if result is not None:
                 return result
@@ -132,7 +276,7 @@ class LLMBackend:
                 logger.info(f"Falling back to {self.fallback_model}")
                 call_kwargs["model"] = self.fallback_model
                 try:
-                    result = await self._call_with_retry(
+                    result = await caller(
                         call_kwargs, self.fallback_model + " (fallback)",
                         response_format, messages)
                     if result is not None:
@@ -149,9 +293,14 @@ class LLMBackend:
         **kwargs: Any,
     ) -> LLMResponse:
         """Send a completion request with function calling / tool use."""
+        target_model = model or self.default_model
+
+        if self._use_native_openai(target_model):
+            return await self._call_native_openai_tools(
+                messages, tools, target_model, **kwargs)
+
         import litellm
 
-        target_model = model or self.default_model
         call_kwargs = self._build_kwargs(messages, target_model, **kwargs)
         call_kwargs["tools"] = tools
 
@@ -178,6 +327,59 @@ class LLMBackend:
                         logger.error(f"Fallback tool call also failed: {e2}")
                 return LLMResponse(text=None, model=target_model)
         return LLMResponse(text=None, model=target_model)
+
+    async def _call_native_openai_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        model: str,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Tool-calling via the native OpenAI SDK for proxy compatibility."""
+        client = self._get_openai_client()
+        raw_model = model[len("openai/"):] if model.startswith("openai/") else model
+
+        oai_kwargs: dict[str, Any] = {
+            "model": raw_model,
+            "messages": messages,
+            "tools": tools,
+            "temperature": kwargs.get("temperature", self.temperature),
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+        }
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = await client.chat.completions.create(**oai_kwargs)
+                if not hasattr(response, "choices"):
+                    response = await self._stream_to_completion(
+                        client, oai_kwargs, raw_model)
+                parsed = self._parse_response(response, model)
+                if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
+                    logger.warning(
+                        f"Tool call {model} attempt {attempt+1}: empty response, "
+                        f"retrying in {_RETRY_BASE_DELAY * (2 ** attempt):.1f}s..."
+                    )
+                    await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+                    continue
+                return parsed
+            except Exception as e:
+                if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
+                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        f"Tool call {model} attempt {attempt+1} "
+                        f"(retryable): {e}. Retrying in {delay:.1f}s..."
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                try:
+                    response = await self._stream_to_completion(
+                        client, oai_kwargs, raw_model)
+                    return self._parse_response(response, model)
+                except Exception:
+                    pass
+                logger.warning(f"Tool call to {model} failed: {e}")
+                return LLMResponse(text=None, model=model)
+        return LLMResponse(text=None, model=model)
 
     def _build_kwargs(
         self,

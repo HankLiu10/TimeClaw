@@ -1,0 +1,53 @@
+# TimeClaw Configuration: Claude Sonnet 4.5 via easyli proxy
+# All agents use claude-sonnet-4-5 through easyli.codesuc.top
+
+llm:
+  api_base: "https://easyli.codesuc.top/v1"
+  api_key: "sk-kYfChA7EAAb9OsYwIRTBj2fjov2L49kYEow3ENB9wXpR1tlP"
+  models:
+    manager: "openai/claude-sonnet-4-5-20250929"
+    analyzer: "openai/claude-sonnet-4-5-20250929"
+    executor: "openai/claude-sonnet-4-5-20250929"
+    reasoner: "openai/claude-sonnet-4-5-20250929"
+    text_light: "openai/claude-sonnet-4-5-20250929"
+    text_heavy: "openai/claude-sonnet-4-5-20250929"
+  fallback: "openai/claude-sonnet-4-5-20250929"
+  max_retries: 3
+  timeout: 180.0
+  temperature: 0.1
+  max_tokens: 4096
+
+reasoning:
+  max_evidence_steps: 10
+  max_reflact_iterations: 3
+  max_quality_gate_retries: 2
+  critic_enabled: true
+
+pipeline:
+  enable_fingerprint: true
+  enable_safeauto: true
+  parallel_execution: true
+  verbose: false
+  multi_agent_mode: true
+
+memory:
+  enable_vector: true
+  vector_dim: 256
+  hybrid_vector_weight: 0.7
+  hybrid_text_weight: 0.3
+  max_experience_entries: 10000
+
+context:
+  max_tokens: 16000
+  reserve_tokens: 4000
+  compaction_threshold: 0.8
+  prune_observation_chars: 200
+  enable_lazy_tool_descriptions: true
+
+fusion:
+  strategy: "confidence_weighted"
+  llm_arbitration_enabled: true
+  confidence_floor: 0.1
+
+log_level: "INFO"
+workspace_dir: ".timeclaw"

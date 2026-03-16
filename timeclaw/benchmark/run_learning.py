@@ -70,30 +70,21 @@ def cmd_split(args: argparse.Namespace) -> None:
 
 
 async def cmd_train(args: argparse.Namespace) -> None:
-    from timeclaw.benchmark.pipeline_eval import run_pipeline_eval
+    from timeclaw.benchmark.train_loop import run_train_loop
 
-    datasets = _filter_datasets(args.dataset, args.domain)
-    all_results = {}
-
-    for ds in datasets:
-        logger.info(f"[RunLearning] Training on {ds} (via pipeline)...")
-        result = await run_pipeline_eval(
-            dataset_name=ds,
-            task_filter=args.task,
-            max_samples=args.max_samples,
-            verbose=args.verbose,
-            concurrency=args.concurrency,
-            use_skills=True,
-            label="train",
-            split="train",
-        )
-        all_results[ds] = result
+    result = await run_train_loop(
+        dataset_name=args.dataset,
+        task_filter=args.task,
+        max_samples=args.max_samples,
+        verbose=args.verbose,
+        concurrency=args.concurrency,
+    )
 
     out = Path(".timeclaw/train_results/train_summary.json")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(all_results, indent=2, default=str))
+    out.write_text(json.dumps(result, indent=2, default=str))
     logger.info(f"[RunLearning] Train summary saved to {out}")
-    print(json.dumps(all_results, indent=2, default=str))
+    print(json.dumps(result, indent=2, default=str))
 
 
 async def cmd_distill(args: argparse.Namespace) -> None:

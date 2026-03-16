@@ -239,3 +239,26 @@ Data fingerprint: {fingerprint}
 
 Begin working on this sub-task.
 """
+
+# ── Training / Learning Mode ──────────────────────────────────────
+
+TRAIN_MODE_HINT = (
+    "\n\n## Learning Mode\n"
+    "You are currently in **learning mode**. Your goal is to **explore "
+    "multiple approaches** and learn which works best.\n\n"
+    "**Workflow:**\n"
+    "1. Plan different solution approaches (e.g. different models, or "
+    "a statistical tool vs llm_reasoning).\n"
+    "2. Use `spawn_subagent` to run them in parallel. Each sub-agent "
+    "tries one approach and returns its result to you.\n"
+    "3. For **every** sub-agent result, call `evaluate_against_gt` with "
+    "that result to get its metrics.\n"
+    "4. Compare. Optionally try more approaches.\n"
+    "5. Finish with answer_type=\"learning_summary\" and "
+    "answer={\"insight\": \"...\", \"recommendation\": \"...\"}.\n\n"
+    "**Rules:**\n"
+    "- Every approach's result must be evaluated via `evaluate_against_gt`.\n"
+    "- answer_type MUST be \"learning_summary\", not the task type.\n"
+    "- If a tool's description says \"Insufficient data\", prioritize "
+    "including it in your exploration — it needs more test runs."
+)

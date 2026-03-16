@@ -45,6 +45,37 @@ _pipeline_ref = None
 _record_enabled = False
 
 
+def _train_kwargs(sample: "MTBenchSample", task: str) -> dict[str, Any]:
+    """Build extra kwargs for pipeline.run() when in training mode."""
+    if not _record_enabled:
+        return {}
+    gt: Any = None
+    if task == "forecast" and sample.output_window is not None:
+        gt = list(sample.output_window)
+    elif task == "mcqa":
+        gt = sample.answer
+    elif task == "trend":
+        if sample.domain == "weather":
+            gt = _weather_trend_3way_label(sample)
+        else:
+            gt = sample.labels.get("trend_label", "")
+    elif task == "indicator":
+        if sample.domain == "weather" and sample.output_window is not None:
+            gt = {"max": float(np.max(sample.output_window)),
+                  "min": float(np.min(sample.output_window)),
+                  "diff": float(np.max(sample.output_window) - np.min(sample.output_window))}
+        else:
+            gt_parts: dict[str, Any] = {}
+            if sample.labels.get("out_macd") is not None:
+                gt_parts["macd"] = float(sample.labels["out_macd"])
+            if sample.labels.get("out_upper_bb") is not None:
+                gt_parts["upper_bb"] = float(sample.labels["out_upper_bb"])
+            gt = gt_parts or None
+    elif task == "correlation":
+        gt = sample.labels.get("correlation", "")
+    return {"mode": "train", "ground_truth": gt}
+
+
 def _get_final_llm():
     global _final_llm
     if _final_llm is None:
@@ -309,6 +340,7 @@ async def _eval_forecast(
         text_data=text_data,
         verbose=verbose,
         domain=sample.domain,
+        **_train_kwargs(sample, "forecast"),
     )
 
     prediction = result.get("prediction")
@@ -369,6 +401,7 @@ async def _eval_mcqa(
         text_data=text_data,
         verbose=verbose,
         domain=sample.domain,
+        **_train_kwargs(sample, "mcqa"),
     )
 
     analysis = _build_pipeline_analysis_summary(result)
@@ -453,6 +486,7 @@ async def _eval_trend(
         text_data=text_data,
         verbose=verbose,
         domain=sample.domain,
+        **_train_kwargs(sample, "trend"),
     )
 
     analysis = _build_pipeline_analysis_summary(result)
@@ -591,6 +625,7 @@ async def _eval_weather_indicator(
         text_data=text_data,
         verbose=verbose,
         domain="weather",
+        **_train_kwargs(sample, "indicator"),
     )
 
     prediction = result.get("prediction")
@@ -695,6 +730,7 @@ async def _eval_stock_indicator(
         text_data=text_data,
         verbose=verbose,
         domain="finance",
+        **_train_kwargs(sample, "indicator"),
     )
 
     analysis = _build_pipeline_analysis_summary(result)
@@ -823,6 +859,7 @@ async def _eval_correlation(
         text_data=text_data,
         verbose=verbose,
         domain="finance",
+        **_train_kwargs(sample, "correlation"),
     )
 
     analysis = _build_pipeline_analysis_summary(result)
@@ -963,6 +1000,22 @@ async def run_pipeline_eval(
         pipeline = PipelineRunner(cfg, disable_memory=disable_mem)
         _pipeline_ref = pipeline
 
+        try:
+            from timeclaw.sbm.registry import get_global_registry, auto_register
+            reg = get_global_registry()
+            if not reg.list_available():
+                auto_register()
+            for name in reg.list_available():
+                adapter = reg.get(name)
+                if not adapter.is_loaded:
+                    try:
+                        adapter.load()
+                    except Exception as e:
+                        logger.warning(f"[SBM pre-load] {name} failed: {e}")
+            logger.info(f"[SBM pre-load] {len(reg.list_available())} models ready")
+        except Exception as e:
+            logger.warning(f"[SBM pre-load] skipped: {e}")
+
         global _record_enabled
         _record_enabled = (split == "train")
         sem = asyncio.Semaphore(concurrency)
@@ -989,9 +1042,6 @@ async def run_pipeline_eval(
 
             if max_samples:
                 samples = samples[:max_samples]
-
-            if split == "train":
-                pipeline.set_training_size(len(samples) * len(info.get("tasks", [])))
 
             supported_tasks = info["tasks"]
             if task_filter:

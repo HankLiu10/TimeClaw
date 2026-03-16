@@ -123,7 +123,7 @@ class ReasonerAgent(AgentBase):
             last_tool = ts_exec_log[-1].get("tool", "") if ts_exec_log else ""
             skip_synthesis = (
                 isinstance(ts_pred, dict)
-                and last_tool in ("llm_reasoning", "llm_indicator")
+                and last_tool == "llm_reasoning"
                 and len(ts_pred) > 0
             )
 
