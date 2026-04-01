@@ -80,6 +80,41 @@ def weather_trend_future(
     return sys, user
 
 
+def weather_trend_past(
+    ts_data: np.ndarray,
+    timestamps: list,
+    text: str,
+) -> tuple[str, str]:
+    """Official-style MTBench weather past-trend prompt."""
+    input_days = max(1, len(ts_data) // 24)
+    sys = "You are a weather forecasting AI."
+    user = (
+        f"Your task is to analyze the past {input_days} days's of temperature trend. "
+        f"The input time series represents temperature readings from "
+        f"{timestamps[0] if timestamps else 'unknown'} to {timestamps[-1] if timestamps else 'unknown'}, "
+        f"with a granularity of hourly. "
+        f"This data is from a location in the United States, where summers are hot and winters are cold. "
+        f"Weather conditions can also be affected by storms, heavy rain, and cold fronts."
+        f"The daytime is usually warmer than the nighttime."
+        f"Every 24 temperature readings represent a full day from 00:00 to 23:00."
+    )
+    user += (
+        f"\n\nYou will use both the historical temperature data and the news article to make your prediction. "
+        f"The input temperature readings are: {list(np.asarray(ts_data, dtype=np.float64).ravel())}. "
+    )
+    if text:
+        user += f"The news article states: {text}. "
+    user += (
+        "\n\nCompute the daily mean temperature and fit a linear trend, "
+        "if the slope is greater or equal to 0.25, then it is classified as increasing, "
+        "if the slope is less or equal than -0.25, it is classified as decrease, "
+        "if the slope is between 0.25 to -0.25, it is classified as stable."
+        f"\n\nBased on the trend, predict the temperature trend for the past {input_days} days. "
+        "Return one word in increasing, decreasing, or stable. Do not return reasoning text and extra words."
+    )
+    return sys, user
+
+
 def weather_indicator(
     ts_data: np.ndarray,
     timestamps: list,

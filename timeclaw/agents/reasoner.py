@@ -10,6 +10,7 @@ When multiple executor branches produce per-modality results, the Reasoner:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import numpy as np
@@ -123,7 +124,7 @@ class ReasonerAgent(AgentBase):
             last_tool = ts_exec_log[-1].get("tool", "") if ts_exec_log else ""
             skip_synthesis = (
                 isinstance(ts_pred, dict)
-                and last_tool == "llm_reasoning"
+                and last_tool.startswith("llm_reasoning_")
                 and len(ts_pred) > 0
             )
 
@@ -327,7 +328,7 @@ class ReasonerAgent(AgentBase):
                     "role": "user",
                     "content": (
                         f"Task: {envelope.task.task_type}\n"
-                        f"Task description: {envelope.task.description[:5000]}\n\n"
+                        f"Task description: {envelope.task.description}\n\n"
                         f"=== TIME-SERIES DATA (recent values) ===\n{ts_tail}\n\n"
                         f"=== ORIGINAL TEXT DATA ===\n{text_block}\n"
                         f"=== PER-MODALITY RESULTS ===\n" + "\n".join(summaries)
@@ -391,7 +392,7 @@ class ReasonerAgent(AgentBase):
                     "role": "user",
                     "content": (
                         f"Task: {envelope.task.task_type}\n"
-                        f"Description: {envelope.task.description[:5000]}\n\n"
+                        f"Description: {envelope.task.description}\n\n"
                         f"Conflicts found:\n{cross_modal_result.get('details', '')}\n"
                         f"Conflict reasoning: {cross_modal_result.get('reasoning', '')}\n\n"
                         f"Per-modality results:\n" + "\n".join(summaries)
@@ -506,7 +507,7 @@ class ReasonerAgent(AgentBase):
                     "role": "user",
                     "content": (
                         f"Task type: {task_type}\n"
-                        f"Task description: {description[:5000]}\n"
+                        f"Task description: {description}\n"
                         f"{domain_block}"
                         f"{raw_ts_block}\n"
                         f"=== MODALITY EVIDENCE ===\n" + "\n".join(summaries) + "\n\n"
@@ -549,8 +550,21 @@ class ReasonerAgent(AgentBase):
             for entry in log:
                 tool = entry.get("tool", "?")
                 ok = entry.get("success", False)
-                summary = (entry.get("result_summary") or "")[:50000]
-                lines.append(f"  - {tool}: {'OK' if ok else 'FAIL'} → {summary}")
+                thought = (entry.get("thought") or "")[:1000]
+                obs = entry.get("observation")
+                if obs is None and entry.get("output") is not None:
+                    obs = entry.get("output")
+                try:
+                    obs_text = json.dumps(obs, ensure_ascii=False, default=str) if obs is not None else ""
+                except TypeError:
+                    obs_text = str(obs) if obs is not None else ""
+                obs_text = obs_text[:50000]
+                line = f"  - {tool}: {'OK' if ok else 'FAIL'}"
+                if thought:
+                    line += f" | thought={thought}"
+                if obs_text:
+                    line += f" | observation={obs_text}"
+                lines.append(line)
 
             if detailed:
                 pred_str = self._format_prediction(pred)

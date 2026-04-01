@@ -61,8 +61,12 @@ class ModalityConfidenceEstimator:
             return 0.0
         rich = 0
         for entry in execution_log:
-            summary = entry.get("result_summary") or ""
-            if len(str(summary)) > 10:
+            if not entry.get("success", False):
+                continue
+            observation = entry.get("observation")
+            if observation is None and entry.get("output") is not None:
+                observation = entry.get("output")
+            if observation is not None and len(str(observation)) > 10:
                 rich += 1
         return rich / len(execution_log)
 

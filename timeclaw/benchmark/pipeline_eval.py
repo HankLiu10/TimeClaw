@@ -25,12 +25,20 @@ from loguru import logger
 
 from timeclaw.benchmark.dataset_split import load_split
 from timeclaw.benchmark.mtbench_adapter import DATASET_REGISTRY, MTBenchSample
+from timeclaw.benchmark.mtbench_support import (
+    build_task_description,
+    expand_dataset_tasks,
+    generate_learning_analysis,
+    load_sample_indices,
+    scope_keys_for_dataset_task,
+    select_samples_by_index,
+)
 from timeclaw.benchmark.baseline_eval import (
     _forecast_metrics,
     _parse_json_from_text,
     _weather_trend_3way_label,
+    _weather_trend_past_3way_label,
 )
-from timeclaw.benchmark import mtbench_prompts as prompts
 from timeclaw.core.config import TimeClawConfig
 from timeclaw.core import trace_logger as trace
 from timeclaw.llm.router import ModelRouter
@@ -59,6 +67,9 @@ def _train_kwargs(sample: "MTBenchSample", task: str) -> dict[str, Any]:
             gt = _weather_trend_3way_label(sample)
         else:
             gt = sample.labels.get("trend_label", "")
+    elif task == "trend_past":
+        if sample.domain == "weather":
+            gt = _weather_trend_past_3way_label(sample)
     elif task == "indicator":
         if sample.domain == "weather" and sample.output_window is not None:
             gt = {"max": float(np.max(sample.output_window)),
@@ -71,9 +82,15 @@ def _train_kwargs(sample: "MTBenchSample", task: str) -> dict[str, Any]:
             if sample.labels.get("out_upper_bb") is not None:
                 gt_parts["upper_bb"] = float(sample.labels["out_upper_bb"])
             gt = gt_parts or None
+    elif task == "indicator_macd":
+        if sample.labels.get("out_macd") is not None:
+            gt = {"macd": float(sample.labels["out_macd"])}
+    elif task == "indicator_upper_bb":
+        if sample.labels.get("out_upper_bb") is not None:
+            gt = {"upper_bb": float(sample.labels["out_upper_bb"])}
     elif task == "correlation":
         gt = sample.labels.get("correlation", "")
-    return {"mode": "train", "ground_truth": gt}
+    return {"mode": "train", "ground_truth": gt, "defer_learning_record": True}
 
 
 def _get_final_llm():
@@ -102,9 +119,9 @@ def _extract_tool_chain(result: dict[str, Any]) -> list[str]:
 def _build_pipeline_analysis_summary(result: dict[str, Any]) -> str:
     """Extract a comprehensive summary of what the pipeline's tools found.
 
-    Reads the ``output`` field (full tool data) when available, falling
-    back to ``result_summary``.  Uses generous character limits so the
-    final-reasoning LLM receives enough detail to make good decisions.
+    Reads the full structured ``observation`` / ``output`` field from
+    each tool log entry. Uses generous character limits so the final-
+    reasoning LLM receives enough detail to make good decisions.
     """
     parts: list[str] = []
 
@@ -114,13 +131,12 @@ def _build_pipeline_analysis_summary(result: dict[str, Any]) -> str:
         for entry in exec_log:
             tool_name = entry.get("tool", "unknown")
             success = entry.get("success", False)
-            raw_output = entry.get("output")
-            summary = entry.get("result_summary", "")
+            raw_output = entry.get("observation")
+            if raw_output is None:
+                raw_output = entry.get("output")
             if success:
                 if raw_output is not None:
                     out_str = json.dumps(raw_output, default=str) if not isinstance(raw_output, str) else raw_output
-                elif summary:
-                    out_str = summary
                 else:
                     out_str = "(no output)"
                 if len(out_str) > 50000:
@@ -150,6 +166,62 @@ def _build_pipeline_analysis_summary(result: dict[str, Any]) -> str:
         parts.append(f"[Pipeline prediction] {pred_str}")
 
     return "\n".join(parts) if parts else "(no tool analysis available)"
+
+
+async def _build_record_learning_analysis(
+    *,
+    sample: MTBenchSample,
+    task_type: str,
+    task_description: str,
+    result: dict[str, Any],
+    best_metrics: dict[str, Any],
+    sample_fingerprint: str = "",
+) -> tuple[dict[str, list[str]] | None, str]:
+    candidate_traces = PipelineRunner._extract_candidate_traces(result.get("execution_log", []))
+    fallback_summary = _build_pipeline_analysis_summary(result)
+    return await generate_learning_analysis(
+        scope_key=(scope_keys_for_dataset_task(getattr(sample, "dataset", ""), task_type) or [""])[0],
+        task_type=task_type,
+        domain=sample.domain,
+        task_description=task_description,
+        sample_fingerprint=sample_fingerprint,
+        candidate_traces=candidate_traces,
+        best_metrics=best_metrics,
+        fallback_summary=fallback_summary,
+    )
+
+
+def _record_candidate_traces(result: dict[str, Any]) -> list[dict[str, Any]]:
+    return PipelineRunner._extract_candidate_traces(result.get("execution_log", []))
+
+
+def _record_correctness(task: str, metrics: dict[str, Any]) -> bool | None:
+    """Return binary correctness only for tasks with natural binary labels.
+
+    New definition:
+        - forecast / indicator-style regression tasks do not synthesize a
+          boolean ``correct`` from arbitrary thresholds. They should be
+          recorded as scored outcomes and rendered as ``SCORED`` by the
+          daily-note layer.
+        - classification / QA style tasks may still provide explicit binary
+          correctness from the evaluator.
+    """
+    if task in {"forecast", "indicator", "stock_indicator"}:
+        return None
+    if isinstance(metrics.get("correct"), bool):
+        return metrics["correct"]
+    if isinstance(metrics.get("accuracy"), (int, float)):
+        return bool(metrics["accuracy"] >= 1.0)
+    return None
+
+
+def _record_tool_chain(result: dict[str, Any], metrics: dict[str, Any]) -> list[str]:
+    """Prefer the evaluated winner candidate chain over top-level orchestration."""
+    candidate_traces = _record_candidate_traces(result)
+    winner_chain = PipelineRunner._select_winner_tool_chain(candidate_traces, metrics)
+    if winner_chain:
+        return winner_chain
+    return _extract_tool_chain(result)
 
 
 async def _final_llm_call(
@@ -309,28 +381,7 @@ async def _eval_forecast(
     if sample.text:
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
 
-    input_days = len(sample.input_window) // 24
-    horizon_days = horizon // 24
-    ds = getattr(sample, "dataset", "")
-
-    if sample.domain == "weather":
-        desc = (
-            f"The input time-series represents temperature readings from a location "
-            f"in the United States, where summers are hot and winters are cold. "
-            f"Weather conditions can also be affected by storms, heavy rain, and cold fronts. "
-            f"The daytime is usually warmer than the nighttime. "
-            f"Every 24 temperature readings represent a full day from 00:00 to 23:00. "
-            f"Predict the next {horizon_days} day(s) of hourly temperature readings "
-            f"({horizon} values). Return a JSON array of {horizon} numbers."
-        )
-    else:
-        input_desc = "7 days at 5-minute intervals" if "short" in ds else "30 days of daily prices"
-        output_desc = f"next {'1 day' if horizon_days <= 1 else f'{horizon_days} days'}"
-        desc = (
-            f"Time Series Stock Price Data recorded at {input_desc}. "
-            f"Predict the stock prices for the {output_desc} ({horizon} values). "
-            f"Return a JSON array of {horizon} numbers."
-        )
+    desc = build_task_description(sample, "forecast")
 
     result = await pipeline.run(
         data=sample.input_window,
@@ -340,6 +391,7 @@ async def _eval_forecast(
         text_data=text_data,
         verbose=verbose,
         domain=sample.domain,
+        scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "forecast"),
         **_train_kwargs(sample, "forecast"),
     )
 
@@ -363,16 +415,27 @@ async def _eval_forecast(
     if pred_arr is not None:
         metrics = _forecast_metrics(sample.output_window, pred_arr)
         if _pipeline_ref and _record_enabled:
-            mae = metrics.get("mae", 99)
+            analysis_structured, analysis_text = await _build_record_learning_analysis(
+                sample=sample,
+                task_type="forecast",
+                task_description=desc,
+                result=result,
+                best_metrics={k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
+                sample_fingerprint=f"horizon={horizon}",
+            )
             await _pipeline_ref.record_outcome(
                 domain=sample.domain, dataset=getattr(sample, "dataset", ""),
-                task="forecast", tool_chain=_extract_tool_chain(result),
+                scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "forecast"),
+                task="forecast", tool_chain=_record_tool_chain(result, metrics),
                 predicted=json.dumps([float(x) for x in pred_arr[:50]]),
                 ground_truth=json.dumps([float(x) for x in sample.output_window[:50]]),
-                correct=(mae < 5.0),
+                correct=_record_correctness("forecast", metrics),
                 metrics={k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
-                pipeline_summary=str(result.get("evidence_summary", ""))[:2000],
-                data_fingerprint=f"horizon={horizon},last5={[float(x) for x in sample.input_window[-5:]]}",
+                pipeline_summary=analysis_text,
+                analysis_structured=analysis_structured,
+                data_fingerprint=f"horizon={horizon}",
+                description=desc,
+                candidate_traces=_record_candidate_traces(result),
             )
         return {"metrics": metrics, "trace_id": result.get("trace_id")}
     return {"metrics": {"error": "no prediction"}}
@@ -388,11 +451,7 @@ async def _eval_mcqa(
     if sample.text:
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
 
-    mcqa_desc = (
-        f"{sample.question[:5000]}\n\n"
-        f"Answer the multiple-choice question by choosing exactly one of A, B, C, or D. "
-        'Return ONLY JSON: {"answer": "X"}'
-    )
+    mcqa_desc = build_task_description(sample, "mcqa")
 
     result = await pipeline.run(
         data=sample.input_window,
@@ -401,6 +460,7 @@ async def _eval_mcqa(
         text_data=text_data,
         verbose=verbose,
         domain=sample.domain,
+        scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "mcqa"),
         **_train_kwargs(sample, "mcqa"),
     )
 
@@ -437,12 +497,23 @@ async def _eval_mcqa(
     correct = answer_char == gt
 
     if _pipeline_ref and _record_enabled:
-        await _pipeline_ref.record_outcome(
-            domain=sample.domain, dataset=getattr(sample, "dataset", ""),
-            task="mcqa", tool_chain=_extract_tool_chain(result),
-            predicted=answer_char, ground_truth=gt, correct=correct,
-            pipeline_summary=analysis[:2000],
-        )
+            analysis_structured, analysis_text = await _build_record_learning_analysis(
+                sample=sample,
+                task_type="mcqa",
+                task_description=mcqa_desc,
+                result=result,
+                best_metrics={"accuracy": 1.0 if correct else 0.0},
+            )
+            await _pipeline_ref.record_outcome(
+                domain=sample.domain, dataset=getattr(sample, "dataset", ""),
+                scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "mcqa"),
+                task="mcqa", tool_chain=_extract_tool_chain(result),
+                predicted=answer_char, ground_truth=gt, correct=correct,
+                pipeline_summary=analysis_text,
+                analysis_structured=analysis_structured,
+                description=mcqa_desc,
+                candidate_traces=_record_candidate_traces(result),
+            )
 
     return {
         "metrics": {"accuracy": 1.0 if correct else 0.0},
@@ -458,26 +529,7 @@ async def _eval_trend(
     if sample.text:
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
 
-    if sample.domain == "weather":
-        trend_desc = (
-            "The input time-series represents temperature readings from a US location. "
-            "Every 24 readings represent a full day from 00:00 to 23:00. "
-            "Predict the temperature trend for the next 1 day. "
-            "Calculate the mean temperature of the last 24-hour period and compare it "
-            "with the mean temperature of the first predicted day. "
-            "If the difference is >= 0.5, classify as 'increasing'. "
-            "If the difference is <= -0.5, classify as 'decreasing'. "
-            "Otherwise, classify as 'stable'. "
-            'Return ONLY JSON: {"trend": "increasing" or "decreasing" or "stable"}'
-        )
-    else:
-        trend_desc = (
-            "Time Series Stock Price Data. "
-            "Predict the stock trend and categorize the future percentage change into "
-            'one of: "<-4%", "-2% ~ -4%", "-2% ~ +2%", "+2% ~ +4%", ">+4%". '
-            "Analyze the provided time-series data and news to identify future trends. "
-            'Return ONLY JSON: {"trend": "<label>"}'
-        )
+    trend_desc = build_task_description(sample, "trend")
 
     result = await pipeline.run(
         data=sample.input_window,
@@ -486,6 +538,7 @@ async def _eval_trend(
         text_data=text_data,
         verbose=verbose,
         domain=sample.domain,
+        scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "trend"),
         **_train_kwargs(sample, "trend"),
     )
 
@@ -522,12 +575,23 @@ async def _eval_trend(
             matched = "stable"
 
         if _pipeline_ref and _record_enabled:
+            analysis_structured, analysis_text = await _build_record_learning_analysis(
+                sample=sample,
+                task_type="trend",
+                task_description=trend_desc,
+                result=result,
+                best_metrics={"accuracy": 1.0 if matched == gt_label else 0.0},
+            )
             await _pipeline_ref.record_outcome(
                 domain="weather", dataset=getattr(sample, "dataset", ""),
+                scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "trend"),
                 task="trend", tool_chain=tool_chain,
                 predicted=matched, ground_truth=gt_label,
                 correct=(matched == gt_label),
-                pipeline_summary=analysis[:2000],
+                pipeline_summary=analysis_text,
+                analysis_structured=analysis_structured,
+                description=trend_desc,
+                candidate_traces=_record_candidate_traces(result),
             )
         return {
             "metrics": {"accuracy": 1.0 if matched == gt_label else 0.0},
@@ -563,18 +627,109 @@ async def _eval_trend(
             matched = "-2% ~ +2%"
 
         if _pipeline_ref and _record_enabled:
+            analysis_structured, analysis_text = await _build_record_learning_analysis(
+                sample=sample,
+                task_type="trend",
+                task_description=trend_desc,
+                result=result,
+                best_metrics={"accuracy": 1.0 if matched == gt_label else 0.0},
+            )
             await _pipeline_ref.record_outcome(
                 domain="finance", dataset=getattr(sample, "dataset", ""),
+                scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "trend"),
                 task="trend", tool_chain=tool_chain,
                 predicted=matched, ground_truth=gt_label,
                 correct=(matched == gt_label),
-                pipeline_summary=analysis[:2000],
+                pipeline_summary=analysis_text,
+                analysis_structured=analysis_structured,
+                description=trend_desc,
+                candidate_traces=_record_candidate_traces(result),
             )
         return {
             "metrics": {"accuracy": 1.0 if matched == gt_label else 0.0},
             "predicted": matched,
             "ground_truth": gt_label,
         }
+
+
+async def _eval_trend_past(
+    sample: MTBenchSample, pipeline: PipelineRunner, verbose: bool,
+) -> dict[str, Any]:
+    if sample.domain != "weather":
+        return {"metrics": {"error": "trend_past_only_supported_for_weather"}}
+
+    text_data = None
+    if sample.text:
+        text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
+
+    input_days = max(1, len(sample.input_window) // 24)
+    trend_desc = build_task_description(sample, "trend_past")
+
+    result = await pipeline.run(
+        data=sample.input_window,
+        task_type="classification",
+        description=trend_desc,
+        text_data=text_data,
+        verbose=verbose,
+        domain=sample.domain,
+        scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "trend_past"),
+        **_train_kwargs(sample, "trend_past"),
+    )
+
+    analysis = _build_pipeline_analysis_summary(result)
+    tool_chain = _extract_tool_chain(result)
+    ts_str = _fmt_ts_compact(sample.input_window)
+    text_section = f"\nContextual text:\n{sample.text[:10000]}\n" if sample.text else ""
+    gt_label = _weather_trend_past_3way_label(sample)
+    sys_prompt = (
+        "You are a weather forecasting AI. "
+        "The input time-series represents temperature readings from a US location. "
+        "Every 24 readings represent a full day from 00:00 to 23:00.\n"
+        f"Analyze the past {input_days} days's of temperature trend. "
+        "Compute the daily mean temperature and fit a linear trend. "
+        "If the slope is >= 0.25, return 'increasing'; if <= -0.25, "
+        "return 'decreasing'; otherwise return 'stable'.\n"
+        'Return ONLY JSON: {"trend": "<increasing|decreasing|stable>"}'
+    )
+    user_prompt = (
+        f"Temperature time series (historical, hourly, °C):\n[{ts_str}]\n"
+        f"{text_section}\n"
+        f"=== Tool Analysis ===\n{analysis}\n\n"
+        f"What is the temperature trend for the past {input_days} days? "
+        '{"trend": "..."}'
+    )
+    parsed = await _final_llm_call(sys_prompt, user_prompt)
+    matched = None
+    valid = {"increasing", "decreasing", "stable"}
+    if isinstance(parsed, dict) and "trend" in parsed:
+        matched = _quick_match_label(str(parsed["trend"]).lower(), valid)
+    if matched is None:
+        matched = "stable"
+
+    if _pipeline_ref and _record_enabled:
+        analysis_structured, analysis_text = await _build_record_learning_analysis(
+            sample=sample,
+            task_type="trend_past",
+            task_description=trend_desc,
+            result=result,
+            best_metrics={"accuracy": 1.0 if matched == gt_label else 0.0},
+        )
+        await _pipeline_ref.record_outcome(
+            domain="weather", dataset=getattr(sample, "dataset", ""),
+            scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "trend_past"),
+            task="trend_past", tool_chain=tool_chain,
+            predicted=matched, ground_truth=gt_label,
+            correct=(matched == gt_label),
+            pipeline_summary=analysis_text,
+            analysis_structured=analysis_structured,
+            description=trend_desc,
+            candidate_traces=_record_candidate_traces(result),
+        )
+    return {
+        "metrics": {"accuracy": 1.0 if matched == gt_label else 0.0},
+        "predicted": matched,
+        "ground_truth": gt_label,
+    }
 
 
 async def _eval_indicator(
@@ -610,21 +765,12 @@ async def _eval_weather_indicator(
     result = await pipeline.run(
         data=sample.input_window,
         task_type="indicator",
-        description=(
-            f"The input time-series represents temperature readings from a location "
-            f"in the United States, where summers are hot and winters are cold. "
-            f"Weather conditions can also be affected by storms, heavy rain, and cold fronts. "
-            f"The daytime is usually warmer than the nighttime. "
-            f"Every 24 temperature readings represent a full day from 00:00 to 23:00. "
-            f"Analyze the past 7 days' temperature trend and predict the next {n_days} day(s) "
-            f"highest temperature, lowest temperature, and the temperature difference "
-            f"between them. "
-            f'Return ONLY JSON: {{"max": number, "min": number, "diff": number}}'
-        ),
+        description=build_task_description(sample, "indicator"),
         horizon=n_hours,
         text_data=text_data,
         verbose=verbose,
         domain="weather",
+        scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "indicator"),
         **_train_kwargs(sample, "indicator"),
     )
 
@@ -673,23 +819,37 @@ async def _eval_weather_indicator(
             hist_arr = np.asarray(sample.input_window).ravel()
             recent_24 = hist_arr[-24:] if len(hist_arr) >= 24 else hist_arr
             recent_range = float(np.max(recent_24) - np.min(recent_24))
-            summary = _build_pipeline_analysis_summary(result)
+            analysis_structured, analysis_text = await _build_record_learning_analysis(
+                sample=sample,
+                task_type="indicator",
+                task_description=build_task_description(sample, "indicator"),
+                result=result,
+                best_metrics=metrics,
+                sample_fingerprint=f"recent_range={recent_range:.1f}",
+            )
             await _pipeline_ref.record_outcome(
                 domain="weather", dataset=getattr(sample, "dataset", ""),
-                task="indicator", tool_chain=_extract_tool_chain(result),
+                scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "indicator"),
+                task="indicator", tool_chain=_record_tool_chain(result, metrics),
                 predicted=json.dumps(pred),
                 ground_truth=json.dumps(gt),
-                correct=(metrics.get("diff_mae", 99) < 3.0),
+                correct=_record_correctness("indicator", metrics),
                 metrics=metrics,
-                pipeline_summary=summary[:2000],
+                pipeline_summary=analysis_text,
+                analysis_structured=analysis_structured,
                 data_fingerprint=f"recent_range={recent_range:.1f}",
+                description=build_task_description(sample, "indicator"),
+                candidate_traces=_record_candidate_traces(result),
             )
         return {"metrics": metrics, "predicted": pred, "ground_truth": gt}
     return {"metrics": {"error": "no prediction"}}
 
 
 async def _eval_stock_indicator(
-    sample: MTBenchSample, pipeline: PipelineRunner, verbose: bool,
+    sample: MTBenchSample,
+    pipeline: PipelineRunner,
+    verbose: bool,
+    indicator_field: str | None = None,
 ) -> dict[str, Any]:
     gt_macd = sample.labels.get("out_macd")
     gt_bb = sample.labels.get("out_upper_bb")
@@ -701,36 +861,25 @@ async def _eval_stock_indicator(
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
 
     indicator_names = []
-    if gt_macd is not None:
+    if indicator_field in (None, "macd") and gt_macd is not None:
         indicator_names.append("MACD")
-    if gt_bb is not None:
+    if indicator_field in (None, "upper_bb") and gt_bb is not None:
         indicator_names.append("upper Bollinger Band")
+    if not indicator_names:
+        return {"metrics": {"error": "indicator_label_missing"}}
 
-    ds = getattr(sample, "dataset", "")
-    input_desc = "7 days at 5-minute intervals" if "short" in ds else "30 days of daily prices"
-    schema_parts = []
-    if gt_macd is not None:
-        schema_parts.append('"macd": <number>')
-    if gt_bb is not None:
-        schema_parts.append('"upper_bb": <number>')
-    target_schema = "{" + ", ".join(schema_parts) + "}"
+    task_name = "indicator" if indicator_field is None else f"indicator_{indicator_field}"
 
     result = await pipeline.run(
         data=sample.input_window,
         task_type="indicator",
-        description=(
-            f"Stock price data recorded at {input_desc}. "
-            f"Predict the following technical indicators for the NEXT trading day: "
-            f"{', '.join(indicator_names)}. "
-            f"MACD (Moving Average Convergence Divergence) = EMA(12) - EMA(26) of closing price. "
-            f"Upper Bollinger Band = SMA(20) + 2 * StdDev(20). "
-            f"Return ONLY JSON: {target_schema}"
-        ),
+        description=build_task_description(sample, task_name),
         horizon=len(sample.output_window) if sample.output_window is not None else 78,
         text_data=text_data,
         verbose=verbose,
         domain="finance",
-        **_train_kwargs(sample, "indicator"),
+        scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), task_name),
+        **_train_kwargs(sample, task_name),
     )
 
     analysis = _build_pipeline_analysis_summary(result)
@@ -741,9 +890,9 @@ async def _eval_stock_indicator(
     input_desc = "7 days at 5-minute intervals" if "short" in ds else "30 days of daily prices"
 
     schema_parts = []
-    if gt_macd is not None:
+    if indicator_field in (None, "macd") and gt_macd is not None:
         schema_parts.append('"macd": <number>')
-    if gt_bb is not None:
+    if indicator_field in (None, "upper_bb") and gt_bb is not None:
         schema_parts.append('"upper_bb": <number>')
     target_schema = "{" + ", ".join(schema_parts) + "}"
 
@@ -766,12 +915,12 @@ async def _eval_stock_indicator(
     parsed = await _final_llm_call(sys_prompt, user_prompt)
     metrics: dict[str, float] = {}
     if isinstance(parsed, dict):
-        if gt_macd is not None and "macd" in parsed:
+        if indicator_field in (None, "macd") and gt_macd is not None and "macd" in parsed:
             try:
                 metrics["macd_mae"] = abs(float(gt_macd) - float(parsed["macd"]))
             except (ValueError, TypeError):
                 pass
-        if gt_bb is not None and "upper_bb" in parsed:
+        if indicator_field in (None, "upper_bb") and gt_bb is not None and "upper_bb" in parsed:
             try:
                 metrics["upper_bb_mae"] = abs(float(gt_bb) - float(parsed["upper_bb"]))
             except (ValueError, TypeError):
@@ -781,26 +930,59 @@ async def _eval_stock_indicator(
         prediction = result.get("prediction")
         pred_dict = _extract_indicator_dict(prediction, ["macd", "upper_bb"])
         if pred_dict:
-            if gt_macd is not None and "macd" in pred_dict:
+            if indicator_field in (None, "macd") and gt_macd is not None and "macd" in pred_dict:
                 metrics["macd_mae"] = abs(float(gt_macd) - float(pred_dict["macd"]))
-            if gt_bb is not None and "upper_bb" in pred_dict:
+            if indicator_field in (None, "upper_bb") and gt_bb is not None and "upper_bb" in pred_dict:
                 metrics["upper_bb_mae"] = abs(float(gt_bb) - float(pred_dict["upper_bb"]))
 
     if not metrics:
         return {"metrics": {"error": "no prediction or labels"}}
 
     if _pipeline_ref and _record_enabled:
+        analysis_structured, analysis_text = await _build_record_learning_analysis(
+            sample=sample,
+            task_type=task_name,
+            task_description=build_task_description(sample, task_name),
+            result=result,
+            best_metrics=metrics,
+        )
+        predicted_fields = {"macd", "upper_bb"} if indicator_field is None else {indicator_field}
+        gt_payload: dict[str, Any] = {}
+        if "macd" in predicted_fields:
+            gt_payload["macd"] = gt_macd
+        if "upper_bb" in predicted_fields:
+            gt_payload["upper_bb"] = gt_bb
         await _pipeline_ref.record_outcome(
             domain="finance", dataset=getattr(sample, "dataset", ""),
-            task="stock_indicator", tool_chain=_extract_tool_chain(result),
-            predicted=json.dumps({k: v for k, v in (parsed if isinstance(parsed, dict) else {}).items() if k in ("macd", "upper_bb")}),
-            ground_truth=json.dumps({"macd": gt_macd, "upper_bb": gt_bb}),
-            correct=(metrics.get("macd_mae", 99) < 1.0 and metrics.get("upper_bb_mae", 99) < 5.0),
+            scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), task_name),
+            task="stock_indicator" if indicator_field is None else task_name,
+            tool_chain=_record_tool_chain(result, metrics),
+            predicted=json.dumps({
+                k: v for k, v in (parsed if isinstance(parsed, dict) else {}).items()
+                if k in predicted_fields
+            }),
+            ground_truth=json.dumps(gt_payload),
+            correct=_record_correctness("stock_indicator", metrics),
             metrics=metrics,
-            pipeline_summary=analysis[:2000],
+            pipeline_summary=analysis_text,
+            analysis_structured=analysis_structured,
+            description=build_task_description(sample, task_name),
+            candidate_traces=_record_candidate_traces(result),
         )
 
     return {"metrics": metrics}
+
+
+async def _eval_indicator_macd(
+    sample: MTBenchSample, pipeline: PipelineRunner, verbose: bool,
+) -> dict[str, Any]:
+    return await _eval_stock_indicator(sample, pipeline, verbose, indicator_field="macd")
+
+
+async def _eval_indicator_upper_bb(
+    sample: MTBenchSample, pipeline: PipelineRunner, verbose: bool,
+) -> dict[str, Any]:
+    return await _eval_stock_indicator(sample, pipeline, verbose, indicator_field="upper_bb")
 
 
 _CORR_CANONICAL = {
@@ -846,19 +1028,11 @@ async def _eval_correlation(
     result = await pipeline.run(
         data=sample.input_window,
         task_type="qa",
-        description=(
-            "Predict the correlation between the stock's price fluctuations in the "
-            "next 7 days and the analysis sentiment. Positive correlation indicates "
-            "that positive analysis leads to price increase and negative analysis "
-            "leads to price decrease. Take into account external factors or market "
-            "conditions that might affect stock price movement. "
-            "Choose one of: Strong Positive Correlation, Moderate Positive Correlation, "
-            "No Correlation, Moderate Negative Correlation, Strong Negative Correlation. "
-            'Return ONLY JSON: {"correlation": "<label>"}'
-        ),
+        description=build_task_description(sample, "correlation"),
         text_data=text_data,
         verbose=verbose,
         domain="finance",
+        scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "correlation"),
         **_train_kwargs(sample, "correlation"),
     )
 
@@ -899,11 +1073,22 @@ async def _eval_correlation(
     correct = matched.lower().strip() == gt_corr.lower().strip()
 
     if _pipeline_ref and _record_enabled:
+        analysis_structured, analysis_text = await _build_record_learning_analysis(
+            sample=sample,
+            task_type="correlation",
+            task_description=build_task_description(sample, "correlation"),
+            result=result,
+            best_metrics={"accuracy": 1.0 if correct else 0.0},
+        )
         await _pipeline_ref.record_outcome(
             domain="finance", dataset=getattr(sample, "dataset", ""),
+            scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "correlation"),
             task="correlation", tool_chain=_extract_tool_chain(result),
             predicted=matched, ground_truth=gt_corr, correct=correct,
-            pipeline_summary=analysis[:2000],
+            pipeline_summary=analysis_text,
+            analysis_structured=analysis_structured,
+            description=build_task_description(sample, "correlation"),
+            candidate_traces=_record_candidate_traces(result),
         )
 
     return {
@@ -918,7 +1103,10 @@ async def _eval_correlation(
 EVAL_HANDLERS = {
     "forecast": _eval_forecast,
     "trend": _eval_trend,
+    "trend_past": _eval_trend_past,
     "indicator": _eval_indicator,
+    "indicator_macd": _eval_indicator_macd,
+    "indicator_upper_bb": _eval_indicator_upper_bb,
     "mcqa": _eval_mcqa,
     "correlation": _eval_correlation,
 }
@@ -932,30 +1120,37 @@ async def _eval_one_task(
     pipeline: PipelineRunner,
     verbose: bool,
     sem: asyncio.Semaphore,
+    task_sem: asyncio.Semaphore | None = None,
 ) -> dict[str, Any]:
-    async with sem:
-        handler = EVAL_HANDLERS.get(task)
-        if not handler:
-            return {"idx": idx, "file": sample.file, "task": task,
-                    "domain": sample.domain,
-                    "metrics": {"error": "no handler"}}
-        try:
-            result = await asyncio.wait_for(
-                handler(sample, pipeline, verbose), timeout=600,
-            )
-        except asyncio.TimeoutError:
-            result = {"metrics": {"error": "timeout"}}
-        except Exception as e:
-            logger.error(f"[PipelineEval] {ds_name}[{idx}] {task}: {e}")
-            result = {"metrics": {"error": str(e)}}
+    if task_sem is not None:
+        await task_sem.acquire()
+    try:
+        async with sem:
+            handler = EVAL_HANDLERS.get(task)
+            if not handler:
+                return {"idx": idx, "file": sample.file, "task": task,
+                        "domain": sample.domain,
+                        "metrics": {"error": "no handler"}}
+            try:
+                result = await asyncio.wait_for(
+                    handler(sample, pipeline, verbose), timeout=1200,
+                )
+            except asyncio.TimeoutError:
+                result = {"metrics": {"error": "timeout"}}
+            except Exception as e:
+                logger.error(f"[PipelineEval] {ds_name}[{idx}] {task}: {e}")
+                result = {"metrics": {"error": str(e)}}
 
-        return {
-            "idx": idx,
-            "file": sample.file,
-            "task": task,
-            "domain": sample.domain,
-            **result,
-        }
+            return {
+                "idx": idx,
+                "file": sample.file,
+                "task": task,
+                "domain": sample.domain,
+                **result,
+            }
+    finally:
+        if task_sem is not None:
+            task_sem.release()
 
 
 # ── Main evaluation loop ─────────────────────────────────────────────
@@ -965,10 +1160,13 @@ async def run_pipeline_eval(
     task_filter: str | None = None,
     config: TimeClawConfig | None = None,
     max_samples: int | None = None,
+    sample_indices: dict[str, list[int]] | str | Path | None = None,
     use_skills: bool = True,
     verbose: bool = False,
     label: str = "timeclaw",
     concurrency: int = 80,
+    per_task_concurrency: int | None = None,
+    indicator_concurrency: int | None = None,
     full_dataset: bool = False,
     use_strategy: bool = True,
     split: str = "test",
@@ -999,6 +1197,11 @@ async def run_pipeline_eval(
         disable_mem = not use_skills and not use_strategy
         pipeline = PipelineRunner(cfg, disable_memory=disable_mem)
         _pipeline_ref = pipeline
+        sample_indices_map = (
+            load_sample_indices(sample_indices)
+            if isinstance(sample_indices, (str, Path))
+            else sample_indices
+        )
 
         try:
             from timeclaw.sbm.registry import get_global_registry, auto_register
@@ -1023,6 +1226,23 @@ async def run_pipeline_eval(
             [dataset_name] if dataset_name else list(DATASET_REGISTRY.keys())
         )
         all_results: dict[str, Any] = {}
+        task_sems: dict[tuple[str, str], asyncio.Semaphore] = {}
+
+        def _get_task_sem(ds_name: str, task_name: str) -> asyncio.Semaphore | None:
+            if per_task_concurrency is None and indicator_concurrency is None:
+                return None
+            key = (ds_name, task_name)
+            if key in task_sems:
+                return task_sems[key]
+            limit = (
+                indicator_concurrency
+                if task_name.startswith("indicator") and indicator_concurrency is not None
+                else per_task_concurrency
+            )
+            if limit is None:
+                return None
+            task_sems[key] = asyncio.Semaphore(limit)
+            return task_sems[key]
 
         from timeclaw.benchmark.mtbench_adapter import load_dataset
 
@@ -1040,26 +1260,30 @@ async def run_pipeline_eval(
                 logger.warning(f"[PipelineEval] No data for {ds_name}")
                 continue
 
+            samples = select_samples_by_index(samples, ds_name, sample_indices_map)
             if max_samples:
                 samples = samples[:max_samples]
 
-            supported_tasks = info["tasks"]
+            supported_tasks = expand_dataset_tasks(ds_name, list(info["tasks"]))
             if task_filter:
                 supported_tasks = [t for t in supported_tasks if t == task_filter]
             if not supported_tasks:
                 continue
 
             total_tasks = len(samples) * len(supported_tasks)
+            ptc_str = f", per_task_concurrency={per_task_concurrency}" if per_task_concurrency else ""
+            ic_str = f", indicator_concurrency={indicator_concurrency}" if indicator_concurrency else ""
             logger.info(
                 f"[PipelineEval:{label}] {ds_name}: {len(samples)} samples "
                 f"× {len(supported_tasks)} tasks = {total_tasks} evals, "
-                f"concurrency={concurrency}"
+                f"concurrency={concurrency}{ptc_str}{ic_str}"
             )
             t0 = time.time()
 
             coros = [
                 _eval_one_task(
-                    ds_name, idx, sample, task, pipeline, verbose, sem
+                    ds_name, idx, sample, task, pipeline, verbose, sem,
+                    _get_task_sem(ds_name, task),
                 )
                 for idx, sample in enumerate(samples)
                 for task in supported_tasks
@@ -1087,7 +1311,7 @@ async def run_pipeline_eval(
             )
 
         if _pipeline_ref is not None and _record_enabled:
-            _pipeline_ref.flush_memory()
+            await _pipeline_ref.flush_memory()
             try:
                 await _pipeline_ref.distill_memory()
                 mem_summary = _pipeline_ref.memory_summary()
@@ -1141,8 +1365,11 @@ async def main() -> None:
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--task", type=str, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--sample-index-file", type=str, default=None)
     parser.add_argument("--no-skills", action="store_true")
     parser.add_argument("--concurrency", type=int, default=80)
+    parser.add_argument("--per-task-concurrency", type=int, default=None)
+    parser.add_argument("--indicator-concurrency", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1150,10 +1377,13 @@ async def main() -> None:
         dataset_name=args.dataset,
         task_filter=args.task,
         max_samples=args.max_samples,
+        sample_indices=args.sample_index_file,
         use_skills=not args.no_skills,
         verbose=args.verbose,
         label="timeclaw_no_skills" if args.no_skills else "timeclaw",
         concurrency=args.concurrency,
+        per_task_concurrency=args.per_task_concurrency,
+        indicator_concurrency=args.indicator_concurrency,
     )
     print(json.dumps(result, indent=2, default=str))
 

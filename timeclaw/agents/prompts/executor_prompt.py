@@ -4,9 +4,8 @@ The Executor uses a step-by-step Think→Act→Observe loop instead of
 planning the entire tool chain upfront. Each step, the LLM sees the
 results of previous tools and decides what to do next.
 
-Tool discovery is fully dynamic: all registered tools are exposed to the
-agent via their self-descriptions (from ClawTool.description or MCP).
-No static candidate-tool mappings or modality/task-type filters.
+Tool discovery is fully dynamic, but tool exposure is filtered by the
+currently available modalities inferred from the sample.
 """
 
 from __future__ import annotations
@@ -17,97 +16,22 @@ if TYPE_CHECKING:
     from timeclaw.clawhub.tool_base import ClawTool
 
 
-def get_all_tool_names() -> list[str]:
-    """Return the names of ALL registered tools (no filtering)."""
+def get_all_tool_names(modalities: list[str] | None = None) -> list[str]:
+    """Return tool names compatible with the currently available modalities."""
     from timeclaw.clawhub.tool_registry import list_tool_instances
-    return [t.name for t in list_tool_instances()]
+
+    available = set(modalities or ["timeseries"])
+    return [
+        t.name for t in list_tool_instances()
+        if t.required_modalities().issubset(available)
+    ]
 
 
-_CATEGORY_ORDER = [
-    "generic_llm", "prediction", "profiling", "detection",
-    "decomposition", "processing", "relation", "text", "image", "validation",
-]
-
-_CATEGORY_LABELS = {
-    "generic_llm": "Generic Multimodal LLM",
-    "prediction": "Prediction / Forecasting",
-    "profiling": "Profiling / Statistics",
-    "detection": "Detection",
-    "decomposition": "Decomposition",
-    "processing": "Processing",
-    "relation": "Relation Analysis",
-    "text": "Text Analysis",
-    "image": "Image Analysis",
-    "validation": "Validation",
-}
-
-
-def build_tool_guide_text(
-    tool_names: list[str],
-    experience_insights: dict[str, str] | None = None,
-    mcp_tools: dict | None = None,
-) -> str:
-    """Build a categorized tool guide from dynamic sources.
-
-    Tools are grouped by category and ordered so that generic_llm
-    appears first, giving the agent equal visibility over LLM-based
-    reasoning alongside specialized tools.
-
-    Description priority:
-        1. MCP ToolDescriptor.description (from running MCP servers)
-        2. ClawTool.description (from the tool registry)
-        3. Tool name only (if neither is available — should not happen)
-
-    Experience notes (from TOOLS.md) are appended when available.
-    """
-    from timeclaw.clawhub.tool_registry import _TOOL_INSTANCES
-
-    def _get_desc(name: str) -> str | None:
-        if mcp_tools and name in mcp_tools:
-            entry = mcp_tools[name]
-            d = entry.description if hasattr(entry, "description") else str(entry)
-            if d:
-                return d
-        obj = _TOOL_INSTANCES.get(name)
-        return obj.description if obj else None
-
-    def _get_category(name: str) -> str:
-        if mcp_tools and name in mcp_tools:
-            entry = mcp_tools[name]
-            srv = entry.server_name if hasattr(entry, "server_name") else ""
-            if "generic-llm" in srv:
-                return "generic_llm"
-            for cat in _CATEGORY_ORDER:
-                if cat in srv:
-                    return cat
-        obj = _TOOL_INSTANCES.get(name)
-        if obj:
-            return obj.category.value if hasattr(obj.category, "value") else str(obj.category)
-        return "other"
-
-    grouped: dict[str, list[str]] = {c: [] for c in _CATEGORY_ORDER}
-    grouped["other"] = []
-    for name in tool_names:
-        cat = _get_category(name)
-        grouped.setdefault(cat, []).append(name)
-
-    lines: list[str] = []
-    for cat in _CATEGORY_ORDER + ["other"]:
-        tools_in_cat = grouped.get(cat, [])
-        if not tools_in_cat:
-            continue
-        label = _CATEGORY_LABELS.get(cat, cat.title())
-        lines.append(f"\n### {label}")
-        for name in tools_in_cat:
-            desc = _get_desc(name)
-            if desc:
-                lines.append(f"- **{name}**: {desc}")
-            else:
-                lines.append(f"- **{name}**")
-            if experience_insights and name in experience_insights:
-                lines.append(f"  NOTE: {experience_insights[name]}")
-
-    return "\n".join(lines)
+def build_tool_name_text(tool_names: list[str]) -> str:
+    """Return the minimal tool list required for the executor prompt."""
+    if not tool_names:
+        return "(none)"
+    return ", ".join(tool_names)
 
 
 # ── Mini-ReAct Prompt Templates ──────────────────────────────────────
@@ -129,15 +53,17 @@ Each turn, you see the results of all previous steps. You then decide:
    Example: if detect_seasonality found period=7, pass period=7 to stl_decompose.
 4. Keep total steps ≤ {max_steps}. Be efficient — don't run tools that won't help.
 5. When you have produced the result the task requires, set done=true.
-6. You have access to tools across ALL categories (time-series, text, image,
-   decomposition, detection, prediction, etc.). Choose whichever tools are
-   appropriate for the data and task — there are no modality restrictions.
+6. You only see tools compatible with the currently available modalities.
+   If text or image data is absent, tools that require them will not be shown.
+7. No tool is mandatory as a first or final step, including any `llm_reasoning_*`
+   wrapper — pick tools from evidence and the task; do not assume you must
+   end with LLM-only reasoning if another chain already satisfies the task.
 
 ## Output Format (strict JSON)
 
 To call a tool:
 {{
-  "thought": "what I learned from previous results and what I should do next",
+  "thought": "Reason: <why this next step is justified>. Action: <what tool to run next and why>",
   "done": false,
   "tool": "tool_name",
   "args": {{"key": "value"}}
@@ -145,7 +71,7 @@ To call a tool:
 
 When done — you MUST include `answer` with the final result:
 {{
-  "thought": "summary of analysis and reasoning for the final answer",
+  "thought": "Reason: <why the evidence supports the final answer>. Action: <finish and return the answer>",
   "done": true,
   "answer": "<the final result — array for forecast, dict for indicator, label for classification, text for QA>",
   "answer_type": "forecast | indicator | classification | qa | correlation",
@@ -155,7 +81,7 @@ When done — you MUST include `answer` with the final result:
 
 To spawn parallel sub-agents for independent sub-tasks (max {max_subagents}):
 {{
-  "thought": "why this task benefits from parallel sub-agents",
+  "thought": "Reason: <why parallel branches are justified>. Action: <spawn sub-agents for the listed sub-tasks>",
   "done": false,
   "tool": "spawn_subagent",
   "args": {{
@@ -173,19 +99,21 @@ multi-step reasoning.
 IMPORTANT: `done: true` without `answer` is INVALID. You must always provide a
 concrete answer. If tools failed, still give your best-effort result based on
 available information.
+Every `thought` MUST explicitly contain these two labeled parts:
+- `Reason:`
+- `Action:`
 """
 
 REACT_FIRST_TURN = """\
 Task: {task_type}
 Description: {task_description}
 Data fingerprint: {fingerprint}
+{profiling_section}
 
 {reanalysis_section}\
-{strategy_section}\
 {skills_section}\
-{l1_section}\
 ## Available Tools
-{tool_guide}
+{tool_names}
 
 This is step 1. Analyze the task description, data fingerprint, and available tools.
 Decide which tool to run first.
@@ -207,12 +135,13 @@ the main agent. You have the same tools and data as the main agent.
 2. ONLY use tools from the available list.
 3. Keep steps ≤ {max_steps}. Be concise and efficient.
 4. When done, set done=true with your answer for this sub-task.
+5. No tool is mandatory as a final step, including any `llm_reasoning_*` tool.
 
 ## Output Format (strict JSON)
 
 To call a tool:
 {{
-  "thought": "reasoning",
+  "thought": "Reason: <why this is justified>. Action: <what tool to run next and why>",
   "done": false,
   "tool": "tool_name",
   "args": {{"key": "value"}}
@@ -220,7 +149,7 @@ To call a tool:
 
 When done:
 {{
-  "thought": "summary",
+  "thought": "Reason: <why the evidence supports the answer>. Action: <finish and return the answer>",
   "done": true,
   "answer": "<result for this sub-task>",
   "answer_type": "forecast | indicator | classification | qa | correlation",
@@ -230,12 +159,16 @@ When done:
 """
 
 SUBAGENT_FIRST_TURN = """\
+Parent task type: {parent_task_type}
+Parent task description: {parent_task_description}
 Sub-task: {task_description}
 Data fingerprint: {fingerprint}
+{profiling_section}
 
+{tool_notes_section}\
 {memory_section}\
 ## Available Tools
-{tool_guide}
+{tool_names}
 
 Begin working on this sub-task.
 """
@@ -246,19 +179,62 @@ TRAIN_MODE_HINT = (
     "\n\n## Learning Mode\n"
     "You are currently in **learning mode**. Your goal is to **explore "
     "multiple approaches** and learn which works best.\n\n"
+    "Completion contract:\n"
+    "- You MUST NOT finish learning mode before calling a ground-truth evaluation tool.\n"
+    "- You MUST explore at least 2 valid candidate paths before finishing, unless tool availability makes that impossible.\n"
+    "- A training run is only complete after at least one valid candidate has been evaluated with "
+    "`evaluate_batch_against_gt`, `batch_evaluate_against_gt`, or `evaluate_against_gt`.\n"
+    "- If you have candidate predictions but no evaluation yet, continue working instead of returning done=true.\n\n"
     "**Workflow:**\n"
-    "1. Plan different solution approaches (e.g. different models, or "
-    "a statistical tool vs llm_reasoning).\n"
+    "1. Plan different solution approaches (e.g. distinct statistical pipelines, "
+    "different time-series forecast tools, different preprocessing + model "
+    "combinations, or independent multi-step chains).\n"
     "2. Use `spawn_subagent` to run them in parallel. Each sub-agent "
     "tries one approach and returns its result to you.\n"
-    "3. For **every** sub-agent result, call `evaluate_against_gt` with "
-    "that result to get its metrics.\n"
+    "3. Collect only the sub-agent results that are valid predictions for the task. "
+    "Use `evaluate_batch_against_gt` to evaluate them together.\n"
     "4. Compare. Optionally try more approaches.\n"
     "5. Finish with answer_type=\"learning_summary\" and "
     "answer={\"insight\": \"...\", \"recommendation\": \"...\"}.\n\n"
     "**Rules:**\n"
-    "- Every approach's result must be evaluated via `evaluate_against_gt`.\n"
+    "- You are NOT required to include any `llm_reasoning_*` branch among your "
+    "candidates; two valid paths may both be non-LLM-reasoning tools only.\n"
+    "- Do NOT evaluate invalid results such as explanations, error messages, or wrong-typed outputs.\n"
+    "- Prefer `evaluate_batch_against_gt` after collecting multiple valid approaches.\n"
+    "- A forecast answer must be a numeric array; an indicator answer must be a numeric JSON object; "
+    "a classification/correlation answer must be a label or a JSON object containing the label.\n"
+    "- After evaluation, if you finish with a task result instead of a learning summary, the final answer must "
+    "reuse one already-evaluated candidate prediction exactly; do not rewrite, summarize, or transform it.\n"
     "- answer_type MUST be \"learning_summary\", not the task type.\n"
     "- If a tool's description says \"Insufficient data\", prioritize "
     "including it in your exploration — it needs more test runs."
+)
+
+DEFERRED_TRAIN_MODE_HINT = (
+    "\n\n## Learning Mode\n"
+    "You are currently in **learning mode** with external learning-note recording.\n\n"
+    "Completion contract:\n"
+    "- You MUST NOT finish before calling a ground-truth evaluation tool.\n"
+    "- You MUST explore at least 2 valid candidate paths before finishing, unless tool availability makes that impossible.\n"
+    "- A training run is only complete after at least one valid candidate has been evaluated with "
+    "`evaluate_batch_against_gt`, `batch_evaluate_against_gt`, or `evaluate_against_gt`.\n"
+    "- The framework will record the learning note externally, so your FINAL answer must use the original task type, not `learning_summary`.\n\n"
+    "**Workflow:**\n"
+    "1. Explore multiple valid approaches.\n"
+    "2. Use `spawn_subagent` to run independent approaches in parallel when helpful.\n"
+    "3. Collect only task-valid candidate predictions.\n"
+    "4. Prefer `evaluate_batch_against_gt` after collecting multiple valid candidates.\n"
+    "5. Finish with a task-typed final answer after at least one successful GT evaluation.\n\n"
+    "**Rules:**\n"
+    "- You are NOT required to include any `llm_reasoning_*` branch among your "
+    "candidates; two valid paths may both be non-LLM-reasoning tools only.\n"
+    "- Do NOT evaluate invalid results such as explanations, error messages, or wrong-typed outputs.\n"
+    "- A forecast answer must be a numeric array; an indicator answer must be a numeric JSON object; "
+    "a classification/correlation answer must be a label or a JSON object containing the label.\n"
+    "- New definition: an `evaluated winner` is a candidate that has already been scored by a GT evaluation tool "
+    "and is strongest among the currently evaluated candidates.\n"
+    "- When finishing, choose an evaluated winner and copy its task-valid prediction as the final answer.\n"
+    "- Do NOT rewrite, summarize, reformat, or verbally describe the winner prediction.\n"
+    "- For forecast specifically, the final `answer` must be the raw numeric array from the evaluated winner.\n"
+    "- If your current final answer is prose, explanation, or a learning summary, it is invalid for deferred learning mode.\n"
 )

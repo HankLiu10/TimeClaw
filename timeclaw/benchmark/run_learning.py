@@ -76,8 +76,11 @@ async def cmd_train(args: argparse.Namespace) -> None:
         dataset_name=args.dataset,
         task_filter=args.task,
         max_samples=args.max_samples,
+        sample_indices=args.sample_index_file,
         verbose=args.verbose,
         concurrency=args.concurrency,
+        per_task_concurrency=args.per_task_concurrency,
+        indicator_concurrency=args.indicator_concurrency,
     )
 
     out = Path(".timeclaw/train_results/train_summary.json")
@@ -104,14 +107,20 @@ async def cmd_test(args: argparse.Namespace) -> None:
         with_mem = await run_pipeline_eval(
             dataset_name=args.dataset, task_filter=args.task,
             max_samples=args.max_samples, verbose=args.verbose,
+            sample_indices=args.sample_index_file,
             concurrency=args.concurrency,
+            per_task_concurrency=args.per_task_concurrency,
+            indicator_concurrency=args.indicator_concurrency,
             use_skills=True, label="with_memory", split="test",
         )
         logger.info("[RunLearning] Compare: running without memory...")
         without_mem = await run_pipeline_eval(
             dataset_name=args.dataset, task_filter=args.task,
             max_samples=args.max_samples, verbose=args.verbose,
+            sample_indices=args.sample_index_file,
             concurrency=args.concurrency,
+            per_task_concurrency=args.per_task_concurrency,
+            indicator_concurrency=args.indicator_concurrency,
             use_skills=False, label="no_memory", split="test",
         )
         result = {"with_memory": with_mem, "no_memory": without_mem}
@@ -120,10 +129,13 @@ async def cmd_test(args: argparse.Namespace) -> None:
             dataset_name=args.dataset,
             task_filter=args.task,
             max_samples=args.max_samples,
+            sample_indices=args.sample_index_file,
             use_skills=not args.no_skills,
             verbose=args.verbose,
             label="no_memory" if args.no_skills else "with_memory",
             concurrency=args.concurrency,
+            per_task_concurrency=args.per_task_concurrency,
+            indicator_concurrency=args.indicator_concurrency,
             split="test",
         )
 
@@ -182,18 +194,33 @@ def main() -> None:
     filters.add_argument("--domain", type=str, choices=["weather", "finance"], default=None,
                          help="Filter by domain")
     filters.add_argument("--task", type=str,
-                         choices=["forecast", "trend", "indicator", "mcqa", "correlation"],
+                         choices=[
+                             "forecast",
+                             "trend",
+                             "trend_past",
+                             "indicator",
+                             "indicator_macd",
+                             "indicator_upper_bb",
+                             "mcqa",
+                             "correlation",
+                         ],
                          default=None, help="Filter by task type")
 
     options = parser.add_argument_group("Options")
     options.add_argument("--max-samples", type=int, default=None,
                          help="Max samples per dataset")
+    options.add_argument("--sample-index-file", type=str, default=None,
+                         help="JSON file mapping dataset names to split-local sample indices")
     options.add_argument("--compare", action="store_true",
                          help="Compare with/without memory (test mode)")
     options.add_argument("--no-skills", action="store_true",
                          help="Disable memory during test")
     options.add_argument("--concurrency", type=int, default=8,
                          help="Max parallel samples")
+    options.add_argument("--per-task-concurrency", type=int, default=None,
+                         help="Max parallel samples per task within each dataset")
+    options.add_argument("--indicator-concurrency", type=int, default=None,
+                         help="Optional override for indicator-task concurrency")
     options.add_argument("--verbose", action="store_true",
                          help="Enable verbose trace logging")
 

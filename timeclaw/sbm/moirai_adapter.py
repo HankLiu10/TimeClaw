@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
+import os
+import threading
+import ctypes
 from typing import Any
 
 import numpy as np
@@ -17,6 +21,39 @@ MOIRAI_DEFAULT_CONFIG = SBMConfig(
     num_samples=20,
 )
 
+_IMPORT_LOCK = threading.Lock()
+_IMPORT_READY = False
+
+
+def _prefer_conda_libstdcpp() -> None:
+    """Preload Conda's libstdc++ for packages that need newer GLIBCXX symbols."""
+    conda_prefix = os.environ.get("CONDA_PREFIX") or ""
+    if not conda_prefix:
+        return
+    libstdcpp = os.path.join(conda_prefix, "lib", "libstdc++.so.6")
+    if not os.path.exists(libstdcpp):
+        return
+    try:
+        ctypes.CDLL(libstdcpp, mode=ctypes.RTLD_GLOBAL)
+    except OSError as e:
+        logger.debug(f"Failed to preload Conda libstdc++: {e}")
+
+
+def _ensure_moirai_imports() -> tuple[type[Any], type[Any]]:
+    """Import Moirai classes once and preserve the real import failure reason."""
+    global _IMPORT_READY
+    with _IMPORT_LOCK:
+        _prefer_conda_libstdcpp()
+        try:
+            forecast_mod = importlib.import_module("uni2ts.model.moirai.forecast")
+            module_mod = importlib.import_module("uni2ts.model.moirai.module")
+        except Exception as e:
+            raise ImportError(
+                f"Failed to import uni2ts Moirai modules: {type(e).__name__}: {e}"
+            ) from e
+        _IMPORT_READY = True
+        return forecast_mod.MoiraiForecast, module_mod.MoiraiModule
+
 
 class MoiraiAdapter(SBMBase):
     """Adapter for Salesforce Moirai universal forecasting model.
@@ -30,13 +67,7 @@ class MoiraiAdapter(SBMBase):
     requires_gpu: bool = True
 
     def load(self) -> None:
-        try:
-            from uni2ts.model.moirai.forecast import MoiraiForecast  # noqa: F401
-            from uni2ts.model.moirai.module import MoiraiModule
-        except ImportError:
-            raise ImportError(
-                "uni2ts is required: pip install uni2ts"
-            )
+        _, MoiraiModule = _ensure_moirai_imports()
 
         import torch
 
@@ -64,7 +95,7 @@ class MoiraiAdapter(SBMBase):
         if not self.is_loaded:
             self.load()
 
-        from uni2ts.model.moirai.forecast import MoiraiForecast
+        MoiraiForecast, _ = _ensure_moirai_imports()
         import torch
 
         pred_len = prediction_length or self.config.prediction_length

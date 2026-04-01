@@ -66,6 +66,8 @@ def discover_and_register() -> int:
             for _importer, modname, _ispkg in pkgutil.iter_modules(pkg.__path__):
                 if modname.startswith("_"):
                     continue
+                if sub_pkg == "prediction" and modname in {"checkpoint", "ensemble"}:
+                    continue
                 try:
                     mod = importlib.import_module(f"timeclaw.clawhub.{sub_pkg}.{modname}")
                     for attr_name in dir(mod):

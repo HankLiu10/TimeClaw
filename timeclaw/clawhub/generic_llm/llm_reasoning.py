@@ -1,14 +1,8 @@
-"""General-purpose multimodal LLM reasoning tool.
+"""Task-specialized multimodal LLM reasoning tools.
 
-Sends raw data (time-series, text, images) directly to a large language
-model for structured reasoning.  Unlike statistical forecast tools that
-produce point-by-point predictions, this tool leverages LLM pattern
-recognition to answer questions, extract indicators, classify trends,
-explain anomalies, and perform any reasoning task that benefits from
-reading actual data values.
-
-Domain knowledge is NOT hardcoded — it is injected externally via
-the ``domain`` parameter (from pipeline input or memory).
+Each wrapper exposes a narrower task boundary while sharing one common
+implementation. This avoids mixing unrelated usage experience under a
+single generic tool name.
 """
 
 from __future__ import annotations
@@ -28,44 +22,8 @@ def _fmt_array(arr: np.ndarray, max_points: int = 0) -> str:
     return ", ".join(f"{v:.2f}" for v in flat)
 
 
-class LLMReasoningTool(ClawTool):
-    """General-purpose multimodal LLM reasoning tool.
-
-    Sends raw time-series values (and optional text/image context)
-    directly to a large language model, asking it to produce a
-    structured JSON answer.  Works for indicator extraction, trend
-    classification, anomaly explanation, question answering, and any
-    task where reading data values and reasoning over them is more
-    effective than running a statistical model.
-    """
-
-    name: str = "llm_reasoning"
+class _BaseLLMReasoningTool(ClawTool):
     category: ToolCategory = ToolCategory.GENERIC_LLM
-    description: str = (
-        "A powerful, comprehensive multimodal large language model that reads and "
-        "reasons over raw time-series values, text context, and images simultaneously "
-        "— the only tool that combines all modalities in a single reasoning step. "
-        "It directly understands the semantics of the task, interprets data patterns "
-        "in context, and produces a structured JSON answer. "
-        "Applicable to ALL task types: forecast (predicting future values by "
-        "understanding temporal dynamics), indicator (extracting statistical "
-        "indicators such as max, min, diff, mean from data context), "
-        "classification (categorizing trends or patterns using holistic judgment), "
-        "qa (answering questions by jointly reasoning over numerical data and text), "
-        "and imputation (inferring missing values from surrounding context). "
-        "Strengths: handles complex, multi-step reasoning in one call; leverages "
-        "textual context (e.g. weather reports, news) that pure statistical models "
-        "ignore; produces answers directly in the required output format without "
-        "post-processing; works on any data length and frequency. "
-        "Especially effective when the task requires understanding both numerical "
-        "patterns and textual/contextual information, or when the expected output "
-        "is not a raw time-series array but a structured result (indicators, labels, "
-        "answers). Input data (time-series, text, images) is automatically provided. "
-        "When called after other tools, their results and the full task description "
-        "are automatically included as additional context. "
-        "Specify 'question' (what to analyze) and 'output_schema' (expected JSON "
-        "format) to use."
-    )
     io_type: ToolIOType = ToolIOType.TX_TO_R
     parameters_schema: dict[str, Any] = {
         "type": "object",
@@ -76,14 +34,11 @@ class LLMReasoningTool(ClawTool):
             },
             "output_schema": {
                 "oneOf": [{"type": "string"}, {"type": "object"}],
-                "description": (
-                    'Expected JSON output keys, as a string or object. '
-                    'Example: \'{"max": number, "min": number, "diff": number}\''
-                ),
+                "description": "Expected JSON output schema.",
             },
             "context": {
                 "type": "string",
-                "description": "Additional domain context to include in the prompt.",
+                "description": "Additional task context to include in the prompt.",
             },
             "domain": {
                 "type": "string",
@@ -100,16 +55,17 @@ class LLMReasoningTool(ClawTool):
             try:
                 from timeclaw.core.config import TimeClawConfig
                 from timeclaw.llm.router import ModelRouter
+
                 cfg = TimeClawConfig.load()
                 router = ModelRouter(cfg.llm)
                 llm = router.get_backend("executor")
             except Exception:
-                raise ValueError("LLM backend is required for llm_reasoning")
+                raise ValueError(f"LLM backend is required for {self.name}")
 
-        question = params.get("question", "Analyze this time-series data.")
+        question = params.get("question", "Analyze this data.")
         output_schema = params.get("output_schema", '{"answer": "..."}')
         if isinstance(output_schema, dict):
-            output_schema = json.dumps(output_schema)
+            output_schema = json.dumps(output_schema, ensure_ascii=False)
         context = params.get("context", "")
         domain = params.get("domain", "")
 
@@ -131,9 +87,10 @@ class LLMReasoningTool(ClawTool):
                 text_section = f"Contextual information:\n{str(text)[:10000]}\n\n"
 
         system_prompt = (
-            "You are a data analysis expert. Analyze the provided data "
-            "and any contextual information to answer the question.\n"
-            f"Return ONLY a JSON object matching this schema: {output_schema}"
+            f"You are a specialist for {self.task_boundary}. "
+            "Analyze the provided data and contextual information carefully.\n"
+            "Return ONLY a JSON object matching this schema: "
+            f"{output_schema}"
         )
         user_prompt = f"{domain_section}{ts_section}{text_section}{context}\n\nQuestion: {question}"
 
@@ -150,9 +107,59 @@ class LLMReasoningTool(ClawTool):
             try:
                 return json.loads(resp.text)
             except (json.JSONDecodeError, TypeError):
-                pass
-            return {"raw_response": resp.text}
+                return {"raw_response": resp.text}
         raise ValueError("LLM returned empty response")
 
 
-tool = LLMReasoningTool()
+class LLMReasoningForecastTool(_BaseLLMReasoningTool):
+    name = "llm_reasoning_forecast"
+    task_boundary = "time-series forecasting"
+    description = (
+        "Multimodal LLM reasoning wrapper specialized for forecast tasks. "
+        "Use when the goal is to predict future numeric values from time-series "
+        "data, optionally using text or image context."
+    )
+
+
+class LLMReasoningIndicatorTool(_BaseLLMReasoningTool):
+    name = "llm_reasoning_indicator"
+    task_boundary = "indicator extraction"
+    description = (
+        "Multimodal LLM reasoning wrapper specialized for indicator tasks. "
+        "Use when the goal is to extract numeric indicators such as max, min, "
+        "diff, MACD, or Bollinger-related values."
+    )
+
+
+class LLMReasoningClassificationTool(_BaseLLMReasoningTool):
+    name = "llm_reasoning_classification"
+    task_boundary = "classification and trend labeling"
+    description = (
+        "Multimodal LLM reasoning wrapper specialized for classification tasks. "
+        "Use when the output is a trend label, class label, or structured label object."
+    )
+
+
+class LLMReasoningQATool(_BaseLLMReasoningTool):
+    name = "llm_reasoning_qa"
+    task_boundary = "question answering"
+    description = (
+        "Multimodal LLM reasoning wrapper specialized for QA tasks. "
+        "Use when the task asks a question over time-series plus optional context."
+    )
+
+
+class LLMReasoningCorrelationTool(_BaseLLMReasoningTool):
+    name = "llm_reasoning_correlation"
+    task_boundary = "correlation classification"
+    description = (
+        "Multimodal LLM reasoning wrapper specialized for correlation tasks. "
+        "Use when the output is a correlation label or correlation judgment."
+    )
+
+
+tool_forecast = LLMReasoningForecastTool()
+tool_indicator = LLMReasoningIndicatorTool()
+tool_classification = LLMReasoningClassificationTool()
+tool_qa = LLMReasoningQATool()
+tool_correlation = LLMReasoningCorrelationTool()

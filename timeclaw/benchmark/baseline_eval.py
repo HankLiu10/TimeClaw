@@ -19,6 +19,10 @@ from loguru import logger
 
 from timeclaw.benchmark.dataset_split import load_split
 from timeclaw.benchmark.mtbench_adapter import DATASET_REGISTRY, MTBenchSample
+from timeclaw.benchmark.mtbench_support import (
+    load_sample_indices,
+    select_samples_by_index,
+)
 from timeclaw.benchmark import mtbench_prompts as prompts
 from timeclaw.core.config import TimeClawConfig
 from timeclaw.llm.router import ModelRouter
@@ -399,12 +403,62 @@ def _weather_trend_3way_label(sample: MTBenchSample) -> str:
     return "stable"
 
 
+def _weather_trend_past_3way_label(sample: MTBenchSample) -> str:
+    """Official MTBench past-trend label for weather.
+
+    Aligns with the official protocol: compute daily means from the
+    input window, fit a linear trend, then threshold the slope at
+    +/-0.25.
+    """
+    if len(sample.input_window) < 24:
+        return "stable"
+    arr = np.asarray(sample.input_window, dtype=np.float64).ravel()
+    usable = (len(arr) // 24) * 24
+    if usable < 24:
+        return "stable"
+    daily_mean = arr[:usable].reshape(usable // 24, 24).mean(axis=1)
+    if len(daily_mean) < 2:
+        return "stable"
+    x = np.arange(len(daily_mean), dtype=np.float64)
+    slope = float(np.polyfit(x, daily_mean, 1)[0])
+    if slope >= 0.25:
+        return "increasing"
+    elif slope <= -0.25:
+        return "decreasing"
+    return "stable"
+
+
+async def _baseline_weather_trend_past(
+    sample: MTBenchSample, llm: Any,
+) -> dict[str, Any]:
+    sys_p, user_p = prompts.weather_trend_past(
+        sample.input_window, sample.timestamps, sample.text,
+    )
+    resp = await llm.complete(
+        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
+        response_format="json",
+    )
+    parsed = _parse_json_from_text(resp.text or "")
+    pred_label = ""
+    if isinstance(parsed, dict):
+        pred_label = str(parsed.get("trend", "")).strip().lower()
+
+    gt_label = _weather_trend_past_3way_label(sample)
+    correct = pred_label == gt_label
+    return {
+        "metrics": {"accuracy": 1.0 if correct else 0.0},
+        "predicted": pred_label,
+        "ground_truth": gt_label,
+    }
+
+
 # ── Task dispatch ─────────────────────────────────────────────────────
 
 BASELINE_HANDLERS: dict[str, dict[str, Any]] = {
     "weather": {
         "forecast": _baseline_weather_forecast,
         "trend": _baseline_weather_trend,
+        "trend_past": _baseline_weather_trend_past,
         "indicator": _baseline_weather_indicator,
         "mcqa": _baseline_weather_mcqa,
     },
@@ -455,6 +509,7 @@ async def run_baseline(
     task_filter: str | None = None,
     config: TimeClawConfig | None = None,
     max_samples: int | None = None,
+    sample_indices: dict[str, list[int]] | str | Path | None = None,
     concurrency: int = 80,
     full_dataset: bool = False,
 ) -> dict[str, Any]:
@@ -463,6 +518,11 @@ async def run_baseline(
     router = ModelRouter(cfg.llm)
     llm = router.get_backend("executor")
     sem = asyncio.Semaphore(concurrency)
+    sample_indices_map = (
+        load_sample_indices(sample_indices)
+        if isinstance(sample_indices, (str, Path))
+        else sample_indices
+    )
 
     from timeclaw.benchmark.mtbench_adapter import load_dataset
 
@@ -482,6 +542,7 @@ async def run_baseline(
             logger.warning(f"[Baseline] No data for {ds_name}")
             continue
 
+        samples = select_samples_by_index(samples, ds_name, sample_indices_map)
         if max_samples:
             samples = samples[:max_samples]
 
@@ -789,6 +850,7 @@ async def main() -> None:
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--task", type=str, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--sample-index-file", type=str, default=None)
     parser.add_argument("--concurrency", type=int, default=80)
     args = parser.parse_args()
 
@@ -796,6 +858,7 @@ async def main() -> None:
         dataset_name=args.dataset,
         task_filter=args.task,
         max_samples=args.max_samples,
+        sample_indices=args.sample_index_file,
         concurrency=args.concurrency,
     )
     print(json.dumps(result, indent=2, default=str))

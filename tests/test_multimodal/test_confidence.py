@@ -12,8 +12,8 @@ def test_empty_log():
 
 def test_perfect_execution():
     log = [
-        {"tool": "basic_stats", "success": True, "result_summary": "mean=25.3, std=2.1"},
-        {"tool": "arima_forecast", "success": True, "result_summary": "forecast=[24, 25, 26]"},
+        {"tool": "basic_stats", "success": True, "observation": {"mean": 25.3, "std": 2.1}},
+        {"tool": "arima_forecast", "success": True, "observation": {"forecast": [24, 25, 26]}},
     ]
     conf = ModalityConfidenceEstimator().estimate(log, [24.0, 25.0, 26.0])
     assert conf > 0.7
@@ -21,8 +21,8 @@ def test_perfect_execution():
 
 def test_failed_execution():
     log = [
-        {"tool": "basic_stats", "success": False, "result_summary": ""},
-        {"tool": "arima_forecast", "success": False, "result_summary": ""},
+        {"tool": "basic_stats", "success": False, "observation": {"error": "failed"}},
+        {"tool": "arima_forecast", "success": False, "observation": {"error": "failed"}},
     ]
     conf = ModalityConfidenceEstimator().estimate(log, None)
     assert conf < 0.3
@@ -46,14 +46,14 @@ def test_estimate_all_confidences():
         "timeseries": {
             "prediction": [24, 25],
             "execution_log": [
-                {"tool": "stats", "success": True, "result_summary": "ok" * 20},
+                {"tool": "stats", "success": True, "observation": {"status": "ok" * 20}},
             ],
         },
         "text": {
             "prediction": "The market will rise",
             "execution_log": [
-                {"tool": "sentiment", "success": True, "result_summary": "positive"},
-                {"tool": "keyword", "success": False, "result_summary": ""},
+                {"tool": "sentiment", "success": True, "observation": {"label": "positive"}},
+                {"tool": "keyword", "success": False, "observation": {"error": "failed"}},
             ],
         },
     }

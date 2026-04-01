@@ -1,20 +1,23 @@
-# TimeClaw Configuration: GPT-5.1 via Codex Portal proxy
-# All agents use gpt-5.1 through ai.changyou.club
+# TimeClaw Configuration: GPT-5.4 via ai.changyou.club
+# Backup APIs (uncomment to switch):
+#   api_key: "sk-proj-89dy5lda8a188si2q9r5e1o4yv6xdrzo"  # 主key，今日额度已用完
+#   api_base: "http://160.202.238.42:48760/v1"
+#   api_key: "27dcc6ce4b4468ab53b62464670dee53050a45e91d9773f21d2c290c8321cebb"
 
 llm:
   api_base: "https://ai.changyou.club/v1"
-  api_key: "sk-proj-89dy5lda8a188si2q9r5e1o4yv6xdrzo"
+  api_key: "sk-proj-3lmogmngl1hir2symiqg77x8y66ce09z"
   models:
-    manager: "openai/gpt-5.1"
-    analyzer: "openai/gpt-5.1"
-    executor: "openai/gpt-5.1"
-    reasoner: "openai/gpt-5.1"
-    text_light: "openai/gpt-5.1"
-    text_heavy: "openai/gpt-5.1"
-  fallback: "openai/gpt-5.1"
-  max_retries: 3
+    manager: "openai/gpt-5.4"
+    analyzer: "openai/gpt-5.4"
+    executor: "openai/gpt-5.4"
+    reasoner: "openai/gpt-5.4"
+    text_light: "openai/gpt-5.4"
+    text_heavy: "openai/gpt-5.4"
+  fallback: "openai/gpt-5.4"
+  max_retries: 10
   timeout: 180.0
-  temperature: 0.1
+  temperature: 1.0
   max_tokens: 4096
 
 reasoning:

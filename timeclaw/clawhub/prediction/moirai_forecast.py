@@ -24,15 +24,20 @@ def _statistical_fallback(ts_data: Any, horizon: int) -> dict[str, Any]:
 
 
 def _run_moirai(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, Any]:
-    from timeclaw.sbm.registry import get_global_registry, auto_register
+    from timeclaw.sbm.registry import get_global_registry
+    from timeclaw.sbm.moirai_adapter import (
+        MoiraiAdapter,
+        MOIRAI_DEFAULT_CONFIG,
+        _ensure_moirai_imports,
+    )
 
     registry = get_global_registry()
     if "moirai" not in registry.list_available():
         try:
-            from timeclaw.sbm.moirai_adapter import MoiraiAdapter, MOIRAI_DEFAULT_CONFIG
+            _ensure_moirai_imports()
             registry.register("moirai", MoiraiAdapter, MOIRAI_DEFAULT_CONFIG)
-        except ImportError:
-            logger.warning("[moirai_forecast] uni2ts not installed")
+        except ImportError as e:
+            logger.warning(f"[moirai_forecast] import unavailable: {e}")
             return _statistical_fallback(ts_data, horizon)
 
     try:
@@ -52,10 +57,18 @@ def _run_moirai(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, 
                     adapter.load()
                     logger.info("[moirai_forecast] model loaded")
                 except Exception as e:
-                    logger.error(f"[moirai_forecast] load failed: {e}")
-                    result = _statistical_fallback(ts_data, horizon)
-                    result["model_error"] = f"load failed: {e}"
-                    return result
+                    logger.warning(f"[moirai_forecast] first load failed: {e}")
+                    # Some runs showed transient false-negative import errors
+                    # under concurrent startup. Re-check imports and retry once.
+                    try:
+                        _ensure_moirai_imports()
+                        adapter.load()
+                        logger.info("[moirai_forecast] model loaded on retry")
+                    except Exception as retry_e:
+                        logger.error(f"[moirai_forecast] load failed: {retry_e}")
+                        result = _statistical_fallback(ts_data, horizon)
+                        result["model_error"] = f"load failed: {retry_e}"
+                        return result
 
     try:
         output = adapter.forecast(context, prediction_length=horizon, num_samples=num_samples)

@@ -104,9 +104,14 @@ class EvaluateAgainstGTTool(ClawTool):
                 if key in gt and isinstance(gt[key], (list, np.ndarray)):
                     gt = gt[key]
                     break
-        y_pred = np.asarray(pred, dtype=np.float64).ravel()
-        y_true = np.asarray(gt, dtype=np.float64).ravel()
+        try:
+            y_pred = np.asarray(pred, dtype=np.float64).ravel()
+            y_true = np.asarray(gt, dtype=np.float64).ravel()
+        except (ValueError, TypeError):
+            return {"type_error": 1.0}
         n = min(len(y_true), len(y_pred))
+        if n == 0:
+            return {"type_error": 1.0}
         y_true, y_pred = y_true[:n], y_pred[:n]
         return {
             "mae": round(mae(y_true, y_pred), 6),
@@ -147,6 +152,8 @@ class EvaluateAgainstGTTool(ClawTool):
 
     @staticmethod
     def _label_metrics(pred: Any, gt: Any) -> dict[str, Any]:
+        pred = EvaluateAgainstGTTool._normalise_label_prediction(pred)
+        gt = EvaluateAgainstGTTool._normalise_label_prediction(gt)
         pred_str = str(pred).strip().lower()
         gt_str = str(gt).strip().lower()
         correct = pred_str == gt_str
@@ -160,6 +167,20 @@ class EvaluateAgainstGTTool(ClawTool):
             "predicted_label": str(pred),
             "ground_truth_label": str(gt),
         }
+
+    @staticmethod
+    def _normalise_label_prediction(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return value
+            value = parsed
+        if isinstance(value, dict):
+            for key in ("trend", "answer", "correlation", "label", "prediction"):
+                if key in value:
+                    return value[key]
+        return value
 
     @staticmethod
     def _serialise(obj: Any) -> Any:

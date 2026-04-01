@@ -254,7 +254,7 @@ class ModalityFusion:
                 "role": "user",
                 "content": (
                     f"Task type: {task_type}\n"
-                    f"Description: {task_description[:5000]}\n\n"
+                    f"Description: {task_description}\n\n"
                     f"Modality predictions:\n" + "\n".join(summaries)
                 ),
             },

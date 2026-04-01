@@ -9,6 +9,8 @@ parameter passing (e.g., detect_seasonality → stl_decompose(period=N)).
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from typing import Any
 
 import numpy as np
@@ -48,30 +50,7 @@ class ExecutorAgent(AgentBase):
     async def perceive(self, envelope: TaskEnvelope) -> dict[str, Any]:
         fingerprint = envelope.environment.fingerprint or {}
         modality = envelope.task.metadata.get("modality") or "timeseries"
-
-        text_summary = ""
-        if envelope.environment.text_data:
-            texts = envelope.environment.text_data
-            parts = [f"{len(texts)} text documents:\n"]
-            for t in texts[:10]:
-                src = t.get("source", "?")
-                ts = t.get("timestamp", "?")
-                content = str(t.get("content", t.get("text", "")))[:5000]
-                parts.append(f"### [{src} @ {ts}]\n{content}\n")
-            text_summary = "\n".join(parts)
-
-        image_summary = ""
-        if envelope.environment.images:
-            imgs = envelope.environment.images
-            img_parts = [f"{len(imgs)} images:"]
-            for img in imgs[:10]:
-                if isinstance(img, dict):
-                    path = img.get("path", img.get("url", "unknown"))
-                    desc = img.get("description", "")
-                    img_parts.append(f"- {path}" + (f": {desc}" if desc else ""))
-                else:
-                    img_parts.append(f"- {str(img)[:200]}")
-            image_summary = "\n".join(img_parts)
+        profiling_results = envelope.task.metadata.get("profiling_results", {})
 
         return {
             "task_type": envelope.task.task_type,
@@ -84,17 +63,15 @@ class ExecutorAgent(AgentBase):
             "modalities": envelope.environment.modalities or ["timeseries"],
             "has_text": envelope.environment.has_text,
             "has_images": envelope.environment.has_images,
-            "text_summary": text_summary,
-            "image_summary": image_summary,
-            "suggested_strategy": envelope.task.metadata.get("suggested_strategy"),
+            "profiling_results": profiling_results,
             "soul_prompt": envelope.task.metadata.get("soul_prompt", ""),
             "skill_prompt": envelope.task.metadata.get("skill_prompt", ""),
             "memory_l2": envelope.task.metadata.get("memory_l2", ""),
-            "memory_l1": envelope.task.metadata.get("memory_l1", ""),
             "tool_notes": envelope.task.metadata.get("tool_notes", {}),
             "domain": envelope.task.metadata.get("domain", ""),
             "reanalysis_context": envelope.task.metadata.get("reanalysis_context"),
             "_mode": envelope.task.metadata.get("_mode", "test"),
+            "_defer_learning_record": envelope.task.metadata.get("_defer_learning_record", False),
             "_ground_truth": envelope.task.metadata.get("_ground_truth"),
         }
 
@@ -102,36 +79,40 @@ class ExecutorAgent(AgentBase):
         """In mini-ReAct, plan just prepares context — actual execution is in act()."""
         modality = perception["modality"]
         task_type = perception["task_type"]
+        modalities_detected = perception.get("modalities", []) or ["timeseries"]
 
-        # Expose ALL registered tools — no modality/task_type filtering.
-        # The agent reads tool descriptions and selects autonomously.
+        # Expose only tools whose required modalities are available.
         if self._mcp_manager:
-            candidates = list(self._mcp_manager.tool_names())
+            from timeclaw.clawhub.tool_registry import get_tool_instance
+
+            candidates = []
+            available = set(modalities_detected)
+            for name in self._mcp_manager.tool_names():
+                try:
+                    tool = get_tool_instance(name)
+                except KeyError:
+                    candidates.append(name)
+                    continue
+                if tool.required_modalities().issubset(available):
+                    candidates.append(name)
         else:
-            candidates = executor_prompt.get_all_tool_names()
+            candidates = executor_prompt.get_all_tool_names(modalities_detected)
 
         run_mode = perception.get("_mode", "test")
+        eval_tools = {"evaluate_against_gt", "evaluate_batch_against_gt", "batch_evaluate_against_gt"}
         if run_mode == "train":
-            if "evaluate_against_gt" not in candidates:
-                candidates.append("evaluate_against_gt")
+            for eval_tool in eval_tools:
+                if eval_tool not in candidates:
+                    candidates.append(eval_tool)
         else:
-            candidates = [c for c in candidates if c != "evaluate_against_gt"]
+            candidates = [c for c in candidates if c not in eval_tools]
 
-        tool_notes = perception.get("tool_notes", {})
-        mcp_tool_map = None
-        if self._mcp_manager:
-            mcp_tool_map = {t.name: t for t in self._mcp_manager.list_tools()}
-        tool_guide = executor_prompt.build_tool_guide_text(
-            candidates, experience_insights=tool_notes, mcp_tools=mcp_tool_map,
+        tool_names_text = executor_prompt.build_tool_name_text(candidates)
+        tool_notes_section = self._build_tool_notes_section(
+            perception.get("tool_notes", {}),
+            candidates,
+            task_type,
         )
-
-        strategy = perception.get("suggested_strategy") or ""
-        strategy_section = ""
-        if strategy:
-            strategy_section = (
-                f"## Recommended Strategy\n"
-                f"Recommendation: **{strategy}**\n\n"
-            )
 
         # SOUL (fixed) + MEMORY (per-scope + cross_domain) → system prompt
         system_memory = ""
@@ -141,15 +122,12 @@ class ExecutorAgent(AgentBase):
         if mem_parts:
             system_memory = "\n".join(mem_parts)
 
-        # Daily notes → first-turn user message
-        daily_section = perception.get("memory_l1", "")
-
         # SKILL → first-turn user message (scene-specific SOP)
         skills_section = perception.get("skill_prompt", "")
 
         logger.debug(
             f"[Executor.plan] Memory injection: SOUL={len(soul)}, "
-            f"MEMORY={len(mem)}, Daily={len(daily_section)}, "
+            f"MEMORY={len(mem)}, "
             f"SKILL={len(skills_section)}, "
             f"ToolNotes={len(perception.get('tool_notes', {}))} tools"
         )
@@ -160,15 +138,15 @@ class ExecutorAgent(AgentBase):
             available_data.append("text")
         if perception.get("has_images") or modality == "image":
             available_data.append("image")
-        modalities_detected = perception.get("modalities", [])
         if modalities_detected and len(modalities_detected) > 1:
-            modality_hint = f"\nDetected modalities: {', '.join(modalities_detected)}. You can use tools for any modality."
+            modality_hint = (
+                f"\nDetected modalities: {', '.join(modalities_detected)}. "
+                "Only tools compatible with these modalities are available."
+            )
 
-        data_context = ""
-        if perception.get("text_summary"):
-            data_context += f"\n## Text Data\n{perception['text_summary']}\n"
-        if perception.get("image_summary"):
-            data_context += f"\n## Image Data\n{perception['image_summary']}\n"
+        profiling_section = self._build_profiling_section(
+            perception.get("profiling_results", {}),
+        )
 
         reanalysis_section = ""
         reanalysis_ctx = perception.get("reanalysis_context")
@@ -187,8 +165,11 @@ class ExecutorAgent(AgentBase):
             for plog in prev_logs:
                 tool = plog.get("tool", "?")
                 ok = plog.get("success", False)
-                summ = plog.get("result_summary", "")[:10000]
-                parts.append(f"- {tool}: {'OK' if ok else 'FAIL'} → {summ}")
+                obs = plog.get("observation")
+                if obs is None:
+                    obs = plog.get("output")
+                obs_text = self._format_observation_for_prompt(obs)[:10000] if obs is not None else ""
+                parts.append(f"- {tool}: {'OK' if ok else 'FAIL'} → {obs_text}")
             parts.append(
                 "\nPlease try a DIFFERENT approach from the previous round.\n"
             )
@@ -199,18 +180,19 @@ class ExecutorAgent(AgentBase):
             "task_type": task_type,
             "task_description": perception.get("task_description", ""),
             "candidates": candidates,
-            "tool_guide": tool_guide,
-            "strategy_section": strategy_section,
+            "tool_names": tool_names_text,
+            "tool_notes": perception.get("tool_notes", {}),
+            "tool_notes_section": tool_notes_section,
             "skills_section": skills_section,
             "system_memory": system_memory,
-            "l1_section": daily_section,
             "modality_hint": modality_hint,
-            "data_context": data_context,
+            "profiling_section": profiling_section,
             "fingerprint": perception["fingerprint"],
             "horizon": perception.get("horizon"),
             "domain": perception.get("domain", ""),
             "reanalysis_section": reanalysis_section,
             "_mode": run_mode,
+            "_defer_learning_record": bool(perception.get("_defer_learning_record", False)),
             "_ground_truth": perception.get("_ground_truth"),
         }
 
@@ -240,23 +222,32 @@ class ExecutorAgent(AgentBase):
 
         is_train = plan.get("_mode") == "train"
         if is_train:
-            system_prompt += executor_prompt.TRAIN_MODE_HINT
+            if plan.get("_defer_learning_record"):
+                system_prompt += executor_prompt.DEFERRED_TRAIN_MODE_HINT
+            else:
+                system_prompt += executor_prompt.TRAIN_MODE_HINT
 
         first_user = executor_prompt.REACT_FIRST_TURN.format(
             task_type=plan["task_type"],
             task_description=plan.get("task_description", ""),
             fingerprint=str(plan["fingerprint"])[:5000],
+            profiling_section=plan.get("profiling_section", ""),
             reanalysis_section=plan.get("reanalysis_section", ""),
-            strategy_section=plan["strategy_section"],
+            tool_notes_section=plan.get("tool_notes_section", ""),
             skills_section=plan.get("skills_section", ""),
-            l1_section=plan.get("l1_section", ""),
-            tool_guide=plan["tool_guide"],
-        ) + plan.get("data_context", "")
+            tool_names=plan["tool_names"],
+        )
 
         conversation: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": first_user},
         ]
+        tool_notes_section = plan.get("tool_notes_section", "")
+        if tool_notes_section:
+            conversation.append({
+                "role": "user",
+                "content": tool_notes_section,
+            })
         _gt_obs_idx: int | None = None
 
         for step in range(1, MAX_REACT_STEPS + 1):
@@ -268,7 +259,9 @@ class ExecutorAgent(AgentBase):
                 conversation.append({"role": "user", "content": follow_up})
 
             response = await self.llm.complete(conversation, response_format="json")
-            decision = response.parsed if isinstance(response.parsed, dict) else {"done": True, "thought": "LLM parse failed"}
+            decision = self._coerce_llm_decision(
+                response.parsed, response.text, fallback_thought="LLM parse failed",
+            )
 
             # Record assistant reply in conversation for multi-turn context
             conversation.append({"role": "assistant", "content": response.text or ""})
@@ -283,22 +276,96 @@ class ExecutorAgent(AgentBase):
             thought = decision.get("thought", "")
             is_done = decision.get("done", False)
 
+            if not self._has_structured_thought(thought) and step < MAX_REACT_STEPS:
+                trace.agent_step("executor", f"react_step_{step}", {
+                    "self_correction": True,
+                    "reason": "unstructured_or_unparsed_response",
+                    "parsed_type": type(response.parsed).__name__,
+                    "parsed_is_dict": isinstance(response.parsed, dict),
+                    "thought": thought,
+                    "response_preview": (response.text or "")[:4000],
+                })
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        "Self-correction: your `thought` must explicitly include "
+                        "`Reason:` and `Action:`. Please continue "
+                        "with the required structure."
+                    ),
+                })
+                continue
+
             if is_done:
                 agent_answer = decision.get("answer")
                 agent_answer_type = decision.get("answer_type", "")
                 agent_confidence = decision.get("confidence")
                 agent_reasoning = decision.get("reasoning", thought)
+                is_train = plan.get("_mode") == "train"
+                deferred_learning_record = bool(plan.get("_defer_learning_record", False))
+                requested_type = plan["task_type"]
+
+                if (
+                    is_train
+                    and not self._has_training_evaluation(execution_log)
+                    and step < MAX_REACT_STEPS
+                ):
+                    logger.info(
+                        "[Executor] Self-correction: training summary without GT evaluation, retrying"
+                    )
+                    correction_msg = (
+                        "Self-correction: in training mode you must evaluate at least one "
+                        "valid candidate with `evaluate_batch_against_gt`, "
+                        "`batch_evaluate_against_gt`, or `evaluate_against_gt` before "
+                        "returning answer_type='learning_summary'. Continue working."
+                    )
+                    conversation.append({"role": "user", "content": correction_msg})
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "thought": thought,
+                        "done": True,
+                        "self_correction": True,
+                        "missing_training_evaluation": True,
+                    })
+                    continue
+
+                if (
+                    is_train
+                    and self._count_training_candidates(
+                        execution_log,
+                        task_type=requested_type,
+                        horizon=plan.get("horizon"),
+                    ) < 2
+                    and step < MAX_REACT_STEPS
+                ):
+                    logger.info(
+                        "[Executor] Self-correction: insufficient candidate exploration, retrying"
+                    )
+                    correction_msg = (
+                        "Self-correction: in training mode you must explore at least 2 valid "
+                        "candidate paths before finishing. Continue exploring and compare more "
+                        "task-valid candidates."
+                    )
+                    conversation.append({"role": "user", "content": correction_msg})
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "thought": thought,
+                        "done": True,
+                        "self_correction": True,
+                        "insufficient_candidates": True,
+                    })
+                    continue
 
                 # Self-correction: if the declared answer_type doesn't match
                 # the requested task_type and we have steps remaining, ask the
                 # agent to fix it instead of accepting a wrong-typed answer.
                 # In training mode, "learning_summary" is always accepted.
-                requested_type = plan["task_type"]
                 type_mismatch = (
                     requested_type
                     and agent_answer_type
                     and agent_answer_type != requested_type
-                    and agent_answer_type != "learning_summary"
+                    and not (
+                        is_train
+                        and not deferred_learning_record
+                        and agent_answer_type == "learning_summary"
+                    )
                     and step < MAX_REACT_STEPS
                 )
                 if type_mismatch:
@@ -317,6 +384,56 @@ class ExecutorAgent(AgentBase):
                         "thought": thought, "done": True,
                         "self_correction": True,
                         "mismatch": f"{agent_answer_type} != {requested_type}",
+                    })
+                    continue
+
+                learning_summary_allowed = (
+                    is_train
+                    and not deferred_learning_record
+                    and agent_answer_type == "learning_summary"
+                )
+                invalid_answer = (
+                    agent_answer is not None
+                    and not learning_summary_allowed
+                    and not self._is_valid_final_answer(
+                        requested_type, agent_answer, horizon=plan.get("horizon"),
+                    )
+                    and step < MAX_REACT_STEPS
+                )
+                if invalid_answer:
+                    _, invalid_reason = self._validate_final_answer(
+                        requested_type, agent_answer, horizon=plan.get("horizon"),
+                    )
+                    try:
+                        answer_preview = json.dumps(agent_answer, ensure_ascii=False, default=str)
+                    except TypeError:
+                        answer_preview = str(agent_answer)
+                    logger.info(
+                        f"[Executor] Self-correction: invalid answer payload for '{requested_type}', retrying"
+                    )
+                    logger.warning(
+                        "[Executor] Invalid final answer detail: "
+                        f"answer_type={agent_answer_type!r}, "
+                        f"python_type={type(agent_answer).__name__}, "
+                        f"reason={invalid_reason}, "
+                        f"answer_preview={answer_preview[:800]}"
+                    )
+                    correction_msg = (
+                        f"Self-correction: the current answer is not a valid '{requested_type}' payload. "
+                        f"For forecast, return a numeric array. For indicator, return a numeric JSON object. "
+                        f"For classification/correlation, return a label or JSON containing the label. "
+                        f"Please continue and produce a valid final answer."
+                    )
+                    conversation.append({"role": "user", "content": correction_msg})
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "thought": thought, "done": True,
+                        "self_correction": True,
+                        "invalid_payload": True,
+                        "requested_type": requested_type,
+                        "invalid_reason": invalid_reason,
+                        "answer_type": agent_answer_type,
+                        "answer_python_type": type(agent_answer).__name__,
+                        "answer_preview": answer_preview[:2000],
                     })
                     continue
 
@@ -344,8 +461,9 @@ class ExecutorAgent(AgentBase):
                     "tool": "spawn_subagent",
                     "args": {"n_tasks": sub_results["n_tasks"]},
                     "success": sub_results["n_success"] > 0,
-                    "result_summary": observation_msg[:5000],
                     "output": sub_results["results"],
+                    "observation": sub_results["results"],
+                    "thought": thought,
                 })
                 trace.agent_step("executor", f"react_step_{step}", {
                     "thought": thought, "tool": "spawn_subagent",
@@ -371,17 +489,62 @@ class ExecutorAgent(AgentBase):
             if plan.get("domain"):
                 tool_args.setdefault("domain", plan["domain"])
 
-            if tool_name == "llm_reasoning":
-                desc = plan.get("task_description", "")
-                if desc:
-                    existing_ctx = tool_args.get("context", "")
-                    tool_args["context"] = (
-                        f"Task description: {desc}\n{existing_ctx}"
-                        if existing_ctx
-                        else f"Task description: {desc}"
-                    )
+            if tool_name.startswith("llm_reasoning_"):
+                tool_args["context"] = self._build_llm_reasoning_context(
+                    plan=plan,
+                    execution_log=execution_log,
+                    existing_context=tool_args.get("context", ""),
+                )
 
-            if tool_name == "evaluate_against_gt" and is_train:
+            if tool_name in {"evaluate_against_gt", "evaluate_batch_against_gt", "batch_evaluate_against_gt"} and is_train:
+                tool_args.setdefault("task_type", plan["task_type"])
+                if tool_name == "evaluate_against_gt":
+                    prediction = tool_args.get("prediction")
+                    if not self._is_valid_final_answer(
+                        plan["task_type"], prediction, horizon=plan.get("horizon"),
+                    ):
+                        conversation.append({
+                            "role": "user",
+                            "content": (
+                                "Self-correction: `evaluate_against_gt` requires a valid "
+                                "task-typed `prediction`. Produce a concrete candidate "
+                                "prediction first, then evaluate it."
+                            ),
+                        })
+                        trace.agent_step("executor", f"react_step_{step}", {
+                            "thought": thought,
+                            "tool": tool_name,
+                            "self_correction": True,
+                            "missing_evaluation_prediction": True,
+                        })
+                        continue
+                if tool_name in {"evaluate_batch_against_gt", "batch_evaluate_against_gt"}:
+                    predictions = tool_args.get("predictions")
+                    if not isinstance(predictions, list) or not predictions:
+                        autofill = self._collect_batch_eval_predictions(
+                            execution_log,
+                            task_type=plan["task_type"],
+                            horizon=plan.get("horizon"),
+                        )
+                        if autofill:
+                            tool_args["predictions"] = autofill
+                    predictions = tool_args.get("predictions")
+                    if not isinstance(predictions, list) or len(predictions) == 0:
+                        conversation.append({
+                            "role": "user",
+                            "content": (
+                                "Self-correction: `evaluate_batch_against_gt` requires a non-empty "
+                                "list of valid candidate predictions. Explore valid candidates "
+                                "first, then evaluate them together."
+                            ),
+                        })
+                        trace.agent_step("executor", f"react_step_{step}", {
+                            "thought": thought,
+                            "tool": tool_name,
+                            "self_correction": True,
+                            "missing_batch_predictions": True,
+                        })
+                        continue
                 tool_args["_ground_truth"] = plan.get("_ground_truth")
 
             result = await self._execute_tool(
@@ -390,10 +553,8 @@ class ExecutorAgent(AgentBase):
 
             success = result is not None and result.success
             status_icon = "✓" if success else "✗"
-            result_summary = ""
 
             if success:
-                result_summary = self._summarize_result(result.data)
                 final_result = result.data
 
                 if tool_name == "normalize" and result.metadata.get("inverse"):
@@ -402,23 +563,25 @@ class ExecutorAgent(AgentBase):
                     current_data = result.data
             else:
                 error_msg = result.error if result else "tool not found"
-                result_summary = f"ERROR: {error_msg}"
 
             # Feed tool execution result back into conversation
+            observation_payload = (
+                result.data if success else {"error": error_msg}
+            )
             observation_msg = (
                 f"[Step {step}] {status_icon} {tool_name}({self._fmt_args(tool_args)})\n"
-                f"→ {result_summary}"
+                f"→ {self._format_observation_for_prompt(observation_payload)}"
             )
             conversation.append({"role": "user", "content": observation_msg})
 
-            if tool_name == "evaluate_against_gt":
+            if tool_name in {"evaluate_against_gt", "evaluate_batch_against_gt", "batch_evaluate_against_gt"}:
                 _gt_obs_idx = len(conversation) - 1
 
             log_entry = {
                 "tool": tool_name, "args": tool_args, "success": success,
-                "result_summary": result_summary[:50000],
                 "output": result.data if success else None,
-                "observation": result.data if success else None,
+                "observation": observation_payload,
+                "thought": thought,
             }
             execution_log.append(log_entry)
 
@@ -427,13 +590,13 @@ class ExecutorAgent(AgentBase):
                 thought=thought,
                 tool_name=tool_name,
                 tool_args=tool_args,
-                observation=result.data if success else None,
-                critic_feedback="ok" if success else f"error: {result_summary}",
+                observation=observation_payload,
+                critic_feedback="ok" if success else f"error: {error_msg}",
             ))
 
             trace.agent_step("executor", f"react_step_{step}", {
                 "thought": thought, "tool": tool_name, "args": tool_args,
-                "success": success, "result_preview": result_summary[:5000],
+                "success": success, "observation_preview": self._format_observation_for_prompt(observation_payload)[:5000],
             })
 
         if norm_inverse and final_result is not None:
@@ -460,6 +623,91 @@ class ExecutorAgent(AgentBase):
             "confidence": act_result.get("confidence"),
         })
         return act_result
+
+    @staticmethod
+    def _has_training_evaluation(execution_log: list[dict[str, Any]]) -> bool:
+        """Return True iff training already produced at least one GT evaluation."""
+        for entry in execution_log:
+            if entry.get("tool") not in {
+                "evaluate_against_gt",
+                "evaluate_batch_against_gt",
+                "batch_evaluate_against_gt",
+            }:
+                continue
+            if not entry.get("success"):
+                continue
+            obs = entry.get("observation")
+            if isinstance(obs, dict) and isinstance(obs.get("metrics"), dict) and obs.get("metrics"):
+                return True
+            if isinstance(obs, dict) and isinstance(obs.get("results"), list):
+                for item in obs.get("results", []):
+                    if isinstance(item, dict) and isinstance(item.get("metrics"), dict) and item.get("metrics"):
+                        return True
+        return False
+
+    @classmethod
+    def _count_training_candidates(
+        cls,
+        execution_log: list[dict[str, Any]],
+        task_type: str,
+        horizon: int | None = None,
+    ) -> int:
+        names: set[str] = set()
+        for entry in execution_log:
+            if entry.get("tool") != "spawn_subagent":
+                continue
+            output = entry.get("output") or []
+            for idx, item in enumerate(output):
+                if not isinstance(item, dict) or not item.get("success"):
+                    continue
+                result = item.get("result") or {}
+                if not isinstance(result, dict):
+                    continue
+                answer = result.get("answer", result.get("prediction"))
+                if not cls._is_valid_final_answer(task_type, answer, horizon=horizon):
+                    continue
+                sub_execution_log = result.get("execution_log") or []
+                tool_chain = [
+                    str(log_entry.get("tool") or "").strip()
+                    for log_entry in sub_execution_log
+                    if isinstance(log_entry, dict) and str(log_entry.get("tool") or "").strip()
+                ]
+                name = (
+                    (tool_chain[0] if tool_chain else "")
+                    or result.get("candidate_name")
+                    or result.get("tools_hint")
+                    or result.get("sub_task_description")
+                    or f"candidate_{idx}"
+                )
+                names.add(str(name))
+        return len(names)
+
+    @staticmethod
+    def _hinted_tools(tools_hint: str) -> list[str]:
+        if not isinstance(tools_hint, str) or not tools_hint.strip():
+            return []
+        hinted: list[str] = []
+        for token in re.split(r"[\s,;:/()\[\]\n]+", tools_hint):
+            token = token.strip()
+            if not token or "_" not in token:
+                continue
+            hinted.append(token)
+        return hinted
+
+    @staticmethod
+    def _subagent_followed_tools_hint(
+        execution_log: list[dict[str, Any]],
+        tools_hint: str,
+    ) -> bool:
+        hinted = ExecutorAgent._hinted_tools(tools_hint)
+        if not hinted:
+            return True
+        executed = {
+            str(entry.get("tool") or "").strip()
+            for entry in execution_log
+            if isinstance(entry, dict) and str(entry.get("tool") or "").strip()
+        }
+        return any(tool in executed for tool in hinted)
 
     @staticmethod
     def _is_passthrough_transform(tool_name: str, result_data: Any) -> bool:
@@ -506,6 +754,10 @@ class ExecutorAgent(AgentBase):
         tasks_spec = tasks_spec[:MAX_CONCURRENT_SUBAGENTS]
         n_tasks = len(tasks_spec)
         logger.info(f"[Executor] Spawning {n_tasks} sub-agents")
+        trace.agent_step("executor", "spawn_subagents", {
+            "n_tasks": n_tasks,
+            "tasks": tasks_spec,
+        })
 
         coros = []
         for i, task in enumerate(tasks_spec):
@@ -549,10 +801,16 @@ class ExecutorAgent(AgentBase):
         envelope: TaskEnvelope,
     ) -> dict[str, Any]:
         """Run a single sub-agent ReAct loop with full memory injection."""
+        trace.agent_step("executor", "subagent_start", {
+            "sub_agent_idx": idx,
+            "sub_task_description": task_description,
+            "tools_hint": tools_hint,
+        })
         data = envelope.environment.data
         text_data = envelope.environment.text_data or None
         images = envelope.environment.images or None
-        candidates = [c for c in plan["candidates"] if c != "evaluate_against_gt"]
+        blocked_eval_tools = {"evaluate_against_gt", "evaluate_batch_against_gt", "batch_evaluate_against_gt"}
+        candidates = [c for c in plan["candidates"] if c not in blocked_eval_tools]
 
         system_memory = plan.get("system_memory", "")
         system_prompt = executor_prompt.SUBAGENT_SYSTEM_PROMPT.format(
@@ -563,18 +821,26 @@ class ExecutorAgent(AgentBase):
         system_prompt += plan.get("modality_hint", "")
 
         memory_section = ""
-        l1 = plan.get("l1_section", "")
         skills = plan.get("skills_section", "")
-        mem_parts = [p for p in [l1, skills] if p]
-        if mem_parts:
-            memory_section = "\n".join(mem_parts) + "\n"
+        if skills:
+            memory_section = skills.strip() + "\n"
+
+        hinted_tool_notes = self._build_tool_notes_section(
+            plan.get("tool_notes", {}),
+            [tool for tool in self._hinted_tools(tools_hint) if tool in candidates],
+            plan["task_type"],
+        )
 
         first_user = executor_prompt.SUBAGENT_FIRST_TURN.format(
+            parent_task_type=plan["task_type"],
+            parent_task_description=plan.get("task_description", ""),
             task_description=task_description,
             fingerprint=str(plan["fingerprint"])[:3000],
+            profiling_section=plan.get("profiling_section", ""),
+            tool_notes_section=hinted_tool_notes,
             memory_section=memory_section,
-            tool_guide=plan["tool_guide"],
-        ) + plan.get("data_context", "")
+            tool_names=executor_prompt.build_tool_name_text(candidates),
+        )
 
         conversation: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
@@ -584,6 +850,7 @@ class ExecutorAgent(AgentBase):
         horizon = plan.get("horizon")
         current_data = data
         final_result: dict[str, Any] = {}
+        execution_log: list[dict[str, Any]] = []
 
         for step in range(1, MAX_SUB_REACT_STEPS + 1):
             if step > 1:
@@ -593,15 +860,89 @@ class ExecutorAgent(AgentBase):
                 conversation.append({"role": "user", "content": follow_up})
 
             response = await self.llm.complete(conversation, response_format="json")
-            decision = response.parsed or {"done": True, "thought": "parse failed"}
+            decision = self._coerce_llm_decision(
+                response.parsed, response.text, fallback_thought="parse failed",
+            )
             conversation.append({"role": "assistant", "content": response.text or ""})
+            thought = decision.get("thought", "")
+            trace.agent_step("executor", "subagent_react_step", {
+                "sub_agent_idx": idx,
+                "step": step,
+                "decision": decision,
+            })
+
+            if not self._has_structured_thought(thought) and step < MAX_SUB_REACT_STEPS:
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        "Your `thought` must explicitly include `Reason:` and "
+                        "`Action:`. Please continue with that structure."
+                    ),
+                })
+                continue
 
             if decision.get("done", False):
+                answer = decision.get("answer")
+                answer_type = decision.get("answer_type", "")
+                requested_type = plan["task_type"]
+                if (
+                    not self._subagent_followed_tools_hint(execution_log, tools_hint)
+                    and step < MAX_SUB_REACT_STEPS
+                ):
+                    trace.agent_step("executor", "subagent_self_correction", {
+                        "sub_agent_idx": idx,
+                        "step": step,
+                        "reason": "tools_hint_not_followed",
+                        "tools_hint": tools_hint,
+                    })
+                    hinted_text = ", ".join(self._hinted_tools(tools_hint)) or tools_hint
+                    conversation.append({
+                        "role": "user",
+                        "content": (
+                            "Self-correction: this sub-task was assigned a specific tool path. "
+                            f"You must actually call one of these tools before finishing: {hinted_text}."
+                        ),
+                    })
+                    continue
+                if (
+                    answer is not None
+                    and not self._is_valid_final_answer(
+                        requested_type, answer, horizon=plan.get("horizon"),
+                    )
+                    and step < MAX_SUB_REACT_STEPS
+                ):
+                    _, invalid_reason = self._validate_final_answer(
+                        requested_type, answer, horizon=plan.get("horizon"),
+                    )
+                    try:
+                        answer_preview = json.dumps(answer, ensure_ascii=False, default=str)
+                    except TypeError:
+                        answer_preview = str(answer)
+                    trace.agent_step("executor", "subagent_self_correction", {
+                        "sub_agent_idx": idx,
+                        "step": step,
+                        "reason": "invalid_final_answer",
+                        "requested_type": requested_type,
+                        "invalid_reason": invalid_reason,
+                        "answer_preview": answer_preview[:2000],
+                    })
+                    conversation.append({
+                        "role": "user",
+                        "content": (
+                            f"Your current final answer is not a valid '{requested_type}' payload. "
+                            f"Return a proper task-typed result instead of an explanation."
+                        ),
+                    })
+                    continue
                 final_result = {
-                    "answer": decision.get("answer"),
-                    "answer_type": decision.get("answer_type", ""),
+                    "answer": answer,
+                    "answer_type": answer_type,
                     "confidence": decision.get("confidence"),
                     "reasoning": decision.get("reasoning", decision.get("thought", "")),
+                    "execution_log": execution_log,
+                    "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
+                    "sub_task_description": task_description,
+                    "tools_hint": tools_hint,
                 }
                 break
 
@@ -622,13 +963,38 @@ class ExecutorAgent(AgentBase):
             if horizon and tool_name.endswith("_forecast"):
                 tool_args["horizon"] = horizon
 
+            if tool_name.startswith("llm_reasoning_"):
+                tool_args["context"] = self._build_llm_reasoning_context(
+                    plan=plan,
+                    execution_log=execution_log,
+                    existing_context=tool_args.get("context", ""),
+                )
+
             result = await self._execute_tool(tool_name, tool_args, current_data, text_data, images)
             success = result is not None and result.success
-            result_summary = self._summarize_result(result.data) if success else (result.error if result else "not found")
+            observation_payload = (
+                result.data if success else {"error": result.error if result else "not found"}
+            )
+            execution_log.append({
+                "tool": tool_name,
+                "args": tool_args,
+                "success": success,
+                "output": result.data if success else None,
+                "observation": observation_payload,
+                "thought": thought,
+            })
+            trace.agent_step("executor", "subagent_tool_result", {
+                "sub_agent_idx": idx,
+                "step": step,
+                "tool": tool_name,
+                "args": tool_args,
+                "success": success,
+                "observation": observation_payload,
+            })
 
             observation = (
                 f"[Sub-{idx} Step {step}] {'OK' if success else 'FAIL'} {tool_name}\n"
-                f"→ {result_summary}"
+                f"→ {self._format_observation_for_prompt(observation_payload)}"
             )
             conversation.append({"role": "user", "content": observation})
 
@@ -636,6 +1002,15 @@ class ExecutorAgent(AgentBase):
                 current_data = result.data
 
         logger.info(f"[Executor] Sub-agent {idx} done: {final_result.get('answer_type', '?')}")
+        trace.agent_step("executor", "subagent_complete", {
+            "sub_agent_idx": idx,
+            "sub_task_description": task_description,
+            "tools_hint": tools_hint,
+            "answer_type": final_result.get("answer_type", ""),
+            "answer_preview": str(final_result.get("answer", ""))[:2000],
+            "tool_chain": final_result.get("tool_chain", []),
+            "steps": len(execution_log),
+        })
         return final_result
 
     # ── Tool execution ────────────────────────────────────────────────
@@ -760,6 +1135,251 @@ class ExecutorAgent(AgentBase):
         return ", ".join(parts)
 
     @staticmethod
+    def _is_valid_final_answer(task_type: str, answer: Any, horizon: int | None = None) -> bool:
+        valid, _ = ExecutorAgent._validate_final_answer(task_type, answer, horizon=horizon)
+        return valid
+
+    @staticmethod
+    def _validate_final_answer(task_type: str, answer: Any, horizon: int | None = None) -> tuple[bool, str]:
+        if answer is None:
+            return False, "answer is None"
+
+        if task_type == "forecast":
+            candidate = answer
+            if isinstance(candidate, str):
+                try:
+                    candidate = json.loads(candidate)
+                except (json.JSONDecodeError, TypeError):
+                    return False, "forecast answer string is not valid JSON"
+            if isinstance(candidate, dict):
+                for key in ("forecast", "point_forecast", "prediction", "values", "answer"):
+                    if key in candidate:
+                        candidate = candidate[key]
+                        break
+            try:
+                arr = np.asarray(candidate, dtype=float).ravel()
+            except (ValueError, TypeError):
+                return False, f"forecast answer cannot be converted to numeric array from {type(candidate).__name__}"
+            if arr.size == 0:
+                return False, "forecast numeric array is empty"
+            if horizon is not None and arr.size < horizon:
+                return False, f"forecast array too short: got {arr.size}, need at least {horizon}"
+            return True, ""
+
+        if task_type == "indicator":
+            if isinstance(answer, str):
+                try:
+                    answer = json.loads(answer)
+                except (json.JSONDecodeError, TypeError):
+                    return False, "indicator answer string is not valid JSON"
+            if not isinstance(answer, dict) or not answer:
+                return False, "indicator answer is not a non-empty JSON object"
+            numeric_found = False
+            for value in answer.values():
+                try:
+                    float(value)
+                    numeric_found = True
+                except (ValueError, TypeError):
+                    return False, "indicator answer contains non-numeric value"
+            return numeric_found, "" if numeric_found else "indicator answer has no numeric values"
+
+        if task_type in {"classification", "correlation"}:
+            if isinstance(answer, str):
+                return bool(answer.strip()), "" if answer.strip() else "classification/correlation answer is empty string"
+            if isinstance(answer, dict):
+                for key in ("trend", "correlation", "answer", "label", "prediction"):
+                    if key in answer and str(answer[key]).strip():
+                        return True, ""
+                return False, "classification/correlation JSON has no non-empty label field"
+            return False, "classification/correlation answer is neither string nor dict"
+
+        if task_type == "qa":
+            if isinstance(answer, str):
+                return bool(answer.strip()), "" if answer.strip() else "qa answer is empty string"
+            if isinstance(answer, dict):
+                ok = any(str(v).strip() for v in answer.values())
+                return ok, "" if ok else "qa answer dict has only empty values"
+            return False, "qa answer is neither string nor dict"
+
+        return True, ""
+
+    @staticmethod
+    def _coerce_prediction_for_evaluation(task_type: str, answer: Any) -> Any:
+        """Restore structured payloads from JSON-looking string answers."""
+        if isinstance(answer, str) and task_type in {"forecast", "indicator"}:
+            try:
+                return json.loads(answer)
+            except (json.JSONDecodeError, TypeError):
+                return answer
+        return answer
+
+    @classmethod
+    def _collect_batch_eval_predictions(
+        cls,
+        execution_log: list[dict[str, Any]],
+        task_type: str,
+        horizon: int | None = None,
+    ) -> list[dict[str, Any]]:
+        predictions: list[dict[str, Any]] = []
+        for entry in reversed(execution_log):
+            if entry.get("tool") != "spawn_subagent":
+                continue
+            output = entry.get("output") or []
+            for idx, item in enumerate(output):
+                if not isinstance(item, dict) or not item.get("success"):
+                    continue
+                result = item.get("result") or {}
+                if not isinstance(result, dict):
+                    continue
+                answer = result.get("answer", result.get("prediction"))
+                if not cls._is_valid_final_answer(task_type, answer, horizon=horizon):
+                    continue
+                eval_prediction = cls._coerce_prediction_for_evaluation(task_type, answer)
+                sub_execution_log = result.get("execution_log") or []
+                tool_chain = [
+                    str(log_entry.get("tool") or "").strip()
+                    for log_entry in sub_execution_log
+                    if isinstance(log_entry, dict) and str(log_entry.get("tool") or "").strip()
+                ]
+                name = (
+                    (tool_chain[0] if tool_chain else "")
+                    or result.get("candidate_name")
+                    or result.get("tools_hint")
+                    or result.get("sub_task_description")
+                    or f"candidate_{idx}"
+                )
+                predictions.append({"name": str(name), "prediction": eval_prediction})
+            if predictions:
+                break
+        return predictions
+
+    @staticmethod
+    def _build_profiling_section(profiling_results: dict[str, Any]) -> str:
+        if not isinstance(profiling_results, dict) or not profiling_results:
+            return ""
+        keys = [
+            "modality_report",
+            "fingerprint_snapshot",
+            "compute_statistics",
+            "detect_seasonality",
+            "autocorrelation",
+            "stationarity_test",
+            "detect_trend",
+        ]
+        lines: list[str] = []
+        for key in keys:
+            if key not in profiling_results:
+                continue
+            value = profiling_results.get(key)
+            try:
+                value_text = json.dumps(value, ensure_ascii=False, default=str)
+            except TypeError:
+                value_text = str(value)
+            if value_text:
+                lines.append(f"- {key}: {value_text[:1200]}")
+        if not lines:
+            return ""
+        return "## Profiling Results\n" + "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _has_structured_thought(thought: str) -> bool:
+        if not thought:
+            return False
+        return all(label in thought for label in ("Reason:", "Action:"))
+
+    @staticmethod
+    def _coerce_llm_decision(
+        parsed: Any,
+        text: str | None,
+        *,
+        fallback_thought: str,
+    ) -> dict[str, Any]:
+        if isinstance(parsed, dict):
+            return parsed
+        raw = (text or "").strip()
+        if raw:
+            try:
+                recovered = json.loads(raw)
+            except Exception:
+                recovered = None
+            if isinstance(recovered, dict):
+                return recovered
+            if isinstance(recovered, list) and recovered and isinstance(recovered[0], dict):
+                return recovered[0]
+        return {"done": True, "thought": fallback_thought}
+
+    @staticmethod
+    def _tool_note_candidates(tool_name: str, task_type: str) -> list[str]:
+        candidates = [tool_name]
+        if tool_name.startswith("llm_reasoning_"):
+            candidates.append("llm_reasoning")
+            candidates.append(f"llm_reasoning::{task_type}")
+        return candidates
+
+    def _build_tool_notes_section(
+        self,
+        tool_notes: dict[str, Any],
+        candidates: list[str],
+        task_type: str,
+    ) -> str:
+        if not isinstance(tool_notes, dict) or not tool_notes:
+            return ""
+        lines: list[str] = []
+        for tool_name in candidates:
+            matched_note = None
+            for key in self._tool_note_candidates(tool_name, task_type):
+                if key in tool_notes and str(tool_notes[key]).strip():
+                    matched_note = str(tool_notes[key]).strip()
+                    break
+            if matched_note:
+                lines.append(f"- {tool_name}: {matched_note[:800]}")
+        if not lines:
+            return ""
+        return "## Tool Notes\n" + "\n".join(lines) + "\n"
+
+    def _build_llm_reasoning_context(
+        self,
+        plan: dict[str, Any],
+        execution_log: list[dict[str, Any]],
+        existing_context: str = "",
+    ) -> str:
+        parts: list[str] = []
+        desc = plan.get("task_description", "")
+        if desc:
+            parts.append(f"## Task Description\n{desc}")
+        profiling = plan.get("profiling_section", "")
+        if profiling:
+            parts.append(profiling.strip())
+        tool_notes = plan.get("tool_notes_section", "")
+        if tool_notes:
+            parts.append(tool_notes.strip())
+        if execution_log:
+            lines = ["## Prior Tool Observations"]
+            for entry in execution_log[-5:]:
+                tool = entry.get("tool", "?")
+                thought = entry.get("thought", "")
+                observation = entry.get("observation")
+                obs_text = self._format_observation_for_prompt(observation) if observation is not None else ""
+                line = f"- tool={tool}"
+                if thought:
+                    line += f" | thought={thought[:1000]}"
+                if obs_text:
+                    line += f" | observation={obs_text[:3000]}"
+                lines.append(line)
+            parts.append("\n".join(lines))
+        if existing_context:
+            parts.append(f"## Caller Context\n{existing_context}")
+        return "\n\n".join(p for p in parts if p).strip()
+
+    @staticmethod
+    def _format_observation_for_prompt(observation: Any) -> str:
+        try:
+            text = json.dumps(observation, ensure_ascii=False, default=str)
+        except TypeError:
+            text = str(observation)
+        return text[:50000]
+
+    @staticmethod
     def _sanitise_gt_observation(
         conversation: list[dict[str, str]], obs_idx: int,
     ) -> None:
@@ -775,8 +1395,8 @@ class ExecutorAgent(AgentBase):
         msg = conversation[obs_idx]
         content = msg.get("content", "")
 
-        # The observation looks like:  "[Step N] ... → metrics=..., ground_truth=..."
-        # Try to parse the result_summary part as JSON-ish and remove ground_truth.
+        # The observation looks like:  "[Step N] ... → {json payload}"
+        # Parse the JSON-ish payload and drop ground_truth recursively.
         try:
             arrow_idx = content.find("→ ")
             if arrow_idx < 0:
@@ -784,11 +1404,21 @@ class ExecutorAgent(AgentBase):
             prefix = content[: arrow_idx + 2]
             payload = content[arrow_idx + 2 :]
 
-            # result_summary from _summarize_result for a dict looks like:
-            #   "metrics={...}, ground_truth=[...]"
-            # We strip the ground_truth=... part.
-            cleaned = re.sub(
-                r",?\s*ground_truth=[^\n]*", "", payload
+            parsed = _json.loads(payload)
+
+            def _strip_gt(value: Any) -> Any:
+                if isinstance(value, dict):
+                    return {
+                        k: _strip_gt(v)
+                        for k, v in value.items()
+                        if k != "ground_truth"
+                    }
+                if isinstance(value, list):
+                    return [_strip_gt(v) for v in value]
+                return value
+
+            cleaned = _json.dumps(
+                _strip_gt(parsed), ensure_ascii=False, default=str,
             )
             conversation[obs_idx] = {
                 "role": msg["role"],

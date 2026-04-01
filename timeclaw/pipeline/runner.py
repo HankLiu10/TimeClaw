@@ -5,7 +5,6 @@ Architecture:
     1. Preprocess (deterministic, no LLM)
        - Modality detection
        - Fingerprint extraction + profiling tools
-       - Strategy recommendation via fingerprint matching
 
     2. Execute (single Executor agent -- ReAct loop)
        - Receives ALL data (timeseries, text, images) in one context
@@ -27,6 +26,7 @@ Memory injection:
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 from uuid import uuid4
@@ -50,13 +50,14 @@ from timeclaw.core import trace_logger as trace
 from timeclaw.fingerprint.extractor import FingerprintExtractor
 from timeclaw.fingerprint.matcher import FingerprintMatcher
 from timeclaw.llm.router import ModelRouter
+from timeclaw.benchmark.mtbench_support import generate_learning_analysis
 from timeclaw.memory.hierarchical import HierarchicalMemory
 from timeclaw.multimodal.detector import ModalityDetector
 
 # Profiling tools run deterministically during preprocessing
 _PROFILING_TOOLS = ["basic_stats", "autocorrelation", "stationarity_test"]
 _DETECTION_TOOLS = ["detect_trend", "detect_anomaly"]
-_TEXT_PROFILING_TOOLS = ["sentiment", "keyword_extract"]
+_TEXT_PROFILING_TOOLS: list[str] = []
 _IMAGE_PROFILING_TOOLS = ["image_load", "image_feature"]
 
 
@@ -158,8 +159,10 @@ class PipelineRunner:
         verbose: bool | None = None,
         full_dump: bool | None = None,
         domain: str = "",
+        scope_keys: list[str] | None = None,
         mode: str = "test",
         ground_truth: Any = None,
+        defer_learning_record: bool = False,
     ) -> dict[str, Any]:
         """Execute the pipeline: Preprocess -> Execute -> Post-process -> Deliver.
 
@@ -178,6 +181,14 @@ class PipelineRunner:
         trace_id = uuid4().hex[:12]
         t_start = time.time()
         logger.info(f"[Pipeline] Starting run {trace_id}: {task_type}")
+        trace.start_run(trace_id, {
+            "task_type": task_type,
+            "description": description or f"{task_type} task",
+            "domain": domain,
+            "horizon": horizon,
+            "mode": mode,
+            "scope_keys": scope_keys or [],
+        })
 
         envelope = self._build_envelope(
             data=data,
@@ -200,35 +211,40 @@ class PipelineRunner:
         preprocess = await self._preprocess(envelope, data, text_data, images)
 
         fingerprint = preprocess["fingerprint"]
-        suggested_strategy = preprocess["suggested_strategy"]
         detected_modalities = preprocess["modalities"]
         profiling_results = preprocess["profiling_results"]
 
         envelope.update_environment(fingerprint=fingerprint)
-        envelope.task.metadata["suggested_strategy"] = suggested_strategy
         envelope.task.metadata["profiling_results"] = profiling_results
 
         timeline["preprocess"] = {
             "elapsed_ms": int((time.time() - t_pre) * 1000),
             "fingerprint_keys": list(fingerprint.keys()) if isinstance(fingerprint, dict) else [],
-            "suggested_strategy": suggested_strategy,
             "modalities": detected_modalities,
         }
-        trace.decision("Pipeline", f"strategy: {suggested_strategy}, modalities: {detected_modalities}")
+        trace.decision("Pipeline", f"modalities: {detected_modalities}")
 
         # -- Step 2: Memory injection --
         if not self._disable_memory:
-            fp_summary = str(fingerprint)[:2000] if fingerprint else ""
-            query = f"{task_type} {description} {fp_summary}"
             soul_prompt = self.memory.soul_text or ""
-            memory_prompt = self.memory.memory.get_prompt_section(domain, task_type) if self.memory.memory else ""
-            daily_prompt = self.memory.daily.get_prompt_section(query, domain=domain or None, task=task_type or None) if self.memory.daily else ""
-            tool_notes = self.memory.get_tool_notes(domain=domain, task=task_type)
-            skill_prompt = self.memory.get_skill(domain, task_type)
+            if scope_keys:
+                mem_parts = []
+                for scope in scope_keys:
+                    if self.memory.memory:
+                        section = self.memory.memory.get_prompt_section(scope=scope)
+                        if section:
+                            mem_parts.append(section)
+                memory_prompt = "\n".join(mem_parts)
+                tool_notes = self.memory.get_tool_notes(scope_keys=scope_keys)
+                skill_prompt = self.memory.get_skill(domain, task_type, scope_keys=scope_keys)
+            else:
+                memory_prompt = self.memory.memory.get_prompt_section(domain, task_type) if self.memory.memory else ""
+                tool_notes = self.memory.get_tool_notes(domain=domain, task=task_type)
+                skill_prompt = self.memory.get_skill(domain, task_type)
 
             envelope.task.metadata["soul_prompt"] = soul_prompt
             envelope.task.metadata["memory_l2"] = memory_prompt
-            envelope.task.metadata["memory_l1"] = daily_prompt
+            envelope.task.metadata["memory_l1"] = ""
             envelope.task.metadata["tool_notes"] = tool_notes
             envelope.task.metadata["skill_prompt"] = skill_prompt
 
@@ -240,6 +256,7 @@ class PipelineRunner:
         # -- Training mode injection --
         if mode == "train":
             envelope.task.metadata["_mode"] = "train"
+            envelope.task.metadata["_defer_learning_record"] = defer_learning_record
             if ground_truth is not None:
                 envelope.task.metadata["_ground_truth"] = ground_truth
             logger.info("[Pipeline] Training mode: GT injected, evaluate_against_gt enabled")
@@ -260,19 +277,27 @@ class PipelineRunner:
         reasoning = result.get("reasoning", "")
         execution_log = result.get("execution_log", [])
 
+        if mode == "train" and defer_learning_record:
+            raw_prediction = self._select_winner_prediction_from_execution_log(execution_log, raw_prediction)
+
+        prediction = self._extract_prediction(raw_prediction, task_type, horizon)
+
         # -- Training mode: save learning insights to memory --
-        if mode == "train" and not self._disable_memory:
+        if mode == "train" and not self._disable_memory and not defer_learning_record:
             await self._save_learning_outcome(
                 answer_type=answer_type,
                 raw_answer=raw_prediction,
+                prediction=prediction,
                 execution_log=execution_log,
                 task_type=task_type,
                 description=description,
                 domain=domain,
+                scope_keys=scope_keys,
                 reasoning=reasoning,
+                fingerprint=fingerprint,
+                profiling_results=profiling_results,
+                horizon=horizon,
             )
-
-        prediction = self._extract_prediction(raw_prediction, task_type, horizon)
 
         execute_ms = int((time.time() - t_exec) * 1000)
         timeline["execute"] = {
@@ -349,6 +374,13 @@ class PipelineRunner:
             f"gate={'PASS' if gate_passed else 'FAIL'}, "
             f"answer_type={answer_type})"
         )
+        trace.end_run("completed", {
+            "trace_id": trace_id,
+            "total_ms": total_ms,
+            "gate_accepted": gate_passed,
+            "answer_type": answer_type,
+            "confidence": confidence,
+        })
 
         return {
             "prediction": prediction,
@@ -394,10 +426,18 @@ class PipelineRunner:
             await self._run_profiling_tool(tool_name, data, profiling_results)
 
         if "text" in modalities and text_data:
+            text_blob = "\n\n".join(
+                (
+                    item.get("text", item.get("content", ""))
+                    if isinstance(item, dict)
+                    else str(item)
+                )
+                for item in text_data
+            ).strip()
             for tool_name in _TEXT_PROFILING_TOOLS:
                 await self._run_profiling_tool(
                     tool_name, data, profiling_results,
-                    text=text_data, llm=self._text_backends or None,
+                    text=text_blob, llm=self._text_backends or None,
                 )
 
         if "image" in modalities and images:
@@ -407,19 +447,18 @@ class PipelineRunner:
                     images=images,
                 )
 
-        strategy = self._fingerprint_matcher.match(fingerprint)
-
         fp_dict = fingerprint
-        if hasattr(fingerprint, "to_summary"):
-            fp_dict = fingerprint.to_summary()
+        if hasattr(fingerprint, "model_dump"):
+            fp_dict = fingerprint.model_dump(mode="python")
         elif not isinstance(fingerprint, dict):
             fp_dict = {}
 
         envelope.update_environment(modalities=modalities)
+        profiling_results["modality_report"] = modality_report
+        profiling_results["fingerprint_snapshot"] = fp_dict
 
         return {
             "fingerprint": fp_dict,
-            "suggested_strategy": strategy,
             "modalities": modalities,
             "profiling_results": profiling_results,
         }
@@ -460,11 +499,16 @@ class PipelineRunner:
         self,
         answer_type: str,
         raw_answer: Any,
+        prediction: Any,
         execution_log: list[dict[str, Any]],
         task_type: str,
         description: str,
         domain: str,
+        scope_keys: list[str] | None,
         reasoning: str,
+        fingerprint: dict[str, Any] | Any,
+        profiling_results: dict[str, Any],
+        horizon: int | None,
     ) -> None:
         """Persist training-mode learning outcomes into hierarchical memory (L1).
 
@@ -474,18 +518,35 @@ class PipelineRunner:
         N notes).
         """
         tool_chain = [e.get("tool", "") for e in execution_log if e.get("tool")]
+        candidate_traces = self._extract_candidate_traces(execution_log)
 
         all_evals: list[dict[str, Any]] = []
         eval_gt: Any = None
         for entry in execution_log:
-            if entry.get("tool") == "evaluate_against_gt":
+            tool_name = entry.get("tool")
+            if tool_name == "evaluate_against_gt":
                 obs = entry.get("observation", {})
                 if isinstance(obs, dict):
                     all_evals.append(obs.get("metrics", {}))
                     eval_gt = obs.get("ground_truth")
+            elif tool_name in {"evaluate_batch_against_gt", "batch_evaluate_against_gt"}:
+                obs = entry.get("observation", {})
+                if isinstance(obs, dict):
+                    eval_gt = obs.get("ground_truth")
+                    if isinstance(obs.get("metrics"), dict):
+                        all_evals.append(obs.get("metrics", {}))
+                    for item in obs.get("results", []):
+                        if isinstance(item, dict):
+                            all_evals.append(item.get("metrics", {}))
 
-        best_metrics = all_evals[-1] if all_evals else {}
-        correct = bool(best_metrics) and best_metrics.get("mae", 999) < 5
+        best_metrics = self._select_best_metrics(all_evals)
+        if not best_metrics:
+            logger.warning(
+                f"[Pipeline] Skip memory record for {scope_keys or [f'{domain}_{task_type}']}: "
+                "training finished without GT evaluation metrics"
+            )
+            return
+        correct = self._learning_outcome_correctness(best_metrics)
 
         analysis = ""
         if answer_type == "learning_summary" and isinstance(raw_answer, dict):
@@ -497,20 +558,389 @@ class PipelineRunner:
                 rec = json.dumps(rec, ensure_ascii=False) if rec else ""
             analysis = f"{insight}\n{rec}".strip()
 
-        summary = analysis or reasoning or str(raw_answer)[:3000]
+        sample_stats = self._build_sample_stats(fingerprint, profiling_results, horizon)
+        winner_tool_chain = self._select_winner_tool_chain(candidate_traces, best_metrics)
+        fallback_summary = analysis or reasoning or str(raw_answer)[:3000]
+        structured_analysis, summary = await generate_learning_analysis(
+            scope_key=(scope_keys[0] if scope_keys else f"{domain}_{task_type}"),
+            task_type=task_type,
+            domain=domain,
+            task_description=description,
+            sample_fingerprint=sample_stats,
+            candidate_traces=candidate_traces,
+            best_metrics=best_metrics,
+            fallback_summary=fallback_summary,
+        )
+
+        winner_trace = self._select_winner_trace(candidate_traces, best_metrics)
+        recorded_prediction = None
+        if winner_trace is not None:
+            recorded_prediction = winner_trace.get("prediction")
+        if recorded_prediction is None:
+            recorded_prediction = prediction
+        if recorded_prediction is None:
+            recorded_prediction = raw_answer
 
         await self.memory.record(
             domain=domain,
             task=task_type,
-            tool_chain=tool_chain,
+            scope_keys=scope_keys,
+            tool_chain=winner_tool_chain or tool_chain,
             pipeline_summary=summary,
-            data_fingerprint="",
-            predicted=str(raw_answer)[:2000] if raw_answer else "",
+            data_fingerprint=sample_stats,
+            predicted=str(recorded_prediction) if recorded_prediction is not None else "",
             metrics=best_metrics,
             correct=correct,
             description=description,
             all_eval_metrics=all_evals,
+            candidate_traces=candidate_traces,
+            analysis_structured=structured_analysis,
         )
+
+    @staticmethod
+    def _build_sample_stats(
+        fingerprint: dict[str, Any] | Any,
+        profiling_results: dict[str, Any],
+        horizon: int | None,
+    ) -> str:
+        fp = fingerprint if isinstance(fingerprint, dict) else {}
+        parts: list[str] = []
+        if horizon is not None:
+            parts.append(f"horizon={horizon}")
+        for key in ("length", "n_points", "mean", "std", "min", "max"):
+            if key in fp:
+                parts.append(f"{key}={fp[key]}")
+        for key in ("trend", "dominant_period", "seasonal_period"):
+            if key in fp:
+                parts.append(f"{key}={fp[key]}")
+        for tool_name in ("detect_seasonality", "autocorrelation", "stationarity_test"):
+            val = profiling_results.get(tool_name)
+            if val is None:
+                continue
+            text = str(val)
+            if text:
+                parts.append(f"{tool_name}={text[:120]}")
+        return "; ".join(parts[:8])[:500]
+
+    @staticmethod
+    def _extract_candidate_traces(execution_log: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        traces: list[dict[str, Any]] = []
+        batch_results: list[dict[str, Any]] = []
+        single_results: list[dict[str, Any]] = []
+        top_level_traces: list[dict[str, Any]] = []
+        for entry in execution_log:
+            tool_name = str(entry.get("tool") or "").strip()
+            if tool_name == "spawn_subagent":
+                output = entry.get("output") or []
+                for item in output:
+                    if not isinstance(item, dict) or not item.get("success"):
+                        continue
+                    result = item.get("result") or {}
+                    if not isinstance(result, dict):
+                        continue
+                    sub_execution_log = result.get("execution_log", [])
+                    tool_chain = [e.get("tool", "") for e in sub_execution_log if e.get("tool")]
+                    raw_name = result.get("candidate_name") or result.get("tools_hint") or result.get("sub_task_description")
+                    derived_name = (
+                        PipelineRunner._primary_candidate_tool_name(tool_chain)
+                        or PipelineRunner._tool_name_from_hint(str(raw_name or ""))
+                        or raw_name
+                        or f"candidate_{len(traces)}"
+                    )
+                    steps = PipelineRunner._compact_candidate_steps(sub_execution_log)
+                    if not steps:
+                        hinted_tool = PipelineRunner._tool_name_from_hint(
+                            str(result.get("tools_hint") or result.get("candidate_name") or raw_name or "")
+                        )
+                        synthetic_step: dict[str, str] = {}
+                        if hinted_tool:
+                            synthetic_step["tool"] = hinted_tool
+                        reasoning = str(result.get("reasoning") or "").strip()
+                        if reasoning:
+                            synthetic_step["thought"] = reasoning
+                        prediction = result.get("answer", result.get("prediction"))
+                        if prediction is not None:
+                            try:
+                                synthetic_step["observation"] = json.dumps(
+                                    {"answer": prediction}, ensure_ascii=False, default=str
+                                )
+                            except TypeError:
+                                synthetic_step["observation"] = str(prediction)
+                        if synthetic_step:
+                            steps = [synthetic_step]
+                    traces.append({
+                        "name": derived_name,
+                        "candidate_key": PipelineRunner._normalise_candidate_key(derived_name, tool_chain, len(traces)),
+                        "tool_chain": tool_chain,
+                        "prediction": result.get("answer", result.get("prediction")),
+                        "steps": steps,
+                    })
+                continue
+            if tool_name in {"evaluate_batch_against_gt", "batch_evaluate_against_gt"}:
+                obs = entry.get("observation") or {}
+                if isinstance(obs, dict) and isinstance(obs.get("results"), list):
+                    batch_results = obs["results"]
+                continue
+            if tool_name == "evaluate_against_gt":
+                obs = entry.get("observation") or {}
+                args = entry.get("args") or {}
+                if isinstance(obs, dict) and isinstance(obs.get("metrics"), dict) and obs.get("metrics"):
+                    single_results.append(
+                        {
+                            "metrics": obs.get("metrics", {}),
+                            "prediction": args.get("prediction"),
+                        }
+                    )
+                continue
+            if tool_name in {
+                "bound_check",
+                "consistency_check",
+                "spawn_subagent",
+                "evaluate_against_gt",
+                "evaluate_batch_against_gt",
+                "batch_evaluate_against_gt",
+            }:
+                continue
+            steps = PipelineRunner._compact_candidate_steps([entry])
+            top_level_traces.append({
+                "name": tool_name,
+                "candidate_key": PipelineRunner._normalise_candidate_key(tool_name, [tool_name], len(top_level_traces)),
+                "tool_chain": [tool_name],
+                "prediction": PipelineRunner._prediction_from_observation(entry.get("observation")),
+                "steps": steps,
+            })
+
+        if not traces and top_level_traces:
+            traces = top_level_traces
+
+        trace_by_key = {
+            trace.get("candidate_key"): trace for trace in traces if trace.get("candidate_key")
+        }
+        unmatched_traces = [trace for trace in traces if trace.get("metrics") is None]
+
+        for idx, res in enumerate(batch_results):
+            if not isinstance(res, dict):
+                continue
+            res_name = str(res.get("name") or "").strip()
+            res_key = PipelineRunner._normalise_candidate_key(res_name, [], idx)
+
+            matched = trace_by_key.get(res_key)
+            if matched is None and idx < len(unmatched_traces):
+                matched = unmatched_traces[idx]
+            if matched is None:
+                continue
+
+            matched["metrics"] = res.get("metrics", {})
+            if res_name and not res_name.startswith("approach_"):
+                matched["name"] = PipelineRunner._normalise_candidate_key(
+                    res_name, matched.get("tool_chain", []), idx,
+                )
+                matched["candidate_key"] = PipelineRunner._normalise_candidate_key(
+                    res_name, matched.get("tool_chain", []), idx,
+                )
+
+        for res in single_results:
+            matched = None
+            res_prediction = res.get("prediction")
+            if res_prediction is not None:
+                for trace in unmatched_traces:
+                    if trace.get("metrics") is not None:
+                        continue
+                    if trace.get("prediction") == res_prediction:
+                        matched = trace
+                        break
+            if matched is None:
+                for trace in unmatched_traces:
+                    if trace.get("metrics") is None:
+                        matched = trace
+                        break
+            if matched is None:
+                continue
+            matched["metrics"] = res.get("metrics", {})
+        return traces
+
+    @staticmethod
+    def _prediction_from_observation(observation: Any) -> Any:
+        if isinstance(observation, dict):
+            for key in ("forecast", "point_forecast", "answer", "prediction"):
+                value = observation.get(key)
+                if value is not None:
+                    return value
+        return None
+
+    @staticmethod
+    def _compact_candidate_steps(execution_log: list[dict[str, Any]]) -> list[dict[str, str]]:
+        steps: list[dict[str, str]] = []
+        for entry in execution_log:
+            tool = str(entry.get("tool") or "").strip()
+            if not tool or tool in {"evaluate_against_gt", "evaluate_batch_against_gt", "batch_evaluate_against_gt", "spawn_subagent"}:
+                continue
+            step: dict[str, str] = {"tool": tool}
+
+            thought = str(entry.get("thought") or "").strip()
+            if thought:
+                step["thought"] = thought
+
+            observation = entry.get("observation")
+            if observation is None and entry.get("output") is not None:
+                observation = entry.get("output")
+            if observation is not None:
+                try:
+                    obs_text = json.dumps(observation, ensure_ascii=False, default=str)
+                except TypeError:
+                    obs_text = str(observation)
+                if obs_text:
+                    step["observation"] = obs_text
+
+            steps.append(step)
+        return steps
+
+    @staticmethod
+    def _select_winner_tool_chain(candidate_traces: list[dict[str, Any]], best_metrics: dict[str, Any]) -> list[str]:
+        winner_trace = PipelineRunner._select_winner_trace(candidate_traces, best_metrics)
+        if winner_trace and winner_trace.get("tool_chain"):
+            return winner_trace["tool_chain"]
+        for trace in candidate_traces:
+            if trace.get("tool_chain"):
+                return trace["tool_chain"]
+        return []
+
+    @staticmethod
+    def _metrics_score(metrics: dict[str, Any]) -> tuple[int, float]:
+        if isinstance(metrics.get("accuracy"), (int, float)):
+            return (0, -float(metrics["accuracy"]))
+        if isinstance(metrics.get("correct"), bool):
+            return (0, 0.0 if metrics["correct"] else 1.0)
+        for key in ("mae", "avg_mae", "rmse", "mse", "max_mae"):
+            if isinstance(metrics.get(key), (int, float)):
+                return (1, float(metrics[key]))
+        return (9, 0.0)
+
+    @staticmethod
+    def _select_winner_trace(
+        candidate_traces: list[dict[str, Any]],
+        best_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        valid_traces = [
+            trace
+            for trace in candidate_traces
+            if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
+        ]
+        if not valid_traces:
+            return None
+
+        if isinstance(best_metrics, dict) and best_metrics:
+            target_score = PipelineRunner._metrics_score(best_metrics)
+            scored_matches = [
+                trace for trace in valid_traces
+                if PipelineRunner._metrics_score(trace["metrics"]) == target_score
+            ]
+            if scored_matches:
+                return min(scored_matches, key=lambda trace: PipelineRunner._metrics_score(trace["metrics"]))
+
+        return min(valid_traces, key=lambda trace: PipelineRunner._metrics_score(trace["metrics"]))
+
+    @staticmethod
+    def _normalise_candidate_key(name: str, tool_chain: list[str], index: int) -> str:
+        clean_name = (name or "").strip()
+        hinted_name = PipelineRunner._tool_name_from_hint(clean_name)
+        if hinted_name:
+            return hinted_name
+        if clean_name and not clean_name.startswith("approach_"):
+            return clean_name
+        chain = " → ".join(t for t in tool_chain if t)
+        if chain:
+            return chain
+        return f"candidate_{index}"
+
+    @staticmethod
+    def _primary_candidate_tool_name(tool_chain: list[str]) -> str:
+        for tool in tool_chain:
+            if tool in {
+                "bound_check",
+                "consistency_check",
+                "evaluate_against_gt",
+                "evaluate_batch_against_gt",
+                "batch_evaluate_against_gt",
+                "spawn_subagent",
+            }:
+                continue
+            if tool:
+                return tool
+        return ""
+
+    @staticmethod
+    def _tool_name_from_hint(text: str) -> str:
+        if not text:
+            return ""
+        for token in re.split(r"[\s,;:/()\[\]\n]+", text):
+            token = token.strip()
+            if token.endswith(("_forecast", "_indicator", "_trend", "_classification", "_qa", "_correlation")):
+                return token
+        return ""
+
+    @staticmethod
+    def _select_best_metrics(all_evals: list[dict[str, Any]]) -> dict[str, Any]:
+        valid = [m for m in all_evals if isinstance(m, dict) and m]
+        if not valid:
+            return {}
+        return min(valid, key=PipelineRunner._metrics_score)
+
+    @staticmethod
+    def _select_winner_prediction_from_execution_log(
+        execution_log: list[dict[str, Any]],
+        fallback_prediction: Any,
+    ) -> Any:
+        candidate_traces = PipelineRunner._extract_candidate_traces(execution_log)
+        evaluated_metrics = [
+            trace.get("metrics")
+            for trace in candidate_traces
+            if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
+        ]
+        best_metrics = PipelineRunner._select_best_metrics(evaluated_metrics)
+        if not best_metrics:
+            return fallback_prediction
+        winner_trace = PipelineRunner._select_winner_trace(candidate_traces, best_metrics)
+        if winner_trace and winner_trace.get("prediction") is not None:
+            return winner_trace.get("prediction")
+        return fallback_prediction
+
+    @staticmethod
+    def _learning_outcome_correctness(metrics: dict[str, Any]) -> bool | None:
+        """Infer training-note correctness from MTBench-aligned metrics.
+
+        New definition:
+            For training notes, we only emit binary correctness when MTBench
+            naturally provides one, i.e. explicit label correctness
+            (`correct`) or classification accuracy (`accuracy`).
+
+            For continuous-score tasks such as forecast / indicator, MTBench
+            reports graded errors (MAE, RMSE, component MAE, ...), not a
+            universal pass/fail threshold. In those cases we return ``None``
+            and let the note be marked as scored rather than OK/FAIL.
+
+            Explicit parse/type/tool errors still count as failures.
+        """
+        if not metrics:
+            return None
+
+        if bool(metrics.get("parse_error")) or bool(metrics.get("type_error")):
+            return False
+        if any(
+            bool(v) for k, v in metrics.items()
+            if k.endswith("_error") and k not in {"parse_error", "type_error"}
+        ):
+            return False
+
+        explicit_correct = metrics.get("correct")
+        if isinstance(explicit_correct, bool):
+            return explicit_correct
+
+        accuracy = metrics.get("accuracy")
+        if isinstance(accuracy, (int, float)):
+            return float(accuracy) >= 1.0
+
+        return None
 
     # -- Hierarchical Memory Interface ----------------------------------
 
@@ -524,11 +954,11 @@ class PipelineRunner:
         """
         await self.memory.record(**run_context)
 
-    def flush_memory(self) -> None:
-        self.memory.flush()
+    async def flush_memory(self) -> None:
+        await self.memory.flush()
 
     async def distill_memory(self) -> None:
-        await self.memory.force_distill()
+        await self.memory.distill_pending()
 
     def memory_summary(self) -> dict:
         return self.memory.summary()

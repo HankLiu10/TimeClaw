@@ -1,8 +1,8 @@
 {
   "dataset": "weather_qa_short",
   "split_year": 2020,
-  "train_count": 93,
-  "test_count": 35,
+  "train_count": 468,
+  "test_count": 177,
   "domain": "weather",
   "task_types": [
     "mcqa"

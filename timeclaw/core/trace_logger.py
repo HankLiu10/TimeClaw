@@ -16,13 +16,21 @@ Usage:
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 import json
+import time
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 _verbose: bool = False
 _full_dump: bool = False
+_trace_dir: Path = Path(".timeclaw/traces")
+_active_trace_path_var: ContextVar[Path | None] = ContextVar(
+    "timeclaw_active_trace_path",
+    default=None,
+)
 
 _SEPARATOR = "═" * 72
 _THIN_SEP = "─" * 60
@@ -32,6 +40,50 @@ def configure(verbose: bool, full_dump: bool = False) -> None:
     global _verbose, _full_dump
     _verbose = verbose
     _full_dump = full_dump
+
+
+def start_run(trace_id: str, metadata: dict[str, Any] | None = None) -> None:
+    _trace_dir.mkdir(parents=True, exist_ok=True)
+    active_trace_path = _trace_dir / f"{trace_id}.jsonl"
+    _active_trace_path_var.set(active_trace_path)
+    if active_trace_path.exists():
+        active_trace_path.unlink()
+    _record_event("run_start", metadata or {})
+
+
+def end_run(status: str, metadata: dict[str, Any] | None = None) -> None:
+    _record_event("run_end", {"status": status, **(metadata or {})})
+    _active_trace_path_var.set(None)
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _record_event(event_type: str, payload: dict[str, Any] | Any) -> None:
+    active_trace_path = _active_trace_path_var.get()
+    if active_trace_path is None:
+        return
+    record = {
+        "ts": time.time(),
+        "event": event_type,
+        "payload": _json_safe(payload),
+    }
+    try:
+        with active_trace_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.debug(f"[trace_logger] failed to persist trace event: {exc}")
 
 
 # ── Formatting helpers ──────────────────────────────────────────
@@ -159,6 +211,7 @@ def _extract_llm_decision(parsed: Any) -> str:
 
 def stage(name: str, extra: str = "") -> None:
     """Mark a major pipeline stage."""
+    _record_event("stage", {"name": name, "extra": extra})
     if not _verbose:
         return
     msg = f"\n{_SEPARATOR}\n  {name}\n{_SEPARATOR}"
@@ -169,6 +222,7 @@ def stage(name: str, extra: str = "") -> None:
 
 def thinking(agent: str, description: str) -> None:
     """Show that an agent is about to think (LLM call)."""
+    _record_event("thinking", {"agent": agent, "description": description})
     if not _verbose:
         return
     logger.info(f"[{agent}] 思考中… {description}")
@@ -182,9 +236,6 @@ def llm_call(
     response_format: str | None = None,
 ) -> None:
     """Log an LLM call — focus on the decision, not the raw prompt."""
-    if not _verbose:
-        return
-
     resp_parsed = None
     resp_usage = {}
     resp_text = ""
@@ -197,6 +248,18 @@ def llm_call(
 
     tokens_in = resp_usage.get("prompt_tokens", "?")
     tokens_out = resp_usage.get("completion_tokens", "?")
+
+    _record_event("llm_call", {
+        "caller": caller,
+        "messages": messages,
+        "response_format": response_format,
+        "response_text": resp_text,
+        "response_parsed": resp_parsed,
+        "usage": resp_usage,
+    })
+
+    if not _verbose:
+        return
 
     if _full_dump:
         parts = [f"\n{_THIN_SEP}", f"[{caller}] LLM 调用详情 (tokens: {tokens_in} in / {tokens_out} out)"]
@@ -234,6 +297,7 @@ def llm_prompt_detail(
     messages: list[dict[str, Any]],
 ) -> None:
     """Log full LLM prompt — only when extra detail is needed."""
+    _record_event("llm_prompt_detail", {"caller": caller, "messages": messages})
     if not _verbose:
         return
     parts = []
@@ -250,6 +314,7 @@ def llm_prompt_detail(
 
 def decision(agent: str, text: str) -> None:
     """Log a key decision point."""
+    _record_event("decision", {"agent": agent, "text": text})
     if not _verbose:
         return
     logger.info(f"[{agent}] → {text}")
@@ -262,13 +327,23 @@ def tool_exec(
     result: Any,
 ) -> None:
     """Log a tool execution with concise result summary."""
-    if not _verbose:
-        return
-
     success = getattr(result, "success", None)
     data = getattr(result, "data", result)
     error = getattr(result, "error", None)
     metadata = getattr(result, "metadata", {})
+
+    _record_event("tool_exec", {
+        "caller": caller,
+        "tool_name": tool_name,
+        "args": args,
+        "success": success,
+        "data": data,
+        "error": error,
+        "metadata": metadata,
+    })
+
+    if not _verbose:
+        return
 
     status = "✓" if success else f"✗ {error}"
     args_str = ", ".join(f"{k}={v}" for k, v in args.items()) if args else "默认参数"
@@ -290,6 +365,7 @@ def agent_step(
     data: dict[str, Any] | Any,
 ) -> None:
     """Log an agent lifecycle phase — extract key info only."""
+    _record_event("agent_step", {"agent": agent, "phase": phase, "data": data})
     if not _verbose:
         return
 
@@ -378,6 +454,7 @@ def pipeline_stage(
     data: dict[str, Any] | Any,
 ) -> None:
     """Log a pipeline stage — minimal, key facts only."""
+    _record_event("pipeline_stage", {"stage_name": stage_name, "data": data})
     if not _verbose:
         return
     # Pipeline stages are already covered by stage() + agent logs.
@@ -393,6 +470,13 @@ def reasoning_step(
     critic: str | None = None,
 ) -> None:
     """Log a reasoning iteration step."""
+    _record_event("reasoning_step", {
+        "caller": caller,
+        "step": step,
+        "thought": thought,
+        "observation": observation,
+        "critic": critic,
+    })
     if not _verbose:
         return
 

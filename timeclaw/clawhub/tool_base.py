@@ -103,6 +103,35 @@ class ClawTool(ABC):
             },
         }
 
+    def required_modalities(self) -> set[str]:
+        """Infer the minimum required modalities from ``io_type``.
+
+        New definition:
+            ``required_modalities`` is the canonical modality signature used
+            for tool exposure. A tool is eligible only when its required
+            modalities are all present in the current sample.
+
+            ``GENERIC_LLM`` tools are treated as universally applicable and
+            therefore require no minimum modality subset.
+        """
+        if self.category == ToolCategory.GENERIC_LLM:
+            return set()
+
+        io_value = self.io_type.value if hasattr(self.io_type, "value") else str(self.io_type)
+        if io_value.startswith("TIX"):
+            return {"timeseries", "text", "image"}
+        if io_value.startswith("TX"):
+            return {"timeseries", "text"}
+        if io_value.startswith("IX"):
+            return {"timeseries", "image"}
+        if io_value.startswith("TI"):
+            return {"text", "image"}
+        if io_value.startswith("T"):
+            return {"text"}
+        if io_value.startswith("I"):
+            return {"image"}
+        return {"timeseries"}
+
     @staticmethod
     def resolve_llm(llm: Any, model: str | None = None) -> Any | None:
         """Resolve the LLM backend from a single backend or {"light": ..., "heavy": ...} dict.

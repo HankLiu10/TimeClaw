@@ -24,13 +24,13 @@ DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "domain": "weather",
         "path": "data/processed/weather/aligned_in7days_out1days",
         "format": "json",
-        "tasks": ["forecast", "trend", "indicator"],
+        "tasks": ["forecast", "trend", "trend_past", "indicator"],
     },
     "weather_aligned_long": {
         "domain": "weather",
         "path": "data/processed/weather/aligned_in14days_out3days",
         "format": "json",
-        "tasks": ["forecast", "trend", "indicator"],
+        "tasks": ["forecast", "trend", "trend_past", "indicator"],
     },
     "weather_qa_short": {
         "domain": "weather",
