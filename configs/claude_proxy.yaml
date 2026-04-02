@@ -1,11 +1,12 @@
-# TimeClaw Configuration: GPT-5.4 via ai.changyou.club
+# TimeClaw Configuration: GPT-5.4 via HTTP 分流（与 Codex 默认 api 对齐；明文仅可信网络）
 # Backup APIs (uncomment to switch):
+#   api_base: "https://ai.changyou.club/v1"
 #   api_key: "sk-proj-89dy5lda8a188si2q9r5e1o4yv6xdrzo"  # 主key，今日额度已用完
 #   api_base: "http://160.202.238.42:48760/v1"
 #   api_key: "27dcc6ce4b4468ab53b62464670dee53050a45e91d9773f21d2c290c8321cebb"
 
 llm:
-  api_base: "https://ai.changyou.club/v1"
+  api_base: "http://38.175.200.167:8090/v1"
   api_key: "sk-proj-3lmogmngl1hir2symiqg77x8y66ce09z"
   models:
     manager: "openai/gpt-5.4"
