@@ -1,5 +1,5 @@
-# TimeClaw Configuration: GPT-5.4 via HTTP 镜像 38.175.200.167:8090（明文仅可信网络）
-# Backup APIs (uncomment to switch):
+# TimeClaw Configuration: GPT-5.4 — llm.api_base 固定为下方 HTTP 镜像（明文仅可信网络）
+# Backup（切回主站时改 llm.api_base）:
 #   api_base: "https://ai.changyou.club/v1"
 #   api_key: "sk-proj-89dy5lda8a188si2q9r5e1o4yv6xdrzo"  # 主key，今日额度已用完
 #   api_base: "http://160.202.238.42:48760/v1"
