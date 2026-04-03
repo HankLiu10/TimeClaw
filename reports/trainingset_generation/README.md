@@ -1,12 +1,12 @@
 # 独立训练集（MTBench 兼容）从零构建指南
 
-本文说明如何在 **TimeClaw 仓库内**，从零生成 `data_preparation/independent/splits/` 下 **8 个**与 MTBench **数据契约**对齐的任务数据集，并列出所依赖的 **代码文件** 与 **官方参考数据路径**。
+本文说明如何在 **TimeClaw 仓库内**，从零生成 `data_preparation/independent/splits/`（历史目录名，存放 **独立语料的样本文件名列表**，与「把 MTBench 一切两半」无关）下 **8 个**与 MTBench **数据契约**对齐的任务数据集，并列出所依赖的 **代码文件** 与 **官方参考数据路径**。
 
 ---
 
 ## 1. 产出物一览
 
-| 目录（相对 `data_preparation/independent/splits/`） | 类型 | 目标规模（脚本常量，以实际运行为准） |
+| 目录（相对 `data_preparation/independent/splits/`，独立侧 **样本列表** 根目录） | 类型 | 目标规模（脚本常量，以实际运行为准） |
 |-----------------------------------------------------|------|----------------------------------------|
 | `finance_aligned_short/` | Parquet + 列表文件 | 530 |
 | `finance_aligned_long/` | Parquet + 列表文件 | 至多 5000（受 1h/5m 覆盖与 MTBench 文本闭区间筛选限制，常为千余级） |
@@ -25,7 +25,7 @@
 
 ### 2.1 仓库与官方参考数据
 
-本流水线在 **统计与筛选** 上会读取仓库内 **MTBench 已处理数据** 与 **split 列表**（合并 test+train 视为单一评测语料）：
+本流水线在 **统计与筛选** 上会读取仓库内 **MTBench 已处理数据** 与 **`data/splits/` 下的官方文件名列表**（将同一数据集的 `train_files.json` 与 `test_files.json` **合并去重**，仅作 **分布/闭区间统计的参考全集**，不是宣称「官方 train 用来训练本流水线」）：
 
 - `data/processed/finance/`（aligned parquet、QA 子目录等）
 - `data/processed/weather/`（aligned、QA 子目录）
@@ -89,7 +89,7 @@ python3 data_preparation/independent/scripts/build_weather.py --base_dir data_pr
 
 **脚本**：[`data_preparation/independent/scripts/generate_tasks.py`](../../data_preparation/independent/scripts/generate_tasks.py)
 
-**PART 1**：从金融 Parquet 与气象 JSON 抽样/重切，写入 `splits/` 下四个 **aligned** 数据集。  
+**PART 1**：从金融 Parquet 与气象 JSON 抽样/重切，写入独立侧 `splits/` 目录下四个 **aligned** 数据集。  
 **PART 2**：金融/天气 QA，**并发 LLM**，支持断点续跑（同 stem 跳过）。  
 **PART 3**：MCQA **选项 A–D 均匀化 shuffle**（**不**改写 `news_price_correlation`）。
 

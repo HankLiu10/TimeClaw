@@ -2,13 +2,15 @@
 
 本文档根据会话 [基准训练与实验监控](d262efb1-cc92-48fe-99ac-a086cbb5beca) 与后续实现讨论整理，用于在你误删编排脚本后**复现同一套协议**。
 
+**用语**：下文「train / test」指 **`load_split(dataset, "train"|"test")` 选中的官方 JSON 列表**（`train_files.json` / `test_files.json`），不是「独立训练语料 vs MTBench」那套双语料叙事；若实验协议改为只在独立语料上训练，本节中的 train 路径需另行约定。
+
 ---
 
 ## 1. 目标
 
-- **训练**：8 个 MTBench 数据集，每个数据集在 **train split** 上只用 **100 条样本**（控制成本）。
-- **测试**：8 个数据集在 **test split** 上只用 **100 条样本**。
-- **公平对比**：Baseline（无工具直出）与 TimeClaw（带记忆）必须在**同一批测试样本**上评估，因此需要**固定测试索引**，而不是「各跑 test 集前 100 条但顺序/抽样不一致」。
+- **训练**：8 个 MTBench 数据集，每个数据集在 **`load_split(..., "train")` 得到的列表**上只用 **100 条样本**（控制成本）。
+- **测试**：8 个数据集在 **`load_split(..., "test")` 得到的列表**上只用 **100 条样本**。
+- **公平对比**：Baseline（无工具直出）与 TimeClaw（带记忆）必须在**同一批测试样本**上评估，因此需要**固定测试索引**，而不是「各跑 test 列表前 100 条但顺序/抽样不一致」。
 
 ---
 
@@ -18,16 +20,16 @@
 - **格式**：`{ "dataset_name": [i0, i1, ...], ... }`，每个 key 对应 `load_split(dataset, "test")` 返回列表中的 **下标**，长度一般为 100（若全量不足 100 则为全量下标）。
 - **生成逻辑**（原 `run_full_experiment.py` 中的 `freeze_test_samples()`）：
   - 若文件**已存在**：直接 `json.load`，保证多次实验**同一批题**。
-  - 若**不存在**：对每个数据集从 test split 用 **`_stratified_sample`**（与 `pipeline_eval` 中一致的分层抽样）选出 100 个样本，再反推出对应的 **原始下标列表**，写入 JSON。
+  - 若**不存在**：对每个数据集从 **test 列表** 用 **`_stratified_sample`**（与 `pipeline_eval` 中一致的分层抽样）选出 100 个样本，再反推出对应的 **列表内下标**，写入 JSON。
 
 仓库中若仍保留该 JSON，可直接复用；若删了，需用同样逻辑**重新生成**一次（否则与历史结果不可比）。
 
 ---
 
-## 3. 训练集：100 条样本（**train 前 100 条**）
+## 3. 训练集：100 条样本（**train 列表前 100 条**）
 
 - **调用**：`timeclaw.benchmark.train_loop.run_train_loop(max_samples=100, ...)`
-- **代码语义**（`train_loop.py`）：`load_split(ds, "train")` 后对 `samples = samples[:max_samples]`，即按当前 split 的**顺序取前 100 条**，不是随机 100 条。
+- **代码语义**（`train_loop.py`）：`load_split(ds, "train")` 后对 `samples = samples[:max_samples]`，即按当前 **train 列表顺序**取前 100 条，不是随机 100 条。
 - **并发**：历史上多次调整；常见配置包括「全局 semaphore + 多数据集并行、每 task 限流」等，以你当时 `run_full_experiment.py` 或 `train_loop` 参数为准。
 
 训练结束后通常会调用 **`HierarchicalMemory.force_distill()`**（或等价「把 L1 笔记蒸馏进 L2/L3」），再进入测试阶段。
@@ -41,14 +43,14 @@
 - `timeclaw.benchmark.baseline_eval.run_baseline(...)`
 - 需传入与 TimeClaw **相同的 100 个 test 样本**。  
   **完整做法**：支持按 `sample_indices`（或等价）只对 `indices` 里的行跑 baseline。  
-  **简化做法**（当前部分代码）：`max_samples=100` → 使用 **test split 的前 100 条**，与「JSON 固定子集」**不一定一致**。
+  **简化做法**（当前部分代码）：`max_samples=100` → 使用 **test 列表的前 100 条**，与「JSON 固定子集」**不一定一致**。
 
 ### Trained（带记忆）
 
 - `timeclaw.benchmark.pipeline_eval.run_pipeline_eval(split="test", label="trained", use_skills=True, ...)`
 - **完整做法**：若实现 **`sample_indices: dict[str, list[int]]`**，则对每个 `ds` 执行  
   `samples = [samples[i] for i in idx_list if i < len(samples)]`，与 baseline 完全一致。  
-- **简化做法**：仅 `max_samples=100` → test **前 100 条**，与 JSON 子集可能不一致。
+- **简化做法**：仅 `max_samples=100` → test 列表 **前 100 条**，与 JSON 子集可能不一致。
 
 ---
 
@@ -84,21 +86,21 @@
 在项目根目录：
 
 ```bash
-# 训练：每数据集 train 前 100 条
+# 训练：每数据集 train 列表前 100 条
 python -c "
 import asyncio
 from timeclaw.benchmark.train_loop import run_train_loop
 asyncio.run(run_train_loop(max_samples=100, concurrency=8))
 "
 
-# 测试（带记忆）：test 前 100 条
+# 测试（带记忆）：test 列表前 100 条
 python -c "
 import asyncio
 from timeclaw.benchmark.pipeline_eval import run_pipeline_eval
 asyncio.run(run_pipeline_eval(max_samples=100, split='test', label='trained', concurrency=20))
 "
 
-# Baseline：test 前 100 条
+# Baseline：test 列表前 100 条
 python -c "
 import asyncio
 from timeclaw.benchmark.baseline_eval import run_baseline

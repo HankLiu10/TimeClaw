@@ -513,13 +513,15 @@ Baseline 使用 MTBench 官方 prompt 直接调用 LLM（无工具），与 Time
 
 ```
 1. 清空记忆和技能
-2. 数据集 70/30 时间切分
+2. （默认库行为）在官方 MTBench processed 上生成/读取两套样本文件名列表（约 70/30 时间边界 → train_files / test_files；见 dataset_split）
 3. 对每个数据集:
-   a. TimeClaw 在训练集上运行（记录经验 + 触发蒸馏）
-   b. TimeClaw 在测试集上评估（使用学到的记忆，不写入）
-   c. Baseline 在测试集上评估
+   a. TimeClaw 在「train 列表」上跑探索（记录经验 + 触发蒸馏）— 默认指向官方较早段，非独立语料
+   b. TimeClaw 在「test 列表」上评估（使用学到的记忆，不写入）
+   c. Baseline 在同一 test 列表上评估
    d. 对比报告
 ```
+
+推荐实验叙事见根目录 `DATASET_USAGE.md`：**独立语料训练 + 官方 test 列表评测**；上表描述的是 **未改加载路径时** 的默认流水线。
 
 ---
 
@@ -582,11 +584,10 @@ Baseline 使用 MTBench 官方 prompt 直接调用 LLM（无工具），与 Time
 | finance_qa_short | 金融 | - | - | mcqa, correlation |
 | finance_qa_long | 金融 | - | - | mcqa, correlation |
 
-### 11.2 数据切分
+### 11.2 官方 processed 上的样本列表（历史目录 `data/splits/`）
 
-- 切分策略：按时间切割（而非随机），避免分布漂移
-- 比例：约 70% 训练，30% 测试
-- 保障：训练集和测试集无时间重叠
+- **机制**：对 **同一份** MTBench `data/processed` 全量，按时间写出两套文件名列表（约 70% 较早段 → `train_files.json`，余下 → `test_files.json`），供默认 `load_split` / `train_loop` / 评测使用。
+- **勿混淆**：这与 **独立训练语料**（`data_preparation/independent/`）是不同数据源；推荐设定是独立语料训练、官方 **test 列表** 评测（见 `DATASET_USAGE.md`）。
 
 ### 11.3 统一适配 (MTBenchSample)
 
@@ -684,7 +685,7 @@ TimeClaw/
 |   |   +-- pipeline_eval.py          # TimeClaw 评估
 |   |   +-- baseline_eval.py          # Baseline 评估
 |   |   +-- mtbench_adapter.py        # 数据集适配
-|   |   +-- dataset_split.py          # 时间切分
+|   |   +-- dataset_split.py          # 官方 processed 样本列表（train/test JSON）
 |   |   +-- train_loop.py            # 训练循环
 |   |   +-- skill_distill.py         # 技能蒸馏
 |   |   +-- metrics.py               # 评估指标
@@ -763,7 +764,7 @@ TimeClaw/
 +-- tests/                             # 测试套件
 +-- data/                              # 数据集
 |   +-- processed/                    # 预处理数据
-|   +-- splits/                       # 训练/测试切分
+|   +-- splits/                       # 官方样本文件名列表（历史目录名；非「唯一 train/test 定义」）
 +-- mtbench_official/                  # MTBench 官方评估
 +-- reports/                           # 报告
 +-- .timeclaw/                         # 运行时状态
@@ -843,7 +844,7 @@ TimeClaw/
 | MAX_SUB_REACT_STEPS | 5 | sub-agent 最大步数 |
 | MAX_CONCURRENT_SUBAGENTS | 4 | 最大并发 sub-agent 数 |
 | _DISTILL_BATCH | 30 | 每 30 条经验触发一次蒸馏 |
-| 训练/测试比 | 70/30 | 按时间切分 |
+| 官方列表时间边界 | ~70/30 | `train_files`/`test_files`（非项目唯一 train/test 定义） |
 | 工具总数 | 64 | 9 个类别 |
 
 ## 附录 B: 历史架构变迁
