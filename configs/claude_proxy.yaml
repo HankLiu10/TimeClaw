@@ -1,5 +1,6 @@
 # TimeClaw Configuration: GPT-5.4 via ai.changyou.club（当前主站 HTTPS）
 # 其它可选 api_base（自行改 llm.api_base 切换）:
+#   api_base: "http://47.245.26.38:8090/v1"
 #   api_base: "http://38.175.200.167:8090/v1"
 #   api_key: "sk-proj-89dy5lda8a188si2q9r5e1o4yv6xdrzo"  # 主key，今日额度已用完
 #   api_base: "http://160.202.238.42:48760/v1"
@@ -55,3 +56,15 @@ fusion:
 
 log_level: "INFO"
 workspace_dir: ".timeclaw"
+
+benchmark:
+  repo_root: "."
+  splits_dir: "data/splits"
+
+sbm:
+  device: "cuda:2"
+  devices:
+    chronos: "cuda:2"
+    timesfm: "cuda:2"
+    moirai: "cuda:3"
+    timer: "cuda:3"
