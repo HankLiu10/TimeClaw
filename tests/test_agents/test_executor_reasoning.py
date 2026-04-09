@@ -13,13 +13,23 @@ from timeclaw.llm.base import LLMResponse
 
 def _decision_response(parsed: dict) -> LLMResponse:
     if parsed.get("done", False):
-        args = {
-            "thought": parsed.get("thought", ""),
-            "answer_type": parsed.get("answer_type", ""),
-            "answer_json": json.dumps(parsed.get("answer"), ensure_ascii=False),
-            "confidence": parsed.get("confidence"),
-            "reasoning": parsed.get("reasoning", ""),
-        }
+        if parsed.get("answer_type") == "learning_summary":
+            answer = parsed.get("answer") or {}
+            args = {
+                "thought": parsed.get("thought", ""),
+                "insight": answer.get("insight", ""),
+                "recommendation": answer.get("recommendation", ""),
+                "confidence": parsed.get("confidence"),
+                "reasoning": parsed.get("reasoning", ""),
+            }
+        else:
+            args = {
+                "thought": parsed.get("thought", ""),
+                "answer_type": parsed.get("answer_type", ""),
+                "answer_json": json.dumps(parsed.get("answer"), ensure_ascii=False),
+                "confidence": parsed.get("confidence"),
+                "reasoning": parsed.get("reasoning", ""),
+            }
         return LLMResponse(
             text="",
             parsed=None,
@@ -1554,7 +1564,24 @@ def test_build_main_output_contract_section_omits_learning_summary_contract_outs
     )
 
     assert "learning_summary" not in text
-    assert "macd" in text
+
+
+def test_decision_tools_use_learning_summary_finish_schema_in_training_mode():
+    tools = ExecutorAgent._decision_tools(
+        allow_tool_call=True,
+        allow_finish=True,
+        finish_mode="learning_summary",
+    )
+
+    finish_tool = next(tool for tool in tools if tool["function"]["name"] == "emit_final_answer")
+    props = finish_tool["function"]["parameters"]["properties"]
+    required = finish_tool["function"]["parameters"]["required"]
+
+    assert "insight" in props
+    assert "recommendation" in props
+    assert "answer_json" not in props
+    assert "answer_type" not in props
+    assert required == ["thought", "insight", "recommendation", "confidence", "reasoning"]
 
 
 def test_is_valid_learning_summary_answer_requires_non_empty_insight_and_recommendation():
@@ -1880,6 +1907,44 @@ def test_coerce_structured_decision_maps_finish_response():
         "answer_type": "qa",
         "confidence": 0.9,
         "reasoning": "1. Evidence supports B.",
+    }
+
+
+def test_coerce_structured_decision_maps_learning_summary_finish_response():
+    response = LLMResponse(
+        text="",
+        parsed=None,
+        tool_calls=[{
+            "name": "emit_final_answer",
+            "arguments": {
+                "thought": "Reason: enough evidence. Action: finish with learning summary.",
+                "insight": "Chronos-2 branch won on the batch evaluation.",
+                "recommendation": "Prefer regime-aware forecast paths when the recent segment breaks from older structure.",
+                "confidence": 0.93,
+                "reasoning": "1. Three candidates were compared.\n2. Chronos-2 had the lowest error.",
+            },
+        }],
+        model="mock",
+    )
+
+    decision = ExecutorAgent._coerce_structured_decision(
+        response,
+        allow_tool_call=True,
+        allow_finish=True,
+        fallback_thought="parse failed",
+        finish_mode="learning_summary",
+    )
+
+    assert decision == {
+        "thought": "Reason: enough evidence. Action: finish with learning summary.",
+        "done": True,
+        "answer": {
+            "insight": "Chronos-2 branch won on the batch evaluation.",
+            "recommendation": "Prefer regime-aware forecast paths when the recent segment breaks from older structure.",
+        },
+        "answer_type": "learning_summary",
+        "confidence": 0.93,
+        "reasoning": "1. Three candidates were compared.\n2. Chronos-2 had the lowest error.",
     }
 
 

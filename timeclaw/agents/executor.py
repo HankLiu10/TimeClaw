@@ -361,6 +361,14 @@ class ExecutorAgent(AgentBase):
                     plan=plan,
                 ),
                 fallback_thought="LLM parse failed",
+                finish_mode=(
+                    "learning_summary"
+                    if (
+                        plan.get("_mode") == "train"
+                        and not bool(plan.get("_defer_learning_record", False))
+                    )
+                    else "task"
+                ),
             )
             expected_final_type = (
                 "learning_summary"
@@ -2494,6 +2502,7 @@ class ExecutorAgent(AgentBase):
                 allow_tool_call=True,
                 allow_finish=True,
                 fallback_thought="parse failed",
+                finish_mode="task",
             )
             thought = decision.get("thought", "")
             parse_failed = bool(decision.get("_parse_failed"))
@@ -3972,6 +3981,7 @@ class ExecutorAgent(AgentBase):
         *,
         allow_tool_call: bool,
         allow_finish: bool,
+        finish_mode: str = "task",
     ) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         if allow_tool_call:
@@ -3997,6 +4007,33 @@ class ExecutorAgent(AgentBase):
                 },
             })
         if allow_finish:
+            if finish_mode == "learning_summary":
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": _DECISION_FINISH,
+                        "description": "Emit the single training learning summary to finish the current turn.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "thought": {"type": "string"},
+                                "insight": {
+                                    "type": "string",
+                                    "description": "A short factual summary of which explored path won and why.",
+                                },
+                                "recommendation": {
+                                    "type": "string",
+                                    "description": "A short reusable lesson or cautionary failure pattern, not the task payload.",
+                                },
+                                "confidence": {"type": "number"},
+                                "reasoning": {"type": "string"},
+                            },
+                            "required": ["thought", "insight", "recommendation", "confidence", "reasoning"],
+                            "additionalProperties": False,
+                        },
+                    },
+                })
+                return tools
             tools.append({
                 "type": "function",
                 "function": {
@@ -4054,6 +4091,7 @@ class ExecutorAgent(AgentBase):
         allow_tool_call: bool,
         allow_finish: bool,
         fallback_thought: str,
+        finish_mode: str = "task",
     ) -> dict[str, Any]:
         tool_calls = getattr(response, "tool_calls", None) or []
         if len(tool_calls) != 1:
@@ -4066,6 +4104,7 @@ class ExecutorAgent(AgentBase):
                 legacy,
                 allow_tool_call=allow_tool_call,
                 allow_finish=allow_finish,
+                finish_mode=finish_mode,
             )
             if normalized is not None:
                 return normalized
@@ -4091,6 +4130,31 @@ class ExecutorAgent(AgentBase):
                 "args": arguments.get("args") if isinstance(arguments.get("args"), dict) else {},
             }
         if name == _DECISION_FINISH and allow_finish:
+            if finish_mode == "learning_summary":
+                insight = arguments.get("insight")
+                recommendation = arguments.get("recommendation")
+                reasoning = arguments.get("reasoning")
+                if not (
+                    isinstance(insight, str)
+                    and isinstance(recommendation, str)
+                    and isinstance(reasoning, str)
+                ):
+                    return {
+                        "done": False,
+                        "_parse_failed": True,
+                        "thought": "invalid_learning_summary_payload",
+                    }
+                return {
+                    "thought": str(arguments.get("thought") or ""),
+                    "done": True,
+                    "answer": {
+                        "insight": insight,
+                        "recommendation": recommendation,
+                    },
+                    "answer_type": "learning_summary",
+                    "confidence": arguments.get("confidence"),
+                    "reasoning": reasoning,
+                }
             answer_json = arguments.get("answer_json")
             if not isinstance(answer_json, str):
                 return {
@@ -4116,12 +4180,14 @@ class ExecutorAgent(AgentBase):
             }
         return {"done": False, "_parse_failed": True, "thought": fallback_thought}
 
-    @staticmethod
+    @classmethod
     def _normalize_legacy_decision_payload(
+        cls,
         decision: dict[str, Any],
         *,
         allow_tool_call: bool,
         allow_finish: bool,
+        finish_mode: str = "task",
     ) -> dict[str, Any] | None:
         if not isinstance(decision, dict) or decision.get("_parse_failed"):
             return None
@@ -4138,6 +4204,9 @@ class ExecutorAgent(AgentBase):
                 return None
             if "tool" in decision or "args" in decision:
                 return None
+            if finish_mode == "learning_summary":
+                if answer_type != "learning_summary" or not cls._is_valid_learning_summary_answer(answer):
+                    return None
             return {
                 "thought": thought,
                 "done": True,
@@ -4167,12 +4236,14 @@ class ExecutorAgent(AgentBase):
         allow_tool_call: bool,
         allow_finish: bool,
         fallback_thought: str,
+        finish_mode: str = "task",
     ) -> tuple[Any, dict[str, Any]]:
         response = await self.llm.complete_with_tools(
             conversation,
             tools=self._decision_tools(
                 allow_tool_call=allow_tool_call,
                 allow_finish=allow_finish,
+                finish_mode=finish_mode,
             ),
             tool_choice="required",
         )
@@ -4181,6 +4252,7 @@ class ExecutorAgent(AgentBase):
             allow_tool_call=allow_tool_call,
             allow_finish=allow_finish,
             fallback_thought=fallback_thought,
+            finish_mode=finish_mode,
         )
         return response, decision
 
