@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -79,3 +80,52 @@ async def test_complete_with_tools_recovers_proxy_degraded_tool_call():
         "arguments": {"thought": "t", "tool": "noop", "args": {"x": 1}},
     }]
     assert parsed.parsed == {"thought": "t", "tool": "noop", "args": {"x": 1}}
+
+
+@pytest.mark.asyncio
+async def test_complete_with_tools_native_openai_forwards_tool_choice_and_parallel_flag():
+    backend = LLMBackend(
+        default_model="openai/gpt-5.4",
+        fallback_model=None,
+        api_base="https://example.invalid/v1",
+        api_key="test-key",
+    )
+
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = ""
+    response.choices[0].message.tool_calls = [
+        SimpleNamespace(
+            function=SimpleNamespace(
+                name="emit_tool_call",
+                arguments='{"thought":"t","tool":"noop","args":{"x":1}}',
+            )
+        )
+    ]
+    response.usage = None
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=AsyncMock(return_value=response))
+            )
+
+    fake_client = _FakeClient()
+    backend._oai_client = fake_client
+
+    parsed = await backend.complete_with_tools(
+        [{"role": "user", "content": "test"}],
+        tools=_tool_specs(),
+        model="openai/gpt-5.4",
+        tool_choice="required",
+        parallel_tool_calls=False,
+    )
+
+    create_call = fake_client.chat.completions.create
+    kwargs = create_call.await_args.kwargs
+    assert kwargs["tool_choice"] == "required"
+    assert kwargs["parallel_tool_calls"] is False
+    assert parsed.tool_calls == [{
+        "name": "emit_tool_call",
+        "arguments": {"thought": "t", "tool": "noop", "args": {"x": 1}},
+    }]
