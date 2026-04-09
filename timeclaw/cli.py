@@ -68,7 +68,10 @@ async def _cmd_run(args: Any) -> None:
     discover_and_register()
 
     from timeclaw.clawhub.tool_registry import get_tool_instance
-    model_name = args.model or "chronos"
+    raw_model_name = str(args.model or "chronos2").strip()
+    if raw_model_name in {"", "auto"}:
+        raw_model_name = "chronos2"
+    model_name = raw_model_name
     tool_name = f"{model_name}_forecast"
     tool = get_tool_instance(tool_name)
     result = await tool.execute(

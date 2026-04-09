@@ -99,13 +99,34 @@ def test_modality_filtered_tool_names_respect_required_modalities():
     assert "temporal_align_text" in text_tools
     assert "temporal_align_text" not in ts_only_tools
 
+
+def test_executor_tool_catalog_includes_descriptions_and_required_args():
+    from timeclaw.clawhub.tool_registry import discover_and_register
+
+    discover_and_register()
+    catalog = executor_prompt.build_tool_name_text(
+        ["window_stats", "spawn_subagent", "evaluate_against_gt", "evaluate_batch_against_gt"]
+    )
+
+    assert "- window_stats:" in catalog
+    assert "Required args:" in catalog
+    assert "start<integer> required" in catalog
+    assert "end<integer> required" in catalog
+    assert "- spawn_subagent:" in catalog
+    assert "tasks<array> required" in catalog
+    assert "- evaluate_against_gt:" in catalog
+    assert "task_type<string> required" in catalog
+    assert "- evaluate_batch_against_gt:" in catalog
+    assert "framework will auto-fill them" in catalog
+
+
 def test_build_task_description_uses_full_prompt_template():
     sample = load_split("weather_aligned_short", "test")[0]
     description = build_task_description(sample, "forecast")
 
-    assert description.startswith("System prompt:\nYou are a weather forecasting AI.")
-    assert "User prompt:\nThe input time-series represents temperature readings." in description
-    assert "Return ONLY a JSON array of 24 numbers, nothing else." in description
+    assert description.startswith("User prompt:\nYou are a weather forecasting AI.")
+    assert "The input time series represents temperature readings" in description
+    assert "Predicted Temperatures: value1, value2, ..., valueN." in description
 
 
 def test_build_task_description_finance_indicator_tasks_are_split():
@@ -113,7 +134,8 @@ def test_build_task_description_finance_indicator_tasks_are_split():
     macd_description = build_task_description(sample, "indicator_macd")
     bb_description = build_task_description(sample, "indicator_upper_bb")
 
-    assert 'Return ONLY a JSON object: {"macd": number}' in macd_description
-    assert 'Return ONLY a JSON object: {"upper_bb": number}' not in macd_description
-    assert 'Return ONLY a JSON object: {"upper_bb": number}' in bb_description
-    assert 'Return ONLY a JSON object: {"macd": number}' not in bb_description
+    assert "Predict the future Moving Average Convergence Divergence (MACD) values" in macd_description
+    assert "estimated upper Bollinger Band (BB) values values" not in macd_description
+    assert "estimated upper Bollinger Band (BB) values values" not in bb_description
+    assert "estimated upper Bollinger Band (BB) values" in bb_description
+    assert "Predict the future Moving Average Convergence Divergence (MACD) values" not in bb_description

@@ -52,7 +52,7 @@ class LLMBackend:
     def __init__(
         self,
         default_model: str = "ollama/qwen3:8b",
-        fallback_model: str | None = "gpt-4o-mini",
+        fallback_model: str | None = None,
         temperature: float = 0.1,
         max_tokens: int = 4096,
         max_retries: int = 3,
@@ -307,7 +307,10 @@ class LLMBackend:
         for attempt in range(_MAX_RETRIES):
             try:
                 response = await litellm.acompletion(**call_kwargs)
-                return self._parse_response(response, target_model)
+                parsed = self._parse_response(response, target_model)
+                self._hydrate_textual_tool_calls(parsed, tools)
+                trace.llm_call(target_model, messages, parsed, response_format="tool_call")
+                return parsed
             except Exception as e:
                 if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
                     delay = _RETRY_BASE_DELAY * (2 ** attempt)
@@ -322,7 +325,10 @@ class LLMBackend:
                     call_kwargs["model"] = self.fallback_model
                     try:
                         response = await litellm.acompletion(**call_kwargs)
-                        return self._parse_response(response, self.fallback_model)
+                        parsed = self._parse_response(response, self.fallback_model)
+                        self._hydrate_textual_tool_calls(parsed, tools)
+                        trace.llm_call(self.fallback_model, messages, parsed, response_format="tool_call")
+                        return parsed
                     except Exception as e2:
                         logger.error(f"Fallback tool call also failed: {e2}")
                 return LLMResponse(text=None, model=target_model)
@@ -354,6 +360,7 @@ class LLMBackend:
                     response = await self._stream_to_completion(
                         client, oai_kwargs, raw_model)
                 parsed = self._parse_response(response, model)
+                self._hydrate_textual_tool_calls(parsed, tools)
                 if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
                     logger.warning(
                         f"Tool call {model} attempt {attempt+1}: empty response, "
@@ -361,6 +368,7 @@ class LLMBackend:
                     )
                     await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
                     continue
+                trace.llm_call(model, messages, parsed, response_format="tool_call")
                 return parsed
             except Exception as e:
                 if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
@@ -374,7 +382,10 @@ class LLMBackend:
                 try:
                     response = await self._stream_to_completion(
                         client, oai_kwargs, raw_model)
-                    return self._parse_response(response, model)
+                    parsed = self._parse_response(response, model)
+                    self._hydrate_textual_tool_calls(parsed, tools)
+                    trace.llm_call(model, messages, parsed, response_format="tool_call")
+                    return parsed
                 except Exception:
                     pass
                 logger.warning(f"Tool call to {model} failed: {e}")
@@ -417,6 +428,67 @@ class LLMBackend:
         return call_kwargs
 
     @staticmethod
+    def _tool_names_from_specs(tools: list[dict[str, Any]]) -> list[str]:
+        names: list[str] = []
+        for spec in tools or []:
+            if not isinstance(spec, dict):
+                continue
+            fn = spec.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = str(fn.get("name") or "").strip()
+            if name:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def _recover_textual_tool_call(
+        text: str | None,
+        *,
+        allowed_tool_names: list[str],
+    ) -> list[dict[str, Any]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+
+        for name in sorted(allowed_tool_names, key=len, reverse=True):
+            if not raw.startswith(name):
+                continue
+            suffix = raw[len(name):].lstrip()
+            if not suffix or suffix[0] not in "{[":
+                continue
+            try:
+                decoder = json.JSONDecoder()
+                arguments, end = decoder.raw_decode(suffix)
+            except Exception:
+                continue
+            trailing = suffix[end:].strip()
+            if trailing:
+                return []
+            if not isinstance(arguments, dict):
+                return []
+            return [{"name": name, "arguments": arguments}]
+        return []
+
+    @classmethod
+    def _hydrate_textual_tool_calls(
+        cls,
+        response: LLMResponse,
+        tools: list[dict[str, Any]],
+    ) -> None:
+        if response.tool_calls:
+            return
+        recovered = cls._recover_textual_tool_call(
+            response.text,
+            allowed_tool_names=cls._tool_names_from_specs(tools),
+        )
+        if not recovered:
+            return
+        response.tool_calls = recovered
+        if response.parsed is None:
+            response.parsed = recovered[0]["arguments"]
+
+    @staticmethod
     def _extract_json(text: str) -> dict[str, Any] | list | None:
         """Best-effort JSON extraction: raw text, markdown fences, or first {/[ block."""
         import re
@@ -452,6 +524,61 @@ class LLMBackend:
         return None
 
     @staticmethod
+    def _usage_to_dict(usage_obj: Any) -> dict[str, Any]:
+        if not usage_obj:
+            return {}
+        raw: Any = usage_obj
+        if hasattr(usage_obj, "model_dump"):
+            try:
+                raw = usage_obj.model_dump(mode="python")
+            except TypeError:
+                raw = usage_obj.model_dump()
+        elif hasattr(usage_obj, "dict"):
+            try:
+                raw = usage_obj.dict()
+            except Exception:
+                raw = usage_obj
+        elif hasattr(usage_obj, "__dict__"):
+            raw = {
+                key: value
+                for key, value in vars(usage_obj).items()
+                if not str(key).startswith("_")
+            }
+
+        def _coerce(value: Any) -> Any:
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, dict):
+                return {str(k): _coerce(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_coerce(v) for v in value]
+            if hasattr(value, "model_dump"):
+                try:
+                    return _coerce(value.model_dump(mode="python"))
+                except TypeError:
+                    return _coerce(value.model_dump())
+            if hasattr(value, "dict"):
+                try:
+                    return _coerce(value.dict())
+                except Exception:
+                    return str(value)
+            if hasattr(value, "__dict__"):
+                return _coerce({
+                    key: val
+                    for key, val in vars(value).items()
+                    if not str(key).startswith("_")
+                })
+            return str(value)
+
+        usage = _coerce(raw)
+        if not isinstance(usage, dict):
+            return {"raw_usage": usage}
+        usage.setdefault("prompt_tokens", getattr(usage_obj, "prompt_tokens", 0) or 0)
+        usage.setdefault("completion_tokens", getattr(usage_obj, "completion_tokens", 0) or 0)
+        usage.setdefault("total_tokens", getattr(usage_obj, "total_tokens", 0) or 0)
+        return usage
+
+    @staticmethod
     def _parse_response(response: Any, model: str) -> LLMResponse:
         if not getattr(response, "choices", None):
             logger.warning(f"Empty choices from {model}")
@@ -476,11 +603,7 @@ class LLMBackend:
 
         usage = {}
         if hasattr(response, "usage") and response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens or 0,
-                "completion_tokens": response.usage.completion_tokens or 0,
-                "total_tokens": response.usage.total_tokens or 0,
-            }
+            usage = LLMBackend._usage_to_dict(response.usage)
 
         return LLMResponse(
             text=text,

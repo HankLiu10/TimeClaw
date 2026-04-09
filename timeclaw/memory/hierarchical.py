@@ -6,31 +6,30 @@ SOUL.md (fixed, human-written):
     Agent identity and behavioral guidelines.  Corresponds to OpenClaw SOUL.md.
     Not learned — maintained by developers.
 
-Daily Notes (auto-recorded):
+Notes (auto-recorded):
     Natural-language summaries of each pipeline run + outcome.
-    Append-only, stored as daily log files as raw experience records.
-    Corresponds to OpenClaw memory/YYYY-MM-DD.md.
+    Append-only, stored as scope-sharded raw experience records.
 
-MEMORY (auto-distilled from daily notes):
+MEMORY (auto-distilled from notes):
     LLM-distilled causal attributions explaining WHY certain patterns of
-    success/failure occur.  Scoped to (domain, task).  Additionally holds
-    a special ``cross_domain`` scope for universal operating strategies
-    distilled across all scopes (replaces the former PRINCIPLES layer).
+    success/failure occur.  Scoped to ``scope_key``.  Additionally holds
+    task-bucket ``cross_domain`` scopes for universal operating strategies
+    distilled across corresponding scopes.
     Corresponds to OpenClaw MEMORY.md, but auto-distilled rather than
     manually curated.
 
-TOOLS.md (auto-distilled from daily notes):
-    Per-tool usage notes learned from experience — when each tool works
-    well or poorly, helping the agent distinguish between functionally
-    similar tools.  Corresponds to OpenClaw TOOLS.md.
+TOOLS.md (auto-distilled from notes):
+    Per-scope per-tool usage notes learned from experience — when each
+    tool works well or poorly for that scope, helping the agent distinguish
+    between functionally similar tools under the current task boundary.
 
 SKILLS/ (auto-distilled from MEMORY):
     Scene-specific SOPs (Standard Operating Procedures) per (domain, task).
     Step-by-step operational guides.  Corresponds to OpenClaw SKILLS.md.
 
 Distillation chain:
-    Daily Notes  ──→  MEMORY (per-scope + cross_domain)
-                 └──→  TOOLS.md
+    Notes  ──→  MEMORY (per-scope + task-bucket cross_domain)
+                 └──→  TOOLS.md (per-scope cards)
                  └──→  SKILLS/
 
 New definition:
@@ -39,7 +38,7 @@ New definition:
     name directly, for example ``weather_aligned_short_forecast``.
 
 New definition:
-    ``Daily Notes`` are now a distillation-source layer only. They remain
+    ``Notes`` are now a distillation-source layer only. They remain
     append-only raw records used to distill MEMORY / TOOLS / SKILLS, but
     they are no longer injected directly into the agent prompt and no
     longer rely on a vector-store retrieval path.
@@ -48,6 +47,9 @@ New definition:
 from __future__ import annotations
 
 import asyncio
+from contextvars import copy_context
+from difflib import SequenceMatcher
+import hashlib
 import json
 import re
 import time
@@ -57,14 +59,21 @@ from typing import Any
 
 from loguru import logger
 
+from timeclaw.core import trace_logger as trace
+from timeclaw.core.learning_text import normalize_learning_clause
+
 MEMORY_ROOT = Path(".timeclaw/hierarchical_memory")
-DAILY_DIR = MEMORY_ROOT / "daily"
+NOTES_DIR = MEMORY_ROOT / "notes"
 MEMORY_DIR = MEMORY_ROOT / "memory"
 TOOLS_FILE = MEMORY_ROOT / "TOOLS.md"
 SKILLS_DIR = MEMORY_ROOT / "skills"
+STATE_DIR = MEMORY_ROOT / "state"
+DISTILL_STATE_FILE = STATE_DIR / "distill_state.json"
+HISTORY_DIR = MEMORY_ROOT / "history"
 SOUL_FILE = Path("timeclaw/memory/SOUL.md")
 
 CROSS_DOMAIN_SCOPE = "cross_domain"
+CROSS_DOMAIN_SCOPE_PREFIX = "cross_domain__"
 _FRAMEWORK_TOOLS = {
     "evaluate_against_gt",
     "evaluate_batch_against_gt",
@@ -72,29 +81,122 @@ _FRAMEWORK_TOOLS = {
     "spawn_subagent",
     "none",
 }
+_NOTE_VALIDATION_TOOLS = {
+    "consistency_check",
+    "bound_check",
+    "evaluate_against_gt",
+    "evaluate_batch_against_gt",
+    "batch_evaluate_against_gt",
+}
+_TOOL_NAME_ALIASES = {
+    "multimodal_classifier": "llm_reasoning_classification",
+    "reasoning_based_multimodal_classification": "llm_reasoning_classification",
+    "direct_indicator_reasoning": "llm_reasoning_indicator",
+    "reasoning_based_indicator_analysis": "llm_reasoning_indicator",
+    "context_aware_forecast": "llm_reasoning_forecast",
+    "multimodal_qa": "llm_reasoning_qa",
+}
 
-_DISTILL_L1_TO_L2 = 2
-_DISTILL_L2_TO_CROSS = 20
+# New definition:
+# - `scoped note count`: number of note blocks written for one exact scope_key
+# - `global note count`: total number of note blocks across all scopes
+#
+# Distillation cadence:
+# - Notes -> MEMORY: whenever one scope accumulates at least 5 undistilled notes
+# - MEMORY -> SKILLS / TOOLS / cross_domain: rebuild from the latest full MEMORY
+#   view when their source fingerprint changes
+_DISTILL_L1_TO_L2 = 5
+_MEMORY_RULE_CAP = 30
 _L1_RETRIEVAL_K = 5
 
 
+def _task_bucket_from_scope(scope: str) -> str:
+    scope_name = str(scope).strip()
+    if not scope_name:
+        return ""
+    if scope_name.startswith(CROSS_DOMAIN_SCOPE_PREFIX):
+        return scope_name[len(CROSS_DOMAIN_SCOPE_PREFIX):].strip()
+    parts = scope_name.split("_", 1)
+    if len(parts) == 2 and parts[0] in {"weather", "finance"}:
+        return parts[1].strip()
+    return scope_name
+
+
+def _cross_domain_scope_for_bucket(bucket: str) -> str:
+    bucket_name = str(bucket).strip()
+    return f"{CROSS_DOMAIN_SCOPE_PREFIX}{bucket_name}" if bucket_name else CROSS_DOMAIN_SCOPE
+
+
+def _cross_domain_scope_for_scope(scope: str) -> str:
+    return _cross_domain_scope_for_bucket(_task_bucket_from_scope(scope))
+
+
+def _is_cross_domain_scope(scope: str) -> bool:
+    scope_name = str(scope).strip()
+    return scope_name == CROSS_DOMAIN_SCOPE or scope_name.startswith(CROSS_DOMAIN_SCOPE_PREFIX)
+
+
+def _available_tool_names() -> set[str]:
+    try:
+        from timeclaw.clawhub.tool_registry import discover_and_register, list_tool_instances
+
+        tools = list_tool_instances()
+        if not tools:
+            discover_and_register()
+            tools = list_tool_instances()
+        return {t.name for t in tools}
+    except Exception:
+        return set()
+
+
+def _canonicalize_tool_list(tool_names: list[str]) -> list[str]:
+    available = _available_tool_names()
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_name in tool_names:
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        key = re.sub(r"\s+", "_", name.lower())
+        canonical = _TOOL_NAME_ALIASES.get(key, name)
+        if canonical not in available:
+            continue
+        if canonical in _FRAMEWORK_TOOLS or canonical in seen:
+            continue
+        seen.add(canonical)
+        out.append(canonical)
+    return out
+
+
 # ═══════════════════════════════════════════════════════════════════════
-# Daily Notes (append-only experience log, distillation source only)
+# Notes (append-only experience log, distillation source only)
 # ═══════════════════════════════════════════════════════════════════════
 
-class DailyNotes:
-    """Append-only natural-language note store used as distillation source."""
+class Notes:
+    """Append-only natural-language note store used as distillation source.
+
+    New definition:
+    - `Notes` is the raw note collection/layer name
+    - one individual record is still called a `note`
+    - storage is scope-sharded on disk under `notes/<scope>.md`
+    """
 
     def __init__(self):
-        DAILY_DIR.mkdir(parents=True, exist_ok=True)
+        NOTES_DIR.mkdir(parents=True, exist_ok=True)
         self._total_count = self._count_notes_on_disk()
+        self._scope_counts = self._count_scope_notes_on_disk()
         self._pending: list[dict[str, Any]] = []
-        self._lock = asyncio.Lock()
+        self._scope_locks: dict[str, asyncio.Lock] = {}
+        self._lock_registry_lock = asyncio.Lock()
+        self._counts_lock = asyncio.Lock()
         self._note_llm = None
 
     @property
     def total(self) -> int:
         return self._total_count
+
+    def scoped_total(self, scope: str) -> int:
+        return int(self._scope_counts.get(scope, 0) or 0)
 
     async def _get_llm(self):
         if self._note_llm is None:
@@ -107,19 +209,92 @@ class DailyNotes:
 
     async def add(self, run_context: dict[str, Any]) -> int:
         note_text = self._build_note(run_context)
-        self._append_to_daily_log(note_text, run_context)
+        scope = str(run_context.get("scope_key", "")).strip()
+        scope_lock = await self._scope_lock(scope)
 
-        async with self._lock:
-            self._total_count += 1
-            return self._total_count
+        async with scope_lock:
+            self._append_to_scope_log(note_text, run_context)
+            async with self._counts_lock:
+                self._total_count += 1
+                if scope:
+                    self._scope_counts[scope] = self._scope_counts.get(scope, 0) + 1
+                return self._total_count
+
+    async def _scope_lock(self, scope: str) -> asyncio.Lock:
+        scope_name = scope or "__default__"
+        async with self._lock_registry_lock:
+            lock = self._scope_locks.get(scope_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._scope_locks[scope_name] = lock
+            return lock
+
+    @staticmethod
+    def _scope_storage_name(scope: str) -> str:
+        scope_name = str(scope).strip() or "__default__"
+        return re.sub(r"[^A-Za-z0-9_.-]+", "__", scope_name)
+
+    @classmethod
+    def _scope_log_path(cls, scope: str) -> Path:
+        return NOTES_DIR / f"{cls._scope_storage_name(scope)}.md"
 
     @staticmethod
     def _count_notes_on_disk() -> int:
         total = 0
-        for path in DAILY_DIR.glob("*.md"):
+        for path in NOTES_DIR.glob("*.md"):
             text = path.read_text()
             total += sum(1 for block in text.split("\n### ") if block.strip())
         return total
+
+    @classmethod
+    def _count_scope_notes_on_disk(cls) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for path in NOTES_DIR.glob("*.md"):
+            for item in cls._note_items_from_text(path.name, path.read_text()):
+                scope = cls._extract_scope_from_note_block(item["text"])
+                if scope:
+                    counts[scope] = counts.get(scope, 0) + 1
+        return counts
+
+    @staticmethod
+    def _stable_note_id(file_name: str, note: str) -> str:
+        payload = f"{file_name}\n{note}".encode("utf-8", errors="ignore")
+        return hashlib.sha1(payload).hexdigest()[:16]
+
+    @classmethod
+    def _note_items_from_text(cls, file_name: str, text: str) -> list[dict[str, str]]:
+        items: list[dict[str, str]] = []
+        for raw in reversed(text.split("\n### ")):
+            note = raw.strip()
+            if not note:
+                continue
+            items.append({
+                "id": cls._stable_note_id(file_name, note),
+                "text": note,
+            })
+        return items
+
+    @staticmethod
+    def _extract_scope_from_note_block(note: str) -> str:
+        lines = note.splitlines()
+        for idx, line in enumerate(lines):
+            if line.strip() == "Scope:" and idx + 1 < len(lines):
+                scope = lines[idx + 1].strip()
+                if scope:
+                    return scope
+        first_content = ""
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                first_content = stripped
+                break
+        match = re.match(r"(?:###\s*)?(?:\[[^\]]+\]\s+)?([^\n]+?)\s+[—-]\s+(OK|FAIL|SCORED|LOGGED)\s*$", first_content)
+        if match:
+            return match.group(1).strip()
+        inline = re.match(r"\[([^\]]+)\]\s+(?:OK|FAIL|SCORED|LOGGED)\b", first_content)
+        if inline:
+            return inline.group(1).strip()
+        return ""
 
     def _build_note(self, ctx: dict[str, Any]) -> str:
         scope = ctx.get("scope_key", "")
@@ -140,13 +315,33 @@ class DailyNotes:
 
         candidate_traces = ctx.get("candidate_traces") or []
         tools = self._winner_tools_for_note(ctx.get("tool_chain", []), candidate_traces)
+        winner_generators, winner_validators = self._split_tool_roles(tools)
         approaches = self._format_approaches(candidate_traces)
         candidates = self._format_candidates(candidate_traces)
+        task_prompt, numeric_block, _text_block = self._task_prompt_blocks(description)
+        source_lines = self._source_lines(ctx)
 
         scope_label = scope or f"{domain}/{task}"
         lines = [f"[{scope_label}] {outcome}", "", "Scope:", scope_label]
-        if description:
-            lines.extend(["", "Task:", self._task_without_long_text(description)])
+        if source_lines:
+            lines.extend(["", "Source:"])
+            lines.extend(source_lines)
+        if task_prompt:
+            lines.extend([
+                "",
+                "Task Prompt:",
+                "[TASK_PROMPT_BEGIN]",
+                task_prompt,
+                "[TASK_PROMPT_END]",
+            ])
+        if numeric_block:
+            lines.extend([
+                "",
+                "Numeric Time Series:",
+                "[NUMERIC_TIME_SERIES_BEGIN]",
+                numeric_block,
+                "[NUMERIC_TIME_SERIES_END]",
+            ])
         text_signals = self._select_text_signals(
             description=description,
             task=task,
@@ -155,16 +350,17 @@ class DailyNotes:
         if text_signals:
             lines.extend(["", "Text Signals:"])
             lines.extend(f"- {item}" for item in text_signals)
-        lines.extend(["", "Winner Tool:"])
-        if tools:
-            lines.extend(f"- {tool}" for tool in tools[:20])
+        lines.extend(["", "Winner Tools:"])
+        winner_tools = winner_generators + winner_validators
+        if winner_tools:
+            lines.extend(f"- {tool}" for tool in winner_tools[:20])
         else:
             lines.append("- none")
         lines.extend(["", "Prediction:", predicted])
         if metric_items:
             lines.extend(["", "Metrics:"])
             lines.extend(
-                f"- {key}: {value:.4f}" for key, value in metric_items
+                f"- {key}: {value:.3f}" for key, value in metric_items
             )
         if fingerprint:
             lines.extend(["", "Fingerprint:", fingerprint])
@@ -172,12 +368,218 @@ class DailyNotes:
             lines.extend(["", "Approaches:"])
             lines.extend(f"- {item}" for item in approaches[:5])
         if candidates:
-            lines.extend(["", "Candidates:"])
-            lines.extend(candidates[:4])
+            lines.extend(["", "Candidates:", "[CANDIDATES_BEGIN]"])
+            lines.extend(candidates[:3])
+            lines.append("[CANDIDATES_END]")
         rendered_summary = self._analysis_without_text_signals(pipeline_summary, bool(text_signals))
         if rendered_summary:
-            lines.extend(["", "Analysis:", rendered_summary])
+            lines.extend(["", "Analysis:", "[ANALYSIS_BEGIN]", rendered_summary, "[ANALYSIS_END]"])
         return "\n".join(lines)
+
+    @staticmethod
+    def _source_lines(ctx: dict[str, Any]) -> list[str]:
+        source = ctx.get("source_metadata") or {}
+        if not isinstance(source, dict):
+            source = {}
+        dataset_name = str(source.get("dataset_name", "")).strip()
+        sample_ref = str(source.get("sample_ref", "")).strip()
+        source_file = str(source.get("source_file", "")).strip()
+        sample_idx = source.get("sample_idx")
+        task_name = str(source.get("task_name", "")).strip()
+        trace_id = str(ctx.get("trace_id") or source.get("trace_id") or "").strip()
+
+        lines: list[str] = []
+        if dataset_name:
+            lines.append(f"- Dataset: {dataset_name}")
+        if sample_ref:
+            lines.append(f"- Sample Ref: {sample_ref}")
+        if source_file:
+            lines.append(f"- Source File: {source_file}")
+        if isinstance(sample_idx, int):
+            lines.append(f"- Sample Index: {sample_idx}")
+        if task_name:
+            lines.append(f"- Task: {task_name}")
+        if trace_id:
+            lines.append(f"- Trace ID: {trace_id}")
+            lines.append(f"- Trace Path: .timeclaw/traces/{trace_id}.jsonl")
+        return lines
+
+    @classmethod
+    def _split_tool_roles(cls, tools: list[str]) -> tuple[list[str], list[str]]:
+        generators: list[str] = []
+        validators: list[str] = []
+        for raw_tool in tools:
+            tool = str(raw_tool).strip()
+            if not tool:
+                continue
+            if tool in _NOTE_VALIDATION_TOOLS:
+                validators.append(tool)
+            else:
+                generators.append(tool)
+        return generators, validators
+
+    @classmethod
+    def _task_prompt_blocks(cls, description: str) -> tuple[str, str, str]:
+        compact = cls._task_without_long_text(description).strip()
+        if not compact:
+            return "", "", ""
+
+        numeric_match = cls._extract_numeric_series_block(description)
+        text_match = cls._extract_text_context_block(description)
+
+        if numeric_match:
+            placeholder = f"{numeric_match['label']}\n[see Numeric Time Series block below]\n"
+            compact = compact.replace(str(numeric_match["full_text"]), placeholder, 1)
+        if text_match:
+            placeholder = f"{text_match['label']}\n[see Text Context block below]\n"
+            compact = compact.replace(str(text_match["full_text"]), placeholder, 1)
+
+        compact = re.sub(r"\n{3,}", "\n\n", compact).strip()
+        numeric_block = cls._render_extracted_block(numeric_match)
+        task_prompt = cls._compact_task_prompt(compact)
+        return task_prompt, numeric_block, ""
+
+    @staticmethod
+    def _compact_task_prompt(compact_prompt: str, max_lines: int = 6) -> str:
+        if not isinstance(compact_prompt, str) or not compact_prompt.strip():
+            return ""
+
+        text = compact_prompt.replace("\r", "\n")
+        if "\n\nUser prompt:\n" in text:
+            _system, user_text = text.split("\n\nUser prompt:\n", 1)
+        else:
+            user_text = text
+        user_text = re.sub(r"\[see Text Context block below\]", "[see Text Signals below]", user_text)
+        user_text = re.sub(r"\s+", " ", user_text).strip()
+        if not user_text:
+            return ""
+
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", user_text)
+            if sentence.strip()
+        ]
+        if not sentences:
+            sentences = [user_text]
+
+        selected: list[str] = []
+        seen: set[str] = set()
+        priority_patterns = [
+            r"\byour task is\b",
+            r"\binput time series\b|\bstock price\b|\btemperature readings\b|\btime series spans\b|\bestimation period\b",
+            r"\bevery 24\b|\bcompare\b|\bcalculate\b|\bclassify\b|\bthreshold\b|\bnext[- ]day\b",
+            r"\breturn\b|\boutput\b|\bensure the output\b|\bnumber of\b|\bjson\b",
+        ]
+        for pattern in priority_patterns:
+            for sentence in sentences:
+                lower = sentence.lower()
+                if re.search(pattern, lower) and sentence not in seen:
+                    selected.append(sentence)
+                    seen.add(sentence)
+                    if len(selected) >= max_lines:
+                        break
+            if len(selected) >= max_lines:
+                break
+
+        for sentence in sentences:
+            if len(selected) >= max_lines:
+                break
+            if sentence not in seen:
+                selected.append(sentence)
+                seen.add(sentence)
+
+        return "\n".join(f"- {item}" for item in selected[:max_lines])
+
+    @staticmethod
+    def _render_extracted_block(block: dict[str, str] | None) -> str:
+        if not isinstance(block, dict):
+            return ""
+        label = str(block.get("label", "")).strip()
+        body = str(block.get("body", "")).strip()
+        if label and body:
+            return f"{label}\n{body}"
+        return body or label
+
+    @classmethod
+    def _extract_numeric_series_block(cls, description: str) -> dict[str, str] | None:
+        if not isinstance(description, str) or not description.strip():
+            return None
+
+        explicit_patterns = [
+            r"(?P<label>The input prices are:)\s*(?P<body>\[(?:[^\[\]]|\n)+?\])",
+            r"(?P<label>The input temperature readings are:)\s*(?P<body>\[(?:[^\[\]]|\n)+?\])",
+            r"(?P<label>(?:\d+-day )?temperature time series[^\n:]*:)\s*(?P<body>\[(?:[^\[\]]|\n)+?\])",
+            r"(?P<label>stock price of .*?:)\s*(?P<body>\[(?:[^\[\]]|\n)+?\])",
+        ]
+        for pattern in explicit_patterns:
+            match = re.search(pattern, description, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return {
+                    "label": str(match.group("label")).strip(),
+                    "body": str(match.group("body")).strip(),
+                    "full_text": str(match.group(0)),
+                }
+
+        match = re.search(
+            r"\[(?:\s*-?\d+(?:\.\d+)?\s*,){4,}\s*-?\d+(?:\.\d+)?\s*\]",
+            description,
+            flags=re.DOTALL,
+        )
+        if not match:
+            return None
+        return {
+            "label": "Numeric time series:",
+            "body": str(match.group(0)).strip(),
+            "full_text": str(match.group(0)),
+        }
+
+    @staticmethod
+    def _extract_text_context_block(description: str) -> dict[str, str] | None:
+        if not isinstance(description, str) or not description.strip():
+            return None
+
+        patterns = [
+            (
+                r"(?P<label>The news article states:)\s*(?P<body>.*?)(?=(?:\n\nPlease return|\n\nBased on|\n\nReturn|\n\nNow, you need|Please return|Return your|Question:| Answer:|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>Weather report:)\s*(?P<body>.*?)(?=(?:\n\nYour task is|\n\nReturn ONLY|\n\nQuestion:|Return ONLY|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>News:)\s*(?P<body>.*?)(?=(?:\n\nYour task is|\n\nReturn ONLY|\n\nQuestion:|Return ONLY|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>Text:)\s*(?P<body>.*?)(?=(?:\n\nYour task is|\n\nReturn ONLY|\n\nQuestion:|Return ONLY|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>Context:)\s*(?P<body>.*?)(?=(?:\n\nQuestion:| Question:| Answer:|Return your answer|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>weather event report:)\s*(?P<body>.*?)(?=(?:Question:| Answer:|$))",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            (
+                r"(?P<label>News published at [^:]+:)\s*(?P<body>.*?)(?=(?:Question:| Give your answer| Answer:|$))",
+                re.DOTALL,
+            ),
+        ]
+        for pattern, flags in patterns:
+            match = re.search(pattern, description, flags=flags)
+            if match:
+                body = str(match.group("body")).strip()
+                if not body:
+                    continue
+                return {
+                    "label": str(match.group("label")).strip(),
+                    "body": body,
+                    "full_text": str(match.group(0)),
+                }
+        return None
 
     @classmethod
     def _select_text_signals(
@@ -207,6 +609,25 @@ class DailyNotes:
         return "Sample Conditions:\n" + pipeline_summary[idx + len(split_marker):].lstrip()
 
     @staticmethod
+    def _round_display_numbers(value: Any) -> Any:
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, float):
+            return round(value, 3)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, list):
+            return [Notes._round_display_numbers(item) for item in value]
+        if isinstance(value, tuple):
+            return [Notes._round_display_numbers(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): Notes._round_display_numbers(item)
+                for key, item in value.items()
+            }
+        return value
+
+    @staticmethod
     def _extract_text_signals(
         description: str,
         task: str = "",
@@ -220,12 +641,27 @@ class DailyNotes:
         if "\n\nUser prompt:\n" in text:
             text = text.split("\n\nUser prompt:\n", 1)[1]
         signal_blocks: list[str] = []
-        for label in ("Weather report:", "News:", "Text:", "Context:"):
+        for label in ("Weather report:", "News:", "Text:", "Context:", "The news article states:"):
             idx = text.find(label)
             if idx < 0:
                 continue
             snippet = text[idx + len(label):].strip()
-            for stop in ("\n\nYour task is", "\nYour task is", "\n\nReturn ONLY", "\nReturn ONLY", "\n\nQuestion:", "\nQuestion:"):
+            for stop in (
+                "\n\nYour task is",
+                "\nYour task is",
+                "\n\nReturn ONLY",
+                "\nReturn ONLY",
+                "\n\nQuestion:",
+                "\nQuestion:",
+                "\n\nPlease return",
+                "\nPlease return",
+                "Please return",
+                "Return your",
+                "\n\nBased on",
+                "\nBased on",
+                "\n\nNow, you need",
+                "\nNow, you need",
+            ):
                 stop_idx = snippet.find(stop)
                 if stop_idx >= 0:
                     snippet = snippet[:stop_idx].strip()
@@ -242,7 +678,7 @@ class DailyNotes:
             for sentence in re.split(r"(?<=[.!?])\s+", cleaned)
             if sentence.strip()
         ]
-        ranked_sentences = DailyNotes._rank_text_signals_for_task(
+        ranked_sentences = Notes._rank_text_signals_for_task(
             sentences,
             task=task,
             task_description=task_description or description,
@@ -275,7 +711,7 @@ class DailyNotes:
         if not sentences:
             return []
 
-        task_focus = DailyNotes._task_focus_terms(task_description, task=task)
+        task_focus = Notes._task_focus_terms(task_description, task=task)
 
         scored: list[tuple[int, int, str]] = []
         for idx, sentence in enumerate(sentences):
@@ -348,13 +784,28 @@ class DailyNotes:
         if "\n\nUser prompt:\n" not in text:
             return text
         system_part, user_part = text.split("\n\nUser prompt:\n", 1)
-        for label in ("Weather report:", "News:", "Text:", "Context:"):
+        for label in ("Weather report:", "News:", "Text:", "Context:", "The news article states:"):
             idx = user_part.find(label)
             if idx < 0:
                 continue
             prefix = user_part[:idx].rstrip()
             suffix = user_part[idx + len(label):]
-            for stop in ("\n\nYour task is", "\nYour task is", "\n\nReturn ONLY", "\nReturn ONLY", "\n\nQuestion:", "\nQuestion:"):
+            for stop in (
+                "\n\nYour task is",
+                "\nYour task is",
+                "\n\nReturn ONLY",
+                "\nReturn ONLY",
+                "\n\nQuestion:",
+                "\nQuestion:",
+                "\n\nPlease return",
+                "\nPlease return",
+                "Please return",
+                "Return your",
+                "\n\nBased on",
+                "\nBased on",
+                "\n\nNow, you need",
+                "\nNow, you need",
+            ):
                 stop_idx = suffix.find(stop)
                 if stop_idx >= 0:
                     suffix = suffix[stop_idx:].lstrip()
@@ -439,7 +890,7 @@ class DailyNotes:
         """Build ranked candidate summaries directly from candidate traces."""
         if not candidate_traces:
             return []
-        ranked = DailyNotes._ranked_candidate_summaries(candidate_traces)
+        ranked = Notes._ranked_candidate_summaries(candidate_traces)
         return ranked[:5]
 
     @staticmethod
@@ -447,30 +898,135 @@ class DailyNotes:
         if not candidate_traces:
             return []
         formatted: list[str] = []
-        for idx, trace in enumerate(candidate_traces[:4]):
-            name = DailyNotes._display_candidate_name(trace, idx)
+        for idx, trace in enumerate(candidate_traces[:3]):
+            name = Notes._display_candidate_name(trace, idx)
             metrics = trace.get("metrics") or {}
-            _, score_label, _ = DailyNotes._candidate_score(metrics)
+            _, score_label, _ = Notes._candidate_score(metrics)
             header = f"- Candidate: {name}"
             if score_label:
                 header += f" ({score_label})"
             block = [header]
             if metrics:
-                metric_text = DailyNotes._stringify_metrics(metrics)
+                metric_text = Notes._stringify_metrics(metrics)
                 if metric_text:
                     block.append(f"  Metrics: {metric_text}")
             tool_chain = [t for t in trace.get("tool_chain", []) if t and t not in _FRAMEWORK_TOOLS]
-            if tool_chain:
-                block.append(f"  Tool chain: {' → '.join(tool_chain)}")
-            prediction = trace.get("prediction")
-            if prediction is not None and not DailyNotes._observation_contains_prediction(trace.get("steps"), prediction):
-                block.append(f"  Prediction: {DailyNotes._stringify_value(prediction)}")
-            steps = DailyNotes._format_candidate_steps(trace.get("steps"))
-            if steps:
-                block.append("  Steps:")
-                block.extend(steps)
+            generator_tools, validation_tools = Notes._split_tool_roles(tool_chain)
+            tool_parts: list[str] = []
+            if generator_tools:
+                tool_parts.append(" -> ".join(generator_tools))
+            if validation_tools:
+                tool_parts.append(f"Validation: {' -> '.join(validation_tools)}")
+            if tool_parts:
+                block.append(f"  Tools: {' | '.join(tool_parts)}")
+            prediction = Notes._short_prediction_value(trace.get("prediction"))
+            if prediction:
+                block.append(f"  Prediction: {prediction}")
+            reasoning = Notes._compact_candidate_reasoning(trace)
+            if reasoning:
+                block.append(f"  Reasoning: {reasoning}")
+            weakness = Notes._compact_candidate_weakness(trace)
+            if weakness:
+                block.append(f"  Weakness: {weakness}")
             formatted.append("\n".join(block))
         return formatted
+
+    @staticmethod
+    def _short_prediction_value(prediction: Any) -> str:
+        if prediction is None or isinstance(prediction, (list, tuple, dict)):
+            return ""
+        rendered = Notes._stringify_value(prediction).strip()
+        if not rendered or len(rendered) > 80 or "\n" in rendered:
+            return ""
+        return rendered
+
+    @staticmethod
+    def _sanitize_candidate_reasoning(text: str) -> str:
+        cleaned = str(text).strip()
+        if not cleaned:
+            return ""
+        cleaned = re.sub(r"^\s*\d+[\.\)\-:]\s*", "", cleaned)
+        cleaned = re.sub(r"(?i)\breason:\s*", "", cleaned)
+        cleaned = re.sub(r"(?i)\baction:\s*.*$", "", cleaned)
+        cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+        cleaned = normalize_learning_clause(cleaned)
+        framework_patterns = (
+            r"(?i)\b(spawn_subagent|evaluate_against_gt|evaluate_batch_against_gt|batch_evaluate_against_gt)\b",
+            r"(?i)\b(execution context|assigned(?: exploration)? path|assigned branch|branch(?: instructions?)?|training mode|learning-mode|ground truth)\b.*\b(require|requires|required|prioritiz|mandat|must|before finishing)\b",
+            r"(?i)\b(required|prioritized?|mandated)\b[^.]{0,80}\bpath\b",
+            r"(?i)\bmust use at least one tool\b",
+        )
+        if any(re.search(pattern, cleaned) for pattern in framework_patterns):
+            return ""
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,:;|-")
+        lower = cleaned.lower()
+        banned_markers = (
+            "spawn_subagent",
+            "evaluate_against_gt",
+            "evaluate_batch_against_gt",
+            "batch_evaluate_against_gt",
+            "execution context",
+            "assigned path",
+            "assigned branch",
+            "branch explicitly prioritizes",
+            "before finishing",
+            "ground truth",
+            "training mode",
+            "learning-mode",
+        )
+        if any(marker in lower for marker in banned_markers):
+            return ""
+        if len(cleaned) < 12:
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _compact_candidate_reasoning(trace: dict[str, Any]) -> str:
+        steps = trace.get("steps")
+        if isinstance(steps, list):
+            snippets: list[str] = []
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                raw = str(step.get("thought") or "").strip()
+                if not raw:
+                    continue
+                snippet = Notes._sanitize_candidate_reasoning(raw)
+                if not snippet:
+                    continue
+                snippet = snippet[0].upper() + snippet[1:] if snippet else snippet
+                if not snippet.endswith("."):
+                    snippet += "."
+                snippets.append(snippet)
+                if len(snippets) >= 2:
+                    break
+            if snippets:
+                return " ".join(snippets)
+        return ""
+
+    @staticmethod
+    def _compact_candidate_weakness(trace: dict[str, Any]) -> str:
+        tool_chain = [t for t in trace.get("tool_chain", []) if t and t not in _FRAMEWORK_TOOLS]
+        if tool_chain == ["basic_stats"]:
+            return "Relied on global summary statistics without an explicit future-path estimate."
+
+        steps = trace.get("steps")
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                tool = str(step.get("tool") or "").strip()
+                obs = step.get("observation")
+                if tool == "arima_forecast" and isinstance(obs, dict):
+                    forecast = obs.get("forecast")
+                    if isinstance(forecast, list):
+                        numeric = [float(v) for v in forecast if isinstance(v, (int, float))]
+                        if len(numeric) >= 3 and max(numeric) - min(numeric) < 0.5:
+                            return "Forecast path was nearly flat, which can miss structured seasonality."
+        _, score_label, _ = Notes._candidate_score(trace.get("metrics") or {})
+        if score_label:
+            return f"This path recorded {score_label} on the sample."
+        return ""
 
     @staticmethod
     def _ranked_candidate_summaries(candidate_traces: list[dict[str, Any]]) -> list[str]:
@@ -480,12 +1036,12 @@ class DailyNotes:
         for idx, trace in enumerate(candidate_traces):
             if not isinstance(trace, dict):
                 continue
-            name = DailyNotes._display_candidate_name(trace, idx)
+            name = Notes._display_candidate_name(trace, idx)
             if name in seen:
                 continue
             seen.add(name)
             metrics = trace.get("metrics") or {}
-            score_value, score_label, sort_key = DailyNotes._candidate_score(metrics)
+            score_value, score_label, sort_key = Notes._candidate_score(metrics)
             if score_label:
                 ranked.append((sort_key, f"{name}({score_label})"))
             else:
@@ -494,7 +1050,7 @@ class DailyNotes:
         return [text for _, text in ranked] + fallback
 
     @staticmethod
-    def _format_candidate_steps(steps: Any) -> list[str]:
+    def _format_candidate_steps(steps: Any, role: str = "all") -> list[str]:
         if not isinstance(steps, list):
             return []
         rendered: list[str] = []
@@ -504,23 +1060,30 @@ class DailyNotes:
             tool = str(step.get("tool") or "").strip()
             if not tool:
                 continue
+            is_validation = tool in _NOTE_VALIDATION_TOOLS
+            if role == "generator" and is_validation:
+                continue
+            if role == "validation" and not is_validation:
+                continue
             rendered.append(f"  - Tool: {tool}")
             reason = str(step.get("thought") or "").strip()
             if reason:
                 rendered.append(f"    Reason/Action: {reason}")
             observation = step.get("observation")
             if observation is not None:
-                rendered.append(f"    Observation: {DailyNotes._stringify_observation(observation)}")
+                rendered.append(f"    Observation: {Notes._stringify_observation(observation)}")
         return rendered
 
     @staticmethod
     def _display_candidate_name(trace: dict[str, Any], index: int) -> str:
         name = str(trace.get("name") or "").strip()
-        if name and not name.startswith("approach_"):
-            return name[:80]
         tool_chain = [t for t in trace.get("tool_chain", []) if t and t not in _FRAMEWORK_TOOLS]
+        if name and not re.fullmatch(r"(slot|candidate|approach)_\d+", name):
+            return name[:80]
         if tool_chain:
             return " → ".join(tool_chain[:3])[:80]
+        if name:
+            return name[:80]
         return f"candidate_{index}"
 
     @staticmethod
@@ -530,13 +1093,13 @@ class DailyNotes:
         for key in ("mae", "avg_mae", "rmse", "mse", "max_mae"):
             if isinstance(metrics.get(key), (int, float)):
                 value = float(metrics[key])
-                label_parts = [f"{key}={value:.2f}"]
+                label_parts = [f"{key}={value:.3f}"]
                 if key != "rmse" and isinstance(metrics.get("rmse"), (int, float)):
-                    label_parts.append(f"rmse={float(metrics['rmse']):.2f}")
+                    label_parts.append(f"rmse={float(metrics['rmse']):.3f}")
                 return value, ", ".join(label_parts), (1, value)
         if isinstance(metrics.get("accuracy"), (int, float)):
             value = float(metrics["accuracy"])
-            return value, f"acc={value:.2f}", (0, -value)
+            return value, f"acc={value:.3f}", (0, -value)
         return None, "", (9, 0.0)
 
     @staticmethod
@@ -544,7 +1107,11 @@ class DailyNotes:
         if isinstance(value, str):
             return value
         try:
-            return json.dumps(value, ensure_ascii=False, default=str)
+            return json.dumps(
+                Notes._round_display_numbers(value),
+                ensure_ascii=False,
+                default=str,
+            )
         except TypeError:
             return str(value)
 
@@ -554,7 +1121,7 @@ class DailyNotes:
         for key in ("mae", "avg_mae", "rmse", "mse", "mape", "max_mae", "accuracy"):
             value = metrics.get(key)
             if isinstance(value, (int, float)):
-                parts.append(f"{key}={float(value):.4f}")
+                parts.append(f"{key}={float(value):.3f}")
         if not parts:
             return ""
         return ", ".join(parts)
@@ -576,16 +1143,20 @@ class DailyNotes:
             if "order" in filtered:
                 filtered.pop("order", None)
             try:
-                return json.dumps(filtered, ensure_ascii=False, default=str)
+                return json.dumps(
+                    Notes._round_display_numbers(filtered),
+                    ensure_ascii=False,
+                    default=str,
+                )
             except TypeError:
                 return str(filtered)
-        return DailyNotes._stringify_value(payload)
+        return Notes._stringify_value(payload)
 
     @staticmethod
     def _observation_contains_prediction(steps: Any, prediction: Any) -> bool:
         if not isinstance(steps, list):
             return False
-        prediction_text = DailyNotes._stringify_value(prediction)
+        prediction_text = Notes._stringify_value(prediction)
         for step in steps:
             if not isinstance(step, dict):
                 continue
@@ -603,24 +1174,23 @@ class DailyNotes:
                         return True
             observation_text = (
                 observation if isinstance(observation, str)
-                else DailyNotes._stringify_value(observation)
+                else Notes._stringify_value(observation)
             )
             if prediction_text and prediction_text in observation_text:
                 return True
         return False
 
-    def _append_to_daily_log(self, note: str, ctx: dict[str, Any]) -> None:
-        today = time.strftime("%Y-%m-%d")
-        path = DAILY_DIR / f"{today}.md"
+    def _append_to_scope_log(self, note: str, ctx: dict[str, Any]) -> None:
         scope = ctx.get("scope_key", "")
         domain = ctx.get("domain", "")
         task = ctx.get("task", "")
         correct = self._outcome_label(ctx.get("correct"), ctx.get("metrics") or {})
-        timestamp = time.strftime("%H:%M:%S")
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        path = self._scope_log_path(str(scope).strip())
 
         label = scope or f"{domain}/{task}"
         entry = f"\n### [{timestamp}] {label} — {correct}\n{note}\n"
-        with path.open("a") as f:
+        with path.open("a", encoding="utf-8") as f:
             f.write(entry)
 
     def search(self, query: str, k: int = _L1_RETRIEVAL_K,
@@ -629,13 +1199,11 @@ class DailyNotes:
                return_ids: bool = False) -> list[str] | list[dict[str, Any]]:
         tokens = [token.lower() for token in re.findall(r"\w+", query or "") if token.strip()]
         matches: list[dict[str, Any]] = []
-        files = sorted(DAILY_DIR.glob("*.md"), reverse=True)
+        files = sorted(NOTES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in files:
             text = path.read_text()
-            for idx, block in enumerate(reversed(text.split("\n### "))):
-                note = block.strip()
-                if not note:
-                    continue
+            for item in self._note_items_from_text(path.name, text):
+                note = item["text"]
                 parsed = DistillationAgent._parse_note_sections(note)
                 note_scope = str(parsed["sections"].get("Scope") or parsed.get("header") or "").strip()
                 if scope and note_scope != scope:
@@ -649,7 +1217,7 @@ class DailyNotes:
                 if tokens and score == 0 and scope is None and domain is None and task is None:
                     continue
                 matches.append({
-                    "id": f"{path.name}#{idx}",
+                    "id": item["id"],
                     "text": note,
                     "score": score,
                 })
@@ -660,21 +1228,37 @@ class DailyNotes:
         return [item["text"] for item in trimmed]
 
     def delete_notes(self, note_ids: list[str]) -> int:
-        logger.info("[DailyNotes] delete_notes is disabled; daily notes are kept as raw distillation sources")
+        logger.info("[Notes] delete_notes is disabled; notes are kept as raw distillation sources")
         return 0
 
     def get_recent_notes(self, n: int = 10) -> list[str]:
-        files = sorted(DAILY_DIR.glob("*.md"), reverse=True)
-        notes = []
+        return [item["text"] for item in self.get_recent_note_items(n)]
+
+    def get_recent_note_items(self, n: int = 10) -> list[dict[str, str]]:
+        files = sorted(NOTES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        notes: list[dict[str, str]] = []
         for f in files:
             if len(notes) >= n:
                 break
-            for block in reversed(f.read_text().split("\n### ")):
-                if block.strip():
-                    notes.append(block.strip())
-                    if len(notes) >= n:
-                        break
+            for item in self._note_items_from_text(f.name, f.read_text()):
+                notes.append(item)
+                if len(notes) >= n:
+                    break
         return notes[:n]
+
+    def get_scope_note_items(self, scope: str) -> list[dict[str, Any]]:
+        """Return one scope's notes in append order with a stable 1-based sequence."""
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return []
+        path = NOTES_DIR / f"{scope_name}.md"
+        if not path.exists():
+            return []
+        items = self._note_items_from_text(path.name, path.read_text())
+        items.reverse()
+        for idx, item in enumerate(items, start=1):
+            item["seq"] = idx
+        return items
 
     async def resolve_conflicts(self, query: str,
                                 domain: str | None = None,
@@ -694,7 +1278,7 @@ class DailyNotes:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# MEMORY.md — Causal insights distilled from daily notes
+# MEMORY.md — Causal insights distilled from notes
 # ═══════════════════════════════════════════════════════════════════════
 
 class MemoryEntry:
@@ -717,6 +1301,7 @@ class MemoryEntry:
         avoid_tools: list[str] | None = None,
         rationale: str = "",
         evidence: dict[str, Any] | None = None,
+        source_rule_ids: list[str] | None = None,
         confidence: float = 0.5,
         injectable: bool = True,
         status: str = "active",
@@ -731,6 +1316,7 @@ class MemoryEntry:
         self.avoid_tools = avoid_tools or []
         self.rationale = rationale
         self.evidence = evidence or {}
+        self.source_rule_ids = source_rule_ids or []
         self.confidence = confidence
         self.injectable = injectable
         self.status = status
@@ -747,6 +1333,7 @@ class MemoryEntry:
             "avoid_tools": list(self.avoid_tools),
             "rationale": self.rationale,
             "evidence": dict(self.evidence),
+            "source_rule_ids": list(self.source_rule_ids),
             "confidence": float(self.confidence),
             "injectable": bool(self.injectable),
             "status": self.status,
@@ -767,7 +1354,14 @@ class MemoryStore:
             try:
                 raw = json.loads(f.read_text())
                 if isinstance(raw, list):
-                    self._entries[f.stem] = [self._normalize_entry(f.stem, entry, idx) for idx, entry in enumerate(raw)]
+                    normalized = [
+                        self._normalize_entry(f.stem, entry, idx)
+                        for idx, entry in enumerate(raw)
+                    ]
+                    normalized = self._dedupe_rule_ids(normalized)
+                    self._entries[f.stem] = normalized
+                    if normalized != raw:
+                        f.write_text(json.dumps(normalized, indent=2, ensure_ascii=False))
             except Exception:
                 pass
 
@@ -818,17 +1412,56 @@ class MemoryStore:
         path = MEMORY_DIR / f"{scope}.json"
         path.write_text(json.dumps(normalized, indent=2, ensure_ascii=False))
 
-    def get_cross_domain_entries(self) -> list[dict]:
-        return self.get_entries(CROSS_DOMAIN_SCOPE)
+    def get_cross_domain_entries(self, bucket: str = "") -> list[dict]:
+        if bucket:
+            return self.get_entries(_cross_domain_scope_for_bucket(bucket))
+        entries: list[dict] = []
+        for scope, scoped_entries in self._entries.items():
+            if _is_cross_domain_scope(scope):
+                entries.extend(scoped_entries)
+        return entries
+
+    @staticmethod
+    def _normalize_note_refs(refs: Any) -> list[str]:
+        if not isinstance(refs, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in refs:
+            ref = str(item).strip()
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            out.append(ref)
+        return out[:200]
+
+    @classmethod
+    def _entry_note_refs(cls, entry: dict[str, Any]) -> list[str]:
+        evidence = entry.get("evidence") if isinstance(entry.get("evidence"), dict) else {}
+        return cls._normalize_note_refs(evidence.get("sample_refs", []))
+
+    @classmethod
+    def _entry_support_count(cls, entry: dict[str, Any]) -> int:
+        refs = cls._entry_note_refs(entry)
+        return len(refs)
 
     @staticmethod
     def _normalize_rule_payload(scope: str, payload: dict[str, Any], index: int) -> dict[str, Any]:
         kind = str(payload.get("kind", "")).strip() or "domain_heuristic"
         summary = str(payload.get("summary", "")).strip()
         conditions = [str(item).strip() for item in payload.get("conditions", []) if str(item).strip()]
-        preferred_tools = [str(item).strip() for item in payload.get("preferred_tools", []) if str(item).strip()]
-        avoid_tools = [str(item).strip() for item in payload.get("avoid_tools", []) if str(item).strip()]
+        preferred_tools = _canonicalize_tool_list(
+            [str(item).strip() for item in payload.get("preferred_tools", []) if str(item).strip()]
+        )
+        avoid_tools = _canonicalize_tool_list(
+            [str(item).strip() for item in payload.get("avoid_tools", []) if str(item).strip()]
+        )
         rationale = str(payload.get("rationale", "")).strip()
+        source_rule_ids = [
+            str(item).strip()
+            for item in payload.get("source_rule_ids", [])
+            if str(item).strip()
+        ]
         return MemoryEntry(
             scope=scope,
             rule_id=str(payload.get("rule_id", "")).strip() or f"{scope}::{index + 1:03d}",
@@ -839,13 +1472,17 @@ class MemoryStore:
             avoid_tools=avoid_tools,
             rationale=rationale,
             evidence={"support_count": 0, "sample_refs": []},
+            source_rule_ids=source_rule_ids,
             status="active",
         ).to_dict()
 
     def get_prompt_section(self, domain: str = "", task: str = "", scope: str = "") -> str:
         scope = scope or f"{domain}_{task}"
-        entries = self.get_entries(scope)
-        domain_entries = self.get_entries(domain) if domain else []
+        entries = [entry for entry in self.get_entries(scope) if bool(entry.get("injectable", True))]
+        domain_entries = [
+            entry for entry in self.get_entries(domain)
+            if bool(entry.get("injectable", True))
+        ] if domain else []
         cross_entries: list[dict] = []
         all_entries = entries + domain_entries
         if not all_entries and not cross_entries:
@@ -874,18 +1511,21 @@ class MemoryStore:
         preferred = [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()]
         avoid = [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()]
         rationale = str(entry.get("rationale", "")).strip()
+        support = MemoryStore._entry_support_count(entry)
 
         parts: list[str] = []
         if summary:
-            parts.append(summary)
+            parts.append(f"Rule: {summary}")
         if conditions:
-            parts.append(f"Conditions: {', '.join(conditions[:3])}")
+            parts.append(f"When: {', '.join(conditions[:3])}")
         if preferred:
             parts.append(f"Prefer: {', '.join(preferred[:3])}")
         if avoid:
             parts.append(f"Avoid: {', '.join(avoid[:3])}")
         if rationale:
             parts.append(f"Why: {rationale}")
+        if support > 0:
+            parts.append(f"Evidence: {support} note(s)")
         return " | ".join(parts)
 
     @staticmethod
@@ -907,6 +1547,11 @@ class MemoryStore:
                 avoid_tools=[],
                 rationale="",
                 evidence={"support_count": evidence_count, "sample_refs": []},
+                source_rule_ids=[
+                    str(item).strip()
+                    for item in entry.get("source_rule_ids", [])
+                    if str(item).strip()
+                ],
                 status="active",
                 timestamp=float(entry.get("timestamp", 0.0) or time.time()),
             ).to_dict()
@@ -916,14 +1561,28 @@ class MemoryStore:
         rule_id = str(entry.get("rule_id", "")).strip() or f"{scope}::{index + 1:03d}"
         kind = str(entry.get("kind", "")).strip() or "domain_heuristic"
         conditions = [str(item).strip() for item in entry.get("conditions", []) if str(item).strip()]
-        preferred_tools = [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()]
-        avoid_tools = [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()]
+        preferred_tools = _canonicalize_tool_list(
+            [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()]
+        )
+        avoid_tools = _canonicalize_tool_list(
+            [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()]
+        )
         rationale = str(entry.get("rationale", "")).strip()
         evidence = entry.get("evidence") if isinstance(entry.get("evidence"), dict) else {}
+        evidence = {
+            **evidence,
+            "sample_refs": MemoryStore._normalize_note_refs(evidence.get("sample_refs", [])),
+        }
+        evidence["support_count"] = len(evidence["sample_refs"])
         confidence = float(entry.get("confidence", 0.5) or 0.5)
         injectable = bool(entry.get("injectable", True))
         status = str(entry.get("status", "active")).strip() or "active"
         timestamp = float(entry.get("timestamp", 0.0) or time.time())
+        source_rule_ids = [
+            str(item).strip()
+            for item in entry.get("source_rule_ids", [])
+            if str(item).strip()
+        ]
 
         return MemoryEntry(
             scope=scope,
@@ -935,6 +1594,7 @@ class MemoryStore:
             avoid_tools=avoid_tools,
             rationale=rationale,
             evidence=evidence,
+            source_rule_ids=source_rule_ids,
             confidence=confidence,
             injectable=injectable,
             status=status,
@@ -950,7 +1610,7 @@ class MemoryStore:
         def _rank(entry: dict[str, Any]) -> tuple[float, int, float]:
             return (
                 float(entry.get("confidence", 0.0) or 0.0),
-                int((entry.get("evidence") or {}).get("support_count", 0) or 0),
+                MemoryStore._entry_support_count(entry),
                 float(entry.get("timestamp", 0.0) or 0.0),
             )
 
@@ -968,10 +1628,10 @@ class MemoryStore:
             key=lambda entry: (
                 not bool(entry.get("injectable", True)),
                 -float(entry.get("confidence", 0.0) or 0.0),
-                -int((entry.get("evidence") or {}).get("support_count", 0) or 0),
+                -MemoryStore._entry_support_count(entry),
             )
         )
-        return unique_entries[:20]
+        return unique_entries[:_MEMORY_RULE_CAP]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -990,19 +1650,19 @@ def load_soul() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 class ToolsStore:
-    """TOOLS.md — per-tool experience notes, distilled from daily notes.
+    """TOOLS.md — per-scope per-tool experience notes, distilled from MEMORY.
 
-    Global notes describe each tool's general behaviour.  Per-scope
-    counters track how many times each tool has been used in a given
-    (domain, task) scope so we can flag under-explored tools.
+    New definition:
+    - tool cards are keyed by exact ``scope_key``
+    - usage counters are also keyed by exact ``scope_key``
     """
 
     _MIN_RUNS = 5
-    _MAX_PROMPT_TOOLS = 5
+    _MAX_PROMPT_TOOLS = 15
 
     def __init__(self):
         MEMORY_ROOT.mkdir(parents=True, exist_ok=True)
-        self._notes: dict[str, dict[str, Any]] = {}
+        self._notes_by_scope: dict[str, dict[str, dict[str, Any]]] = {}
         self._scope_counts: dict[str, dict[str, int]] = {}
         self._load()
 
@@ -1010,45 +1670,85 @@ class ToolsStore:
         if TOOLS_FILE.exists():
             try:
                 raw = json.loads(TOOLS_FILE.read_text())
-                if isinstance(raw, dict) and "_scope_counts" in raw:
-                    self._notes = {
-                        str(k): self._normalize_note_payload(v)
-                        for k, v in (raw.get("notes", {}) or {}).items()
+                if isinstance(raw, dict) and "notes_by_scope" in raw:
+                    self._notes_by_scope = {
+                        str(scope): {
+                            str(tool_name): self._normalize_note_payload(payload)
+                            for tool_name, payload in (tool_map or {}).items()
+                        }
+                        for scope, tool_map in (raw.get("notes_by_scope", {}) or {}).items()
                     }
                     self._scope_counts = raw.get("_scope_counts", {})
+                elif isinstance(raw, dict) and "_scope_counts" in raw:
+                    self._notes_by_scope = {}
+                    self._scope_counts = raw.get("_scope_counts", {})
                 else:
-                    self._notes = {
-                        str(k): self._normalize_note_payload(v)
-                        for k, v in (raw.items() if isinstance(raw, dict) else [])
-                    }
+                    self._notes_by_scope = {}
             except Exception:
-                self._notes = {}
+                self._notes_by_scope = {}
 
     def _save(self) -> None:
-        payload = {"notes": self._notes, "_scope_counts": self._scope_counts}
+        payload = {"notes_by_scope": self._notes_by_scope, "_scope_counts": self._scope_counts}
         TOOLS_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
-    def get_notes(self) -> dict[str, dict[str, Any]]:
-        return dict(self._notes)
+    def get_notes(self, scope: str = "") -> dict[str, dict[str, Any]]:
+        if scope:
+            return dict(self._notes_by_scope.get(scope, {}))
+        merged: dict[str, dict[str, Any]] = {}
+        for tool_map in self._notes_by_scope.values():
+            for tool_name, payload in tool_map.items():
+                merged.setdefault(tool_name, payload)
+        return merged
 
-    def update(self, notes: dict[str, Any]) -> None:
-        self._notes.update({
+    def update(self, scope: str, notes: dict[str, Any]) -> None:
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return
+        scoped = self._notes_by_scope.setdefault(scope_name, {})
+        scoped.update({
             str(tool_name): self._normalize_note_payload(payload)
             for tool_name, payload in notes.items()
         })
         self._save()
-        logger.info(f"[TOOLS] Updated usage notes for {len(notes)} tools")
+        logger.info(f"[TOOLS] Updated usage notes for {len(notes)} tools in {scope_name}")
+
+    def replace(self, scope: str, notes: dict[str, Any]) -> None:
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return
+        self._notes_by_scope[scope_name] = {
+            str(tool_name): self._normalize_note_payload(payload)
+            for tool_name, payload in notes.items()
+        }
+        self._save()
+        logger.info(f"[TOOLS] Rebuilt usage notes for {len(notes)} tools in {scope_name}")
 
     def record_scope_usage(self, scope: str, tool_counts: dict[str, int]) -> None:
         """Replace per-tool usage counts for a scope from the latest scan."""
         self._scope_counts[scope] = dict(tool_counts)
         self._save()
 
-    def total(self) -> int:
-        return len(self._notes)
+    def increment_scope_usage(self, scope: str, tool_names: list[str]) -> None:
+        """Increment per-tool usage counts for one scope from a finished run."""
+        if not scope or not tool_names:
+            return
+        bucket = self._scope_counts.setdefault(scope, {})
+        for raw_name in tool_names:
+            name = str(raw_name).strip()
+            if not name:
+                continue
+            bucket[name] = int(bucket.get(name, 0) or 0) + 1
+        self._save()
 
-    def get_tool_note(self, tool_name: str) -> str:
-        payload = self._notes.get(tool_name)
+    def get_scope_usage(self, scope: str) -> dict[str, int]:
+        """Return a copy of per-tool usage counts for one scope."""
+        return dict(self._scope_counts.get(scope, {}))
+
+    def total(self) -> int:
+        return sum(len(tool_map) for tool_map in self._notes_by_scope.values())
+
+    def get_tool_note(self, tool_name: str, scope: str) -> str:
+        payload = self._notes_by_scope.get(scope, {}).get(tool_name)
         return self._render_note_payload(payload) if payload else ""
 
     def get_prompt_for_tools(
@@ -1056,9 +1756,10 @@ class ToolsStore:
     ) -> dict[str, str]:
         """Return notes for the given tools, limited to a small relevant subset."""
         scope_data = self._scope_counts.get(scope, {}) if scope else {}
+        scoped_notes = self._notes_by_scope.get(scope, {}) if scope else {}
         ranked: list[tuple[int, str, str]] = []
         for name in tool_names:
-            payload = self._notes.get(name)
+            payload = scoped_notes.get(name)
             note = self._render_note_payload(payload) if payload else ""
             if note:
                 ranked.append((scope_data.get(name, 0), name, note))
@@ -1146,6 +1847,14 @@ class SkillsStore:
         path.write_text(content)
         logger.info(f"[SKILLS] Updated SOP for {scope}")
 
+    def delete_skill(self, scope: str) -> None:
+        if scope in self._skills:
+            del self._skills[scope]
+        path = SKILLS_DIR / f"{scope}.md"
+        if path.exists():
+            path.unlink()
+        logger.info(f"[SKILLS] Removed SOP for {scope}")
+
     def get_prompt_section(self, domain: str = "", task: str = "", scope: str = "") -> str:
         scope = scope or f"{domain}_{task}"
         skill = self._skills.get(scope, "")
@@ -1172,7 +1881,7 @@ Total runs analyzed: {total}
 ## Statistics
 {statistics}
 
-## Sample Experience Notes (recent)
+## Sample Experience Notes (recent, each with stable note_id)
 {notes}
 
 ## Existing Rules (review and update these)
@@ -1259,13 +1968,29 @@ Rules must be based on:
 - Merge rules only when they express the same operational guidance
 - Mark rules as conflicting only when both can be valid under different conditions or when evidence is genuinely split
 - Create a new rule only if the evidence is not already covered by an existing rule family
-- Keep the total active rule set at or below 20 after the update
+- Keep the total active rule set at or below {memory_rule_cap} after the update
+- Before adding any new rule, you MUST compare it against every existing rule that could express the same operational guidance
+- Treat `domain_heuristic` and `result_constraint` as a shared duplicate-check pool; do not create a second rule just because the better label could be argued either way
+- If a candidate rule leads to the same test-time decision or same output-validity check as an existing rule, treat it as a duplicate even if the wording is different
+- Wording changes, abstraction changes, and scope-local paraphrases are NOT enough to justify a new rule
+- When in doubt, update the closest existing rule instead of creating a new one
+- For `tool_failure`, if several tools fail for the same underlying reason or produce the same operational warning, prefer one broader rule and list all relevant concrete tools in `avoid_tools`
+- For `tool_selection`, if multiple tools support the same workflow under the same conditions, prefer one workflow-level rule and list the interchangeable concrete tools in `preferred_tools`
+- Do not split one workflow into multiple rules only because the concrete tool names differ
+
+## Strong Boundary Between `domain_heuristic` And `result_constraint`
+- Use `result_constraint` only when the rule is about validity, consistency, shape, format, or internal correctness of the output itself
+- Use `domain_heuristic` only when the rule is about input patterns, task structure, or domain regularities that influence strategy choice
+- If the rule says what a good output must satisfy, it is `result_constraint`, not `domain_heuristic`
 
 ## Output Requirements
 Return JSON only with this exact top-level structure:
 {{
-  "support_updates": [
-    {{"rule_id": "existing_rule_id_1", "add_support": 2}}
+ "support_updates": [
+    {{
+      "rule_id": "existing_rule_id_1",
+      "support_note_ids": ["note_id_1", "note_id_2"]
+    }}
   ],
   "merge_groups": [["existing_rule_id_1", "existing_rule_id_2"]],
   "conflict_groups": [["existing_rule_id_3", "existing_rule_id_4"]],
@@ -1278,17 +2003,26 @@ Return JSON only with this exact top-level structure:
       "preferred_tools": ["tool_a"],
       "avoid_tools": ["tool_b"],
       "rationale": "brief evidence-grounded rationale",
-      "initial_support": 2
+      "support_note_ids": ["note_id_3", "note_id_4"],
+      "closest_existing_rule_id": "existing_rule_id_5",
+      "novelty_reason": "why this is not already covered by the closest existing rule"
     }}
   ]
 }}
 
 If no items belong in a section, return an empty list for that section.
+Every returned `support_note_ids` must use only note ids that appear in the
+provided experience notes.
+Every returned `new_rule` MUST include `closest_existing_rule_id` and `novelty_reason`.
+If a valid `novelty_reason` cannot be stated concretely, do not create the new rule.
 """
 
 MEMORY_TO_CROSS_DOMAIN_PROMPT = """\
 You are synthesizing domain-specific decision rules into universal
 cross-domain insights for a multimodal time-series analysis agent.
+
+## Allowed Concrete Tool Names
+{allowed_tool_names}
 
 ## All Domain-Task Rules
 {all_memory_entries}
@@ -1308,6 +2042,8 @@ RULES:
   - domain_heuristic
   - result_constraint
 - Cross-domain rules must still avoid any training/orchestration behavior
+- If you mention tools, you MUST use exact names from the allowed tool list above
+- If no exact concrete tool name is well-supported, leave `preferred_tools` / `avoid_tools` empty
 - **CRITICAL**: Insights must NEVER reference ground truth values or label
   distributions.  Base all guidance on input data characteristics and tool
   performance metrics, not on output label frequencies.
@@ -1320,11 +2056,15 @@ Return JSON: {{
       "conditions": ["condition 1", "condition 2"],
       "preferred_tools": ["tool_a"],
       "avoid_tools": ["tool_b"],
-      "rationale": "why this rule is useful"
+      "rationale": "why this rule is useful",
+      "source_rule_ids": ["scope_rule_id_1", "scope_rule_id_2"]
     }}
   ],
   "removed_rule_ids": ["existing_rule_id_1", "existing_rule_id_2"]
 }}
+
+Every `source_rule_ids` item must reference a rule id that appears in
+`All Domain-Task Rules`.
 """
 
 MEMORY_TO_TOOLS_PROMPT = """\
@@ -1439,6 +2179,98 @@ Rules:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Distillation State
+# ═══════════════════════════════════════════════════════════════════════
+
+class DistillStateStore:
+    """Persist per-path distillation watermarks independently from artifacts.
+
+    New definition:
+    - `notes_to_memory_done_seq`: highest scope-local note sequence already
+      consumed by Notes -> MEMORY.
+    - `*_done_fingerprint`: hash of the exact full-memory view used to build
+      a downstream artifact.
+    - `memory_history_seq`: append-only snapshot counter for one scope's
+      MEMORY evolution across training.
+    """
+
+    def __init__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._data: dict[str, dict[str, dict[str, Any]]] = {
+            "scopes": {},
+            "buckets": {},
+        }
+        self._load()
+
+    def _load(self) -> None:
+        if not DISTILL_STATE_FILE.exists():
+            return
+        try:
+            raw = json.loads(DISTILL_STATE_FILE.read_text())
+            if isinstance(raw, dict):
+                self._data["scopes"] = {
+                    str(scope): dict(payload or {})
+                    for scope, payload in (raw.get("scopes", {}) or {}).items()
+                }
+                self._data["buckets"] = {
+                    str(bucket): dict(payload or {})
+                    for bucket, payload in (raw.get("buckets", {}) or {}).items()
+                }
+        except Exception:
+            self._data = {"scopes": {}, "buckets": {}}
+        self.reset_inflight_flags()
+
+    def save(self) -> None:
+        DISTILL_STATE_FILE.write_text(json.dumps(self._data, indent=2, ensure_ascii=False))
+
+    def reset_inflight_flags(self) -> None:
+        for payload in self._data["scopes"].values():
+            payload["notes_to_memory_inflight"] = False
+            payload["memory_to_skills_inflight"] = False
+            payload["memory_to_tools_inflight"] = False
+        for payload in self._data["buckets"].values():
+            payload["memory_to_cross_inflight"] = False
+
+    def get_scope(self, scope: str) -> dict[str, Any]:
+        scope_name = str(scope).strip()
+        payload = dict(self._data["scopes"].get(scope_name, {}))
+        payload.setdefault("notes_total_seq", 0)
+        payload.setdefault("notes_to_memory_done_seq", 0)
+        payload.setdefault("notes_to_memory_inflight", False)
+        payload.setdefault("memory_fingerprint", "")
+        payload.setdefault("memory_history_seq", 0)
+        payload.setdefault("memory_to_skills_done_fingerprint", "")
+        payload.setdefault("memory_to_skills_inflight", False)
+        payload.setdefault("memory_to_tools_done_fingerprint", "")
+        payload.setdefault("memory_to_tools_inflight", False)
+        return payload
+
+    def update_scope(self, scope: str, **fields: Any) -> dict[str, Any]:
+        scope_name = str(scope).strip()
+        payload = self.get_scope(scope_name)
+        payload.update(fields)
+        self._data["scopes"][scope_name] = payload
+        self.save()
+        return dict(payload)
+
+    def get_bucket(self, bucket: str) -> dict[str, Any]:
+        bucket_name = str(bucket).strip()
+        payload = dict(self._data["buckets"].get(bucket_name, {}))
+        payload.setdefault("memory_fingerprint", "")
+        payload.setdefault("memory_to_cross_done_fingerprint", "")
+        payload.setdefault("memory_to_cross_inflight", False)
+        return payload
+
+    def update_bucket(self, bucket: str, **fields: Any) -> dict[str, Any]:
+        bucket_name = str(bucket).strip()
+        payload = self.get_bucket(bucket_name)
+        payload.update(fields)
+        self._data["buckets"][bucket_name] = payload
+        self.save()
+        return dict(payload)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Distillation Agent
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1446,19 +2278,21 @@ class DistillationAgent:
     """Orchestrates bottom-up knowledge distillation.
 
     Distillation chain:
-        Daily Notes  ──→  MEMORY (per-scope + cross_domain)
+        Notes  ──→  MEMORY (per-scope + cross_domain)
                      └──→  TOOLS.md
                      └──→  SKILLS/
     """
 
-    def __init__(self, daily: DailyNotes, memory: MemoryStore,
+    def __init__(self, notes: Notes, memory: MemoryStore,
                  tools: ToolsStore, skills: SkillsStore):
-        self.daily = daily
+        self.notes = notes
         self.memory = memory
         self.tools = tools
         self.skills = skills
-        self._notes_distilled_at: dict[str, int] = {}
-        self._memory_distilled_at: int = 0
+        self._state = DistillStateStore()
+        self._state_lock = asyncio.Lock()
+        self._scope_workers: dict[str, asyncio.Task] = {}
+        self._bucket_workers: dict[str, asyncio.Task] = {}
         self._llm = None
 
     async def _get_llm(self):
@@ -1469,6 +2303,362 @@ class DistillationAgent:
             router = ModelRouter(cfg.llm)
             self._llm = router.get_backend("reasoner")
         return self._llm
+
+    @staticmethod
+    def _threshold_reached(current: int, last: int, threshold: int) -> bool:
+        return max(0, int(current) - int(last)) >= int(threshold)
+
+    async def _get_scope_state(self, scope: str) -> dict[str, Any]:
+        async with self._state_lock:
+            return self._state.get_scope(scope)
+
+    async def _update_scope_state(self, scope: str, **fields: Any) -> dict[str, Any]:
+        async with self._state_lock:
+            return self._state.update_scope(scope, **fields)
+
+    async def _get_bucket_state(self, bucket: str) -> dict[str, Any]:
+        async with self._state_lock:
+            return self._state.get_bucket(bucket)
+
+    async def _update_bucket_state(self, bucket: str, **fields: Any) -> dict[str, Any]:
+        async with self._state_lock:
+            return self._state.update_bucket(bucket, **fields)
+
+    @staticmethod
+    def _hash_payload(payload: Any) -> str:
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    def _scope_memory_fingerprint(self, scope: str) -> str:
+        entries = self.memory.get_entries(scope)
+        if not entries:
+            return ""
+        normalized = [
+            {
+                "rule_id": str(entry.get("rule_id", "")).strip(),
+                "kind": str(entry.get("kind", "")).strip(),
+                "summary": str(entry.get("summary", "")).strip(),
+                "conditions": [str(item).strip() for item in entry.get("conditions", []) if str(item).strip()],
+                "preferred_tools": [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()],
+                "avoid_tools": [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()],
+                "rationale": str(entry.get("rationale", "")).strip(),
+                "evidence": {
+                    "sample_refs": self._entry_note_refs(entry),
+                    "support_count": self._entry_support_count(entry),
+                },
+                "injectable": bool(entry.get("injectable", True)),
+                "status": str(entry.get("status", "active")).strip() or "active",
+            }
+            for entry in entries
+        ]
+        normalized.sort(key=lambda item: (item["rule_id"], item["summary"], item["kind"]))
+        return self._hash_payload(normalized)
+
+    def _bucket_memory_fingerprint(self, bucket: str) -> str:
+        entries = [
+            {
+                "scope": str(entry.get("scope", "")).strip(),
+                "rule_id": str(entry.get("rule_id", "")).strip(),
+                "kind": str(entry.get("kind", "")).strip(),
+                "summary": str(entry.get("summary", "")).strip(),
+                "conditions": [str(item).strip() for item in entry.get("conditions", []) if str(item).strip()],
+                "preferred_tools": [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()],
+                "avoid_tools": [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()],
+                "injectable": bool(entry.get("injectable", True)),
+                "status": str(entry.get("status", "active")).strip() or "active",
+                "support_count": self._entry_support_count(entry),
+            }
+            for entry in self.memory.get_all_entries()
+            if _task_bucket_from_scope(str(entry.get("scope", "")).strip()) == bucket
+            and not _is_cross_domain_scope(str(entry.get("scope", "")).strip())
+        ]
+        if not entries:
+            return ""
+        entries.sort(key=lambda item: (item["scope"], item["rule_id"], item["summary"], item["kind"]))
+        return self._hash_payload(entries)
+
+    @staticmethod
+    def _scope_history_dir(scope: str) -> Path:
+        path = HISTORY_DIR / str(scope).strip()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    async def _append_memory_history_snapshot(
+        self,
+        *,
+        scope: str,
+        notes_from_seq: int,
+        notes_to_seq: int,
+        memory_fingerprint: str,
+    ) -> None:
+        """Persist one scope-local MEMORY snapshot after a successful rebuild."""
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return
+
+        state = await self._get_scope_state(scope_name)
+        snapshot_seq = int(state.get("memory_history_seq", 0) or 0) + 1
+        created_at = time.time()
+        entries = self.memory.get_entries(scope_name)
+        payload = {
+            "scope": scope_name,
+            "snapshot_seq": snapshot_seq,
+            "created_at": created_at,
+            "source_stage": "notes_to_memory",
+            "notes_from_seq": int(notes_from_seq),
+            "notes_to_seq": int(notes_to_seq),
+            "notes_covered_count": max(0, int(notes_to_seq) - int(notes_from_seq) + 1),
+            "memory_fingerprint": str(memory_fingerprint or ""),
+            "rule_count": len(entries),
+            "entries": entries,
+        }
+
+        scope_dir = self._scope_history_dir(scope_name)
+        snapshot_path = scope_dir / f"{snapshot_seq:06d}.json"
+        snapshot_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+        manifest_path = scope_dir / "manifest.jsonl"
+        manifest_row = {
+            "scope": scope_name,
+            "snapshot_seq": snapshot_seq,
+            "created_at": created_at,
+            "source_stage": "notes_to_memory",
+            "notes_from_seq": int(notes_from_seq),
+            "notes_to_seq": int(notes_to_seq),
+            "memory_fingerprint": str(memory_fingerprint or ""),
+            "rule_count": len(entries),
+            "path": str(snapshot_path.relative_to(MEMORY_ROOT)),
+        }
+        with manifest_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(manifest_row, ensure_ascii=False) + "\n")
+
+        await self._update_scope_state(scope_name, memory_history_seq=snapshot_seq)
+
+    @staticmethod
+    def _create_background_task(coro: Any, label: str) -> asyncio.Task:
+        ctx = copy_context()
+
+        def _spawn() -> asyncio.Task:
+            trace.detach_context()
+            return asyncio.create_task(coro)
+
+        task = ctx.run(_spawn)
+
+        def _log_failure(done_task: asyncio.Task) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning(f"[Distill] Background task {label} failed: {exc}")
+
+        task.add_done_callback(_log_failure)
+        return task
+
+    def _ensure_scope_worker(self, scope: str, *, force: bool = False) -> None:
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return
+        worker = self._scope_workers.get(scope_name)
+        if worker and not worker.done():
+            return
+        self._scope_workers[scope_name] = self._create_background_task(
+            self._scope_worker(scope_name, force=force),
+            label=f"scope:{scope_name}",
+        )
+
+    def _ensure_bucket_worker(self, bucket: str, *, force: bool = False) -> None:
+        bucket_name = str(bucket).strip()
+        if not bucket_name:
+            return
+        worker = self._bucket_workers.get(bucket_name)
+        if worker and not worker.done():
+            return
+        self._bucket_workers[bucket_name] = self._create_background_task(
+            self._bucket_worker(bucket_name, force=force),
+            label=f"bucket:{bucket_name}",
+        )
+
+    async def on_sample_commit(self, scope_keys: list[str]) -> None:
+        await self.on_commit(scope_keys)
+
+    async def on_commit(self, scope_keys: list[str]) -> None:
+        """Record new note availability and trigger non-blocking distillation workers."""
+        seen: set[str] = set()
+        for raw_scope in scope_keys:
+            scope = str(raw_scope).strip()
+            if not scope or scope in seen or _is_cross_domain_scope(scope):
+                continue
+            seen.add(scope)
+            await self._update_scope_state(scope, notes_total_seq=self.notes.scoped_total(scope))
+            self._ensure_scope_worker(scope)
+
+    async def on_scope_commit(self, scope_keys: list[str]) -> None:
+        await self.on_commit(scope_keys)
+
+    async def on_global_commit(self, scope_keys: list[str]) -> None:
+        seen_buckets: set[str] = set()
+        for raw_scope in scope_keys:
+            bucket = _task_bucket_from_scope(raw_scope)
+            if not bucket or bucket in seen_buckets:
+                continue
+            seen_buckets.add(bucket)
+            self._ensure_bucket_worker(bucket)
+
+    async def _scope_worker(self, scope: str, *, force: bool = False) -> None:
+        try:
+            while True:
+                progressed = False
+                notes_total = self.notes.scoped_total(scope)
+                state = await self._update_scope_state(scope, notes_total_seq=notes_total)
+
+                should_run_notes = (
+                    notes_total > int(state.get("notes_to_memory_done_seq", 0) or 0)
+                    and (
+                        force
+                        or self._threshold_reached(
+                            notes_total,
+                            int(state.get("notes_to_memory_done_seq", 0) or 0),
+                            _DISTILL_L1_TO_L2,
+                        )
+                    )
+                )
+                if should_run_notes:
+                    target_seq = notes_total
+                    await self._update_scope_state(scope, notes_to_memory_inflight=True)
+                    success = await self.maybe_distill_notes_to_memory(scope, target_seq=target_seq, force=force)
+                    await self._update_scope_state(scope, notes_to_memory_inflight=False)
+                    if success:
+                        memory_fp = self._scope_memory_fingerprint(scope)
+                        await self._append_memory_history_snapshot(
+                            scope=scope,
+                            notes_from_seq=int(state.get("notes_to_memory_done_seq", 0) or 0) + 1,
+                            notes_to_seq=target_seq,
+                            memory_fingerprint=memory_fp,
+                        )
+                        await self._update_scope_state(
+                            scope,
+                            notes_to_memory_done_seq=target_seq,
+                            memory_fingerprint=memory_fp,
+                        )
+                        bucket = _task_bucket_from_scope(scope)
+                        if bucket:
+                            self._ensure_bucket_worker(bucket, force=force)
+                        progressed = True
+                    else:
+                        break
+
+                state = await self._get_scope_state(scope)
+                memory_fp = self._scope_memory_fingerprint(scope)
+                if memory_fp != str(state.get("memory_fingerprint", "") or ""):
+                    state = await self._update_scope_state(scope, memory_fingerprint=memory_fp)
+
+                if memory_fp and memory_fp != str(state.get("memory_to_skills_done_fingerprint", "") or ""):
+                    await self._update_scope_state(scope, memory_to_skills_inflight=True)
+                    success = await self.maybe_distill_memory_to_skills(scope)
+                    await self._update_scope_state(scope, memory_to_skills_inflight=False)
+                    if success:
+                        await self._update_scope_state(scope, memory_to_skills_done_fingerprint=memory_fp)
+                        progressed = True
+                    else:
+                        break
+                elif not memory_fp and self.skills.get_skill(scope):
+                    self.skills.delete_skill(scope)
+                    await self._update_scope_state(scope, memory_to_skills_done_fingerprint="")
+                    progressed = True
+
+                state = await self._get_scope_state(scope)
+                if memory_fp and memory_fp != str(state.get("memory_to_tools_done_fingerprint", "") or ""):
+                    await self._update_scope_state(scope, memory_to_tools_inflight=True)
+                    success = await self.maybe_distill_memory_to_tools(scope)
+                    await self._update_scope_state(scope, memory_to_tools_inflight=False)
+                    if success:
+                        await self._update_scope_state(scope, memory_to_tools_done_fingerprint=memory_fp)
+                        progressed = True
+                    else:
+                        break
+                elif not memory_fp and self.tools.get_notes(scope):
+                    self.tools.replace(scope, {})
+                    await self._update_scope_state(scope, memory_to_tools_done_fingerprint="")
+                    progressed = True
+
+                if not progressed:
+                    break
+        finally:
+            current = asyncio.current_task()
+            if self._scope_workers.get(scope) is current:
+                self._scope_workers.pop(scope, None)
+
+    async def _bucket_worker(self, bucket: str, *, force: bool = False) -> None:
+        try:
+            while True:
+                memory_fp = self._bucket_memory_fingerprint(bucket)
+                state = await self._update_bucket_state(bucket, memory_fingerprint=memory_fp)
+                if memory_fp and memory_fp != str(state.get("memory_to_cross_done_fingerprint", "") or ""):
+                    await self._update_bucket_state(bucket, memory_to_cross_inflight=True)
+                    success = await self.maybe_distill_memory_to_cross_domain(bucket)
+                    await self._update_bucket_state(bucket, memory_to_cross_inflight=False)
+                    if success:
+                        await self._update_bucket_state(bucket, memory_to_cross_done_fingerprint=memory_fp)
+                        continue
+                    break
+                if not memory_fp:
+                    cross_scope = _cross_domain_scope_for_bucket(bucket)
+                    if self.memory.get_entries(cross_scope):
+                        self.memory.replace_entries(cross_scope, [])
+                        await self._update_bucket_state(bucket, memory_to_cross_done_fingerprint="")
+                    break
+                break
+        finally:
+            current = asyncio.current_task()
+            if self._bucket_workers.get(bucket) is current:
+                self._bucket_workers.pop(bucket, None)
+
+    @staticmethod
+    def _normalize_ref_list(refs: Any, allowed: set[str] | None = None) -> list[str]:
+        if not isinstance(refs, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in refs:
+            ref = str(item).strip()
+            if not ref or ref in seen:
+                continue
+            if allowed is not None and ref not in allowed:
+                continue
+            seen.add(ref)
+            out.append(ref)
+        return out
+
+    def _note_ref_count(self, refs: list[str]) -> int:
+        return len(self._normalize_ref_list(refs))
+
+    def _entry_note_refs(self, entry: dict[str, Any]) -> list[str]:
+        return self.memory._entry_note_refs(entry)
+
+    def _entry_support_count(self, entry: dict[str, Any]) -> int:
+        return self.memory._entry_support_count(entry)
+
+    def _source_rule_note_refs(self, source_rule_ids: list[str]) -> list[str]:
+        if not source_rule_ids:
+            return []
+        refs: list[str] = []
+        seen: set[str] = set()
+        by_id = {
+            str(entry.get("rule_id", "")).strip(): entry
+            for entry in self.memory.get_all_entries()
+            if isinstance(entry, dict)
+        }
+        for rule_id in source_rule_ids:
+            entry = by_id.get(str(rule_id).strip())
+            if not entry:
+                continue
+            for ref in self._entry_note_refs(entry):
+                if ref in seen:
+                    continue
+                seen.add(ref)
+                refs.append(ref)
+        return refs
 
     @staticmethod
     def _score_rule_confidence(
@@ -1496,39 +2686,224 @@ class DistillationAgent:
                 other = entries_by_id.get(other_id)
                 if not other:
                     continue
-                support = int((other.get("evidence") or {}).get("support_count", 0) or 0)
+                support = MemoryStore._entry_support_count(other)
                 max_support = max(max_support, support)
         return max_support
+
+    @staticmethod
+    def _canonical_rule_text(text: str) -> str:
+        normalized = str(text or "").lower()
+        replacements = {
+            "self-consistency": "internal consistency",
+            "self consistency": "internal consistency",
+            "internally consistent": "internal consistency",
+            "internally coherent": "internal consistency",
+            "numerically consistent": "numeric consistency",
+            "numerical consistency": "numeric consistency",
+            "consistency-preserving": "consistency preserving",
+            "outputs": "output",
+            "results": "result",
+            "predictions": "prediction",
+            "answers": "answer",
+            "constraints": "constraint",
+            "heuristics": "heuristic",
+        }
+        for src, dst in replacements.items():
+            normalized = normalized.replace(src, dst)
+        normalized = re.sub(r"\bresults?\b", "output", normalized)
+        normalized = re.sub(r"\bpredictions?\b", "output", normalized)
+        normalized = re.sub(r"\banswers?\b", "output", normalized)
+        normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    @classmethod
+    def _rule_text_tokens(cls, text: str) -> set[str]:
+        stopwords = {
+            "a", "an", "and", "are", "as", "at", "be", "by", "do", "for",
+            "from", "good", "if", "in", "into", "is", "it", "of", "on",
+            "or", "must", "preserve", "remain", "same", "should", "stay",
+            "that", "the", "their", "them", "then", "this", "to", "under",
+            "use", "when", "with",
+        }
+        tokens: set[str] = set()
+        for token in cls._canonical_rule_text(text).split():
+            if len(token) <= 2 or token in stopwords:
+                continue
+            if token.endswith("ies") and len(token) > 4:
+                token = token[:-3] + "y"
+            elif token.endswith("s") and len(token) > 4:
+                token = token[:-1]
+            tokens.add(token)
+        return tokens
+
+    @classmethod
+    def _rule_similarity_signature(cls, entry: dict[str, Any]) -> dict[str, Any]:
+        summary = str(entry.get("summary", "")).strip()
+        conditions = [
+            str(item).strip()
+            for item in entry.get("conditions", [])
+            if str(item).strip()
+        ]
+        return {
+            "kind": str(entry.get("kind", "")).strip(),
+            "summary_text": cls._canonical_rule_text(summary),
+            "summary_tokens": cls._rule_text_tokens(summary),
+            "condition_tokens": cls._rule_text_tokens(" ".join(conditions)),
+            "preferred_tools": tuple(
+                str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()
+            ),
+            "avoid_tools": tuple(
+                str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()
+            ),
+        }
+
+    @staticmethod
+    def _token_overlap(left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        union = left | right
+        if not union:
+            return 0.0
+        return len(left & right) / len(union)
+
+    @classmethod
+    def _is_near_duplicate_rule(
+        cls,
+        existing_entry: dict[str, Any],
+        candidate_entry: dict[str, Any],
+    ) -> bool:
+        target_kinds = {"result_constraint", "domain_heuristic", "tool_failure"}
+        existing_sig = cls._rule_similarity_signature(existing_entry)
+        candidate_sig = cls._rule_similarity_signature(candidate_entry)
+
+        if existing_sig["kind"] not in target_kinds or candidate_sig["kind"] not in target_kinds:
+            return False
+        same_kind = existing_sig["kind"] == candidate_sig["kind"]
+        if not same_kind and {existing_sig["kind"], candidate_sig["kind"]} != {"result_constraint", "domain_heuristic"}:
+            return False
+        existing_preferred = set(existing_sig["preferred_tools"])
+        candidate_preferred = set(candidate_sig["preferred_tools"])
+        existing_avoid = set(existing_sig["avoid_tools"])
+        candidate_avoid = set(candidate_sig["avoid_tools"])
+
+        if same_kind and existing_sig["kind"] == "tool_failure":
+            same_tool_family = (
+                not existing_avoid and not candidate_avoid
+            ) or bool(existing_avoid & candidate_avoid)
+            if not same_tool_family:
+                return False
+            if existing_preferred != candidate_preferred:
+                return False
+        else:
+            if existing_preferred != candidate_preferred:
+                return False
+            if existing_avoid != candidate_avoid:
+                return False
+
+        summary_overlap = cls._token_overlap(
+            existing_sig["summary_tokens"], candidate_sig["summary_tokens"]
+        )
+        condition_overlap = cls._token_overlap(
+            existing_sig["condition_tokens"], candidate_sig["condition_tokens"]
+        )
+        summary_ratio = SequenceMatcher(
+            None,
+            existing_sig["summary_text"],
+            candidate_sig["summary_text"],
+        ).ratio()
+
+        condition_match = (
+            not existing_sig["condition_tokens"] and not candidate_sig["condition_tokens"]
+        ) or condition_overlap >= 0.6
+
+        if condition_match and summary_overlap >= 0.65:
+            return True
+        if condition_match and summary_ratio >= 0.82:
+            return True
+        if same_kind and existing_sig["kind"] == "tool_failure":
+            if condition_overlap >= 0.65 and (summary_ratio >= 0.62 or summary_overlap >= 0.33):
+                return True
+        if not same_kind:
+            cross_kind_condition_match = (
+                not existing_sig["condition_tokens"] and not candidate_sig["condition_tokens"]
+            ) or condition_overlap >= 0.55
+            if cross_kind_condition_match and (summary_ratio >= 0.60 or summary_overlap >= 0.30):
+                return True
+        return False
+
+    @classmethod
+    def _find_near_duplicate_rule_id(
+        cls,
+        entries: list[dict[str, Any]],
+        candidate_entry: dict[str, Any],
+        hinted_rule_id: str = "",
+    ) -> str:
+        by_id = {
+            str(entry.get("rule_id", "")).strip(): entry
+            for entry in entries
+            if str(entry.get("rule_id", "")).strip()
+        }
+        hint = str(hinted_rule_id).strip()
+        if hint and hint in by_id and cls._is_near_duplicate_rule(by_id[hint], candidate_entry):
+            return hint
+
+        best_rule_id = ""
+        best_score = 0.0
+        candidate_sig = cls._rule_similarity_signature(candidate_entry)
+        for entry in entries:
+            rule_id = str(entry.get("rule_id", "")).strip()
+            if not rule_id:
+                continue
+            if not cls._is_near_duplicate_rule(entry, candidate_entry):
+                continue
+            existing_sig = cls._rule_similarity_signature(entry)
+            overlap = cls._token_overlap(
+                existing_sig["summary_tokens"] | existing_sig["condition_tokens"],
+                candidate_sig["summary_tokens"] | candidate_sig["condition_tokens"],
+            )
+            ratio = SequenceMatcher(
+                None,
+                existing_sig["summary_text"],
+                candidate_sig["summary_text"],
+            ).ratio()
+            score = max(overlap, ratio)
+            if score > best_score:
+                best_score = score
+                best_rule_id = rule_id
+        return best_rule_id
 
     def _apply_memory_update_decision(
         self,
         scope: str,
         existing_entries: list[dict[str, Any]],
         decision: dict[str, Any],
+        available_note_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         entries = self.memory._dedupe_rule_ids([dict(entry) for entry in existing_entries])
         by_id = {str(entry.get("rule_id", "")).strip(): entry for entry in entries if str(entry.get("rule_id", "")).strip()}
         now = time.time()
 
-        support_updates: dict[str, int] = {}
+        available_note_ids = available_note_ids or set()
+        support_updates: dict[str, list[str]] = {}
         for item in decision.get("support_updates", []):
             if not isinstance(item, dict):
                 continue
             rule_id = str(item.get("rule_id", "")).strip()
             if not rule_id or rule_id not in by_id:
                 continue
-            try:
-                add_support = int(item.get("add_support", 0) or 0)
-            except Exception:
-                add_support = 0
-            if add_support > 0:
-                support_updates[rule_id] = support_updates.get(rule_id, 0) + add_support
+            note_ids = self._normalize_ref_list(item.get("support_note_ids", []), allowed=available_note_ids)
+            if note_ids:
+                support_updates.setdefault(rule_id, [])
+                for note_id in note_ids:
+                    if note_id not in support_updates[rule_id]:
+                        support_updates[rule_id].append(note_id)
 
         # Backward compatibility for older LLM outputs.
         for rule_id in decision.get("support_rule_ids", []):
             rid = str(rule_id).strip()
             if rid and rid in by_id:
-                support_updates[rid] = support_updates.get(rid, 0) + 1
+                support_updates.setdefault(rid, [])
         merge_groups = [
             [str(rule_id).strip() for rule_id in group if str(rule_id).strip() in by_id]
             for group in decision.get("merge_groups", [])
@@ -1548,10 +2923,16 @@ class DistillationAgent:
         }
 
         # Apply support increments before confidence recomputation.
-        for rule_id, add_support in support_updates.items():
+        for rule_id, added_note_ids in support_updates.items():
             entry = by_id[rule_id]
             evidence = dict(entry.get("evidence") or {})
-            evidence["support_count"] = int(evidence.get("support_count", 0) or 0) + int(add_support)
+            existing_refs = self._normalize_ref_list(evidence.get("sample_refs", []))
+            merged_refs = existing_refs[:]
+            for note_id in added_note_ids:
+                if note_id not in merged_refs:
+                    merged_refs.append(note_id)
+            evidence["sample_refs"] = merged_refs[:200]
+            evidence["support_count"] = len(evidence["sample_refs"])
             entry["evidence"] = evidence
             entry["timestamp"] = now
 
@@ -1561,18 +2942,18 @@ class DistillationAgent:
             survivors = [by_id[rule_id] for rule_id in group if rule_id in by_id and rule_id not in merged_away]
             if len(survivors) < 2:
                 continue
-            survivors.sort(key=lambda e: (int((e.get("evidence") or {}).get("support_count", 0) or 0), float(e.get("timestamp", 0.0) or 0.0)), reverse=True)
+            survivors.sort(key=lambda e: (self._entry_support_count(e), float(e.get("timestamp", 0.0) or 0.0)), reverse=True)
             keeper = survivors[0]
             keeper_evidence = dict(keeper.get("evidence") or {})
-            sample_refs = list(keeper_evidence.get("sample_refs", []) or [])
-            total_support = int(keeper_evidence.get("support_count", 0) or 0)
+            sample_refs = self._normalize_ref_list(keeper_evidence.get("sample_refs", []))
             for entry in survivors[1:]:
                 merged_away.add(str(entry.get("rule_id", "")).strip())
                 other_evidence = dict(entry.get("evidence") or {})
-                total_support += int(other_evidence.get("support_count", 0) or 0)
-                sample_refs.extend(other_evidence.get("sample_refs", []) or [])
-            keeper_evidence["support_count"] = total_support
-            keeper_evidence["sample_refs"] = sample_refs[:20]
+                for note_id in self._normalize_ref_list(other_evidence.get("sample_refs", [])):
+                    if note_id not in sample_refs:
+                        sample_refs.append(note_id)
+            keeper_evidence["sample_refs"] = sample_refs[:200]
+            keeper_evidence["support_count"] = len(keeper_evidence["sample_refs"])
             keeper["evidence"] = keeper_evidence
             keeper["timestamp"] = now
 
@@ -1584,19 +2965,41 @@ class DistillationAgent:
         for idx, payload in enumerate(decision.get("new_rules", [])):
             if not isinstance(payload, dict):
                 continue
+            note_ids = self._normalize_ref_list(payload.get("support_note_ids", []), allowed=available_note_ids)
+            if not note_ids:
+                continue
             normalized = self.memory._normalize_rule_payload(scope, payload, base_index + idx)
             normalized["timestamp"] = now
             normalized["injectable"] = True
             normalized["status"] = "active"
+            duplicate_rule_id = self._find_near_duplicate_rule_id(
+                entries,
+                normalized,
+                hinted_rule_id=str(payload.get("closest_existing_rule_id", "")).strip(),
+            )
+            if duplicate_rule_id and duplicate_rule_id in by_id:
+                target = by_id[duplicate_rule_id]
+                evidence = dict(target.get("evidence") or {})
+                merged_refs = self._normalize_ref_list(evidence.get("sample_refs", []))
+                for note_id in note_ids:
+                    if note_id not in merged_refs:
+                        merged_refs.append(note_id)
+                evidence["sample_refs"] = merged_refs[:200]
+                evidence["support_count"] = len(evidence["sample_refs"])
+                target["evidence"] = evidence
+                target["timestamp"] = now
+                logger.info(
+                    f"[Distill Notes→MEMORY] {scope}: merged near-duplicate new rule into {duplicate_rule_id}"
+                )
+                continue
             evidence = dict(normalized.get("evidence") or {})
-            try:
-                initial_support = int(payload.get("initial_support", 1) or 1)
-            except Exception:
-                initial_support = 1
-            evidence["support_count"] = max(1, initial_support)
-            evidence["sample_refs"] = []
+            evidence["sample_refs"] = note_ids[:200]
+            evidence["support_count"] = len(evidence["sample_refs"])
             normalized["evidence"] = evidence
             entries.append(normalized)
+            rule_id = str(normalized.get("rule_id", "")).strip()
+            if rule_id:
+                by_id[rule_id] = normalized
 
         by_id = {str(entry.get("rule_id", "")).strip(): entry for entry in entries if str(entry.get("rule_id", "")).strip()}
 
@@ -1605,7 +3008,7 @@ class DistillationAgent:
             rule_id = str(entry.get("rule_id", "")).strip()
             max_conflict_support = self._max_conflict_support(rule_id, conflict_groups, by_id)
             evidence = dict(entry.get("evidence") or {})
-            support_count = int(evidence.get("support_count", 0) or 0)
+            support_count = self._entry_support_count(entry)
             entry["confidence"] = self._score_rule_confidence(
                 support_count=support_count,
                 last_seen_at=float(entry.get("timestamp", now) or now),
@@ -1618,14 +3021,14 @@ class DistillationAgent:
             key=lambda entry: (
                 not bool(entry.get("injectable", True)),
                 -float(entry.get("confidence", 0.0) or 0.0),
-                -int((entry.get("evidence") or {}).get("support_count", 0) or 0),
+                -self._entry_support_count(entry),
             )
         )
         return self.memory._dedupe_rule_ids(entries)
 
     @staticmethod
     def _normalize_task_for_notes(task: str) -> str:
-        """Map dataset task names to the task labels stored in daily notes."""
+        """Map dataset task names to the task labels stored in notes."""
         return {
             "mcqa": "qa",
             "trend": "classification",
@@ -1633,7 +3036,7 @@ class DistillationAgent:
 
     @staticmethod
     def _denormalize_task_from_notes(task: str) -> str:
-        """Map daily-note task labels back to canonical memory scope names."""
+        """Map note task labels back to canonical memory scope names."""
         return {
             "qa": "mcqa",
             "classification": "trend",
@@ -1646,9 +3049,16 @@ class DistillationAgent:
 
         titles = {
             "Scope",
+            "Source",
             "Task",
+            "Task Prompt",
+            "Numeric Time Series",
+            "Text Context",
+            "Winner Tools",
             "Tools",
             "Winner Tool",
+            "Winner Generator Tools",
+            "Winner Validation Tools",
             "Prediction",
             "Metrics",
             "Fingerprint",
@@ -1717,7 +3127,11 @@ class DistillationAgent:
         parsed = DistillationAgent._parse_note_sections(note)
         tools_section = parsed["sections"].get("Tools", "").strip()
         if not tools_section:
+            tools_section = parsed["sections"].get("Winner Tools", "").strip()
+        if not tools_section:
             tools_section = parsed["sections"].get("Winner Tool", "").strip()
+        if not tools_section:
+            tools_section = parsed["sections"].get("Winner Generator Tools", "").strip()
         if tools_section:
             tools: list[str] = []
             for line in tools_section.splitlines():
@@ -1728,7 +3142,7 @@ class DistillationAgent:
                     tools.append(item)
             return tools
 
-        legacy_match = re.search(r"(?:Tools|Winner Tool):\s*(.+?)(?:\s*\|)", note)
+        legacy_match = re.search(r"(?:Tools|Winner Tools|Winner Tool|Winner Generator Tools):\s*(.+?)(?:\s*\|)", note)
         if not legacy_match:
             return []
         chain = [t.strip() for t in legacy_match.group(1).split("→")]
@@ -1842,7 +3256,7 @@ class DistillationAgent:
             lines.append("\nMetric averages:")
             for k, vals in sorted(metric_sums.items()):
                 avg = sum(vals) / len(vals)
-                lines.append(f"  {k}: avg={avg:.4f} (n={len(vals)})")
+                lines.append(f"  {k}: avg={avg:.3f} (n={len(vals)})")
 
         return "\n".join(lines) if lines else "(no statistics available)"
 
@@ -1881,7 +3295,7 @@ class DistillationAgent:
                 metric_parts = []
                 for mk, mvs in sorted(tool_metrics[t].items()):
                     avg = sum(mvs) / len(mvs)
-                    metric_parts.append(f"{mk}={avg:.4f}")
+                    metric_parts.append(f"{mk}={avg:.3f}")
                 if metric_parts:
                     line += f" | {', '.join(metric_parts)}"
             lines.append(line)
@@ -1918,13 +3332,13 @@ class DistillationAgent:
             return action_text[:160]
         return cond_text[:160]
 
-    def _build_tool_evidence_from_memory(self) -> dict[str, dict[str, Any]]:
-        """Collect tool-centered evidence bundles from MEMORY rules."""
+    def _build_tool_evidence_from_memory(self, scope: str) -> dict[str, dict[str, Any]]:
+        """Collect scope-local tool-centered evidence bundles from MEMORY rules."""
         from collections import defaultdict
 
         all_entries = [
             entry for entry in self.memory.get_all_entries()
-            if str(entry.get("scope", "")).strip() != CROSS_DOMAIN_SCOPE
+            if str(entry.get("scope", "")).strip() == scope
         ]
         grouped: dict[str, dict[str, list[tuple[int, str]]]] = defaultdict(
             lambda: {
@@ -1935,7 +3349,7 @@ class DistillationAgent:
         )
 
         for entry in all_entries:
-            support = int((entry.get("evidence") or {}).get("support_count", 0) or 0)
+            support = self._entry_support_count(entry)
             if support <= 0:
                 continue
             kind = str(entry.get("kind", "")).strip()
@@ -1978,45 +3392,61 @@ class DistillationAgent:
 
     # ── Notes → MEMORY.md ─────────────────────────────────────────────
 
-    async def maybe_distill_notes_to_memory(self, scope: str) -> bool:
+    async def maybe_distill_notes_to_memory(self, scope: str, *, target_seq: int | None = None, force: bool = False) -> bool:
         key = scope
-        current = self.daily.total
-        last = self._notes_distilled_at.get(key, 0)
-        if current - last < _DISTILL_L1_TO_L2:
+        state = await self._get_scope_state(key)
+        done_seq = int(state.get("notes_to_memory_done_seq", 0) or 0)
+        note_items = self.notes.get_scope_note_items(key)
+        current = len(note_items)
+        target = min(int(target_seq or current), current)
+        if target <= done_seq:
+            return False
+        if not force and not self._threshold_reached(target, done_seq, _DISTILL_L1_TO_L2):
             return False
 
-        logger.info(f"[Distill Notes→MEMORY] {key}: {current} notes (+{current - last})")
-        self._notes_distilled_at[key] = current
-
-        await self.daily.resolve_conflicts(query=scope, scope=scope)
-
-        notes = self.daily.search(
-            query=f"{scope} error failure wrong",
-            k=30, scope=scope,
-        )
-        success_notes = self.daily.search(
-            query=f"{scope} correct success",
-            k=15, scope=scope,
-        )
-        all_notes = notes + success_notes
-        if len(all_notes) < 2:
+        pending_notes = note_items[done_seq:target]
+        if len(pending_notes) < 2:
             return False
 
-        statistics = self._compute_statistics(all_notes)
-        notes_text = "\n\n".join(f"- {n}" for n in all_notes[:30])
+        logger.info(f"[Distill Notes→MEMORY] {key}: processing notes {done_seq + 1}-{target} of {current}")
+
+        await self.notes.resolve_conflicts(query=scope, scope=scope)
+
+        note_texts = [item["text"] for item in pending_notes]
+        available_note_ids = {item["id"] for item in pending_notes}
+        statistics = self._compute_statistics(note_texts)
+        notes_text = "\n\n".join(
+            f"- note_id={item['id']}\n{item['text']}"
+            for item in pending_notes
+        )
 
         existing_memory = self.memory.get_entries(key)
-        existing_text = "\n".join(
-            f"  - rule_id={e.get('rule_id','')}; kind={e.get('kind','')}; "
-            f"summary={e.get('summary','')}; support_count={(e.get('evidence') or {}).get('support_count', 0)}; "
-            f"last_seen_at={e.get('timestamp', 0.0)}; confidence={e.get('confidence', 0.0)}; "
-            f"injectable={e.get('injectable', True)}"
-            for e in existing_memory
-        ) if existing_memory else "(none yet)"
+        existing_blocks: list[str] = []
+        for e in existing_memory:
+            existing_blocks.append(
+                "\n".join(
+                    [
+                        f"  - rule_id={e.get('rule_id', '')}",
+                        f"    kind={e.get('kind', '')}",
+                        f"    summary={e.get('summary', '')}",
+                        f"    conditions={json.dumps(e.get('conditions', []), ensure_ascii=False)}",
+                        f"    preferred_tools={json.dumps(e.get('preferred_tools', []), ensure_ascii=False)}",
+                        f"    avoid_tools={json.dumps(e.get('avoid_tools', []), ensure_ascii=False)}",
+                        f"    rationale={e.get('rationale', '')}",
+                        f"    support_count={self._entry_support_count(e)}",
+                        f"    support_note_ids={json.dumps(self._entry_note_refs(e), ensure_ascii=False)}",
+                        f"    last_seen_at={e.get('timestamp', 0.0)}",
+                        f"    confidence={e.get('confidence', 0.0)}",
+                        f"    injectable={e.get('injectable', True)}",
+                    ]
+                )
+            )
+        existing_text = "\n\n".join(existing_blocks) if existing_blocks else "(none yet)"
 
         prompt = NOTES_TO_MEMORY_PROMPT.format(
-            scope=key, total=len(all_notes),
+            scope=key, total=len(pending_notes),
             statistics=statistics, notes=notes_text,
+            memory_rule_cap=_MEMORY_RULE_CAP,
             existing_memory=existing_text,
         )
 
@@ -2033,7 +3463,9 @@ class DistillationAgent:
                 response_format="json",
             )
             if resp.parsed and isinstance(resp.parsed, dict):
-                updated_entries = self._apply_memory_update_decision(key, existing_memory, resp.parsed)
+                updated_entries = self._apply_memory_update_decision(
+                    key, existing_memory, resp.parsed, available_note_ids=available_note_ids
+                )
                 self.memory.replace_entries(key, updated_entries)
                 logger.info(
                     f"[Distill Notes→MEMORY] {key}: updated to {len(self.memory.get_entries(key))} rules "
@@ -2045,27 +3477,22 @@ class DistillationAgent:
 
     # ── Notes → TOOLS.md ──────────────────────────────────────────────
 
-    async def maybe_distill_notes_to_tools(self) -> bool:
-        """Derive TOOLS.md from tool-related MEMORY rules.
-
-        Scope usage counters still come from daily notes, but tool cards
-        themselves are derived from already-distilled MEMORY rather than
-        exploration winners in raw notes.
-        """
-        full_notes = self.daily.get_recent_notes(10000)
+    async def maybe_distill_memory_to_tools(self, scope: str) -> bool:
+        """Rebuild scope-local tool cards from the current full MEMORY view."""
+        full_notes = self.notes.get_recent_notes(10000)
         if full_notes:
             self._update_scope_counts(full_notes)
 
-        tool_evidence = self._build_tool_evidence_from_memory()
+        tool_evidence = self._build_tool_evidence_from_memory(scope)
         if not tool_evidence:
-            self.tools.update({})
-            logger.info("[Distill MEMORY→TOOLS] Updated 0 tool notes")
+            self.tools.replace(scope, {})
+            logger.info(f"[Distill MEMORY→TOOLS] Rebuilt 0 tool notes for {scope}")
             return True
 
         existing_text = "\n".join(
             f"- **{k}**: {self.tools._render_note_payload(v)}"
-            for k, v in self.tools.get_notes().items()
-        ) if self.tools.total() > 0 else "(none yet)"
+            for k, v in self.tools.get_notes(scope).items()
+        ) if self.tools.get_notes(scope) else "(none yet)"
         tool_evidence_text = json.dumps(tool_evidence, ensure_ascii=False, indent=2)
 
         prompt = MEMORY_TO_TOOLS_PROMPT.format(
@@ -2083,11 +3510,11 @@ class DistillationAgent:
                 response_format="json",
             )
             if resp.parsed and isinstance(resp.parsed, dict) and isinstance(resp.parsed.get("tool_notes"), dict):
-                self.tools.update(resp.parsed["tool_notes"])
-                logger.info(f"[Distill MEMORY→TOOLS] Updated {len(resp.parsed['tool_notes'])} tool notes")
+                self.tools.replace(scope, resp.parsed["tool_notes"])
+                logger.info(f"[Distill MEMORY→TOOLS] Rebuilt {len(resp.parsed['tool_notes'])} tool notes for {scope}")
                 return True
         except Exception as e:
-            logger.warning(f"[Distill MEMORY→TOOLS] failed: {e}")
+            logger.warning(f"[Distill MEMORY→TOOLS] {scope} failed: {e}")
         return False
 
     def _update_scope_counts(self, notes: list[str]) -> None:
@@ -2111,7 +3538,7 @@ class DistillationAgent:
             self.tools.record_scope_usage(scope, counts)
 
     def _extract_scope_from_note(self, note: str) -> str:
-        """Extract the canonical scope key from a daily-note block."""
+        """Extract the canonical scope key from a note block."""
         import re
 
         parsed = self._parse_note_sections(note)
@@ -2130,29 +3557,44 @@ class DistillationAgent:
 
     # ── MEMORY → cross_domain scope ──────────────────────────────────────
 
-    async def maybe_distill_memory_to_cross_domain(self) -> bool:
-        current = self.memory.total()
-        if current - self._memory_distilled_at < _DISTILL_L2_TO_CROSS:
-            return False
-
-        logger.info(f"[Distill MEMORY→cross_domain] {current} entries (+{current - self._memory_distilled_at})")
-        self._memory_distilled_at = current
-
-        all_memory = self.memory.get_all_entries()
+    async def maybe_distill_memory_to_cross_domain(self, bucket: str) -> bool:
+        cross_scope = _cross_domain_scope_for_bucket(bucket)
+        all_memory = [
+            entry for entry in self.memory.get_all_entries()
+            if _task_bucket_from_scope(str(entry.get("scope", "")).strip()) == bucket
+            and not _is_cross_domain_scope(str(entry.get("scope", "")).strip())
+        ]
         if len(all_memory) < 4:
-            return False
+            self.memory.replace_entries(cross_scope, [])
+            logger.info(f"[Distill MEMORY→cross_domain] {bucket}: cleared cross-domain rules")
+            return True
 
-        memory_text = "\n".join(
-            f"  [{e.get('scope', '?')}] {e.get('summary', '')}"
-            for e in all_memory[-60:]
-        )
+        logger.info(f"[Distill MEMORY→cross_domain] {bucket}: rebuilding from {len(all_memory)} rules")
 
-        existing_cross = self.memory.get_cross_domain_entries()
+        memory_lines = []
+        for entry in all_memory:
+            preferred = ", ".join(entry.get("preferred_tools", [])[:4])
+            avoid = ", ".join(entry.get("avoid_tools", [])[:4])
+            parts = [
+                f"  rule_id={entry.get('rule_id', '')}",
+                f"scope={entry.get('scope', '?')}",
+                f"summary={entry.get('summary', '')}",
+                f"support_count={self._entry_support_count(entry)}",
+            ]
+            if preferred:
+                parts.append(f"prefer_tools={preferred}")
+            if avoid:
+                parts.append(f"avoid_tools={avoid}")
+            memory_lines.append(" | ".join(parts))
+        memory_text = "\n".join(memory_lines)
+
+        existing_cross = self.memory.get_cross_domain_entries(bucket)
         existing_text = "\n".join(
             f"  - {e.get('summary', '')}" for e in existing_cross
         ) if existing_cross else "(none yet)"
 
         prompt = MEMORY_TO_CROSS_DOMAIN_PROMPT.format(
+            allowed_tool_names=", ".join(sorted(_available_tool_names())),
             all_memory_entries=memory_text,
             existing_cross_domain=existing_text,
         )
@@ -2171,32 +3613,47 @@ class DistillationAgent:
                 for i, rule in enumerate(resp.parsed["rules"]):
                     if not isinstance(rule, dict):
                         continue
-                    normalized = self.memory._normalize_rule_payload(CROSS_DOMAIN_SCOPE, rule, i)
+                    normalized = self.memory._normalize_rule_payload(cross_scope, rule, i)
+                    source_rule_ids = self._normalize_ref_list(
+                        rule.get("source_rule_ids", []),
+                        allowed={
+                            str(entry.get("rule_id", "")).strip()
+                            for entry in all_memory
+                            if str(entry.get("rule_id", "")).strip()
+                        },
+                    )
+                    note_refs = self._source_rule_note_refs(source_rule_ids)
                     evidence = normalized.get("evidence", {})
-                    evidence["support_count"] = len(all_memory)
+                    evidence["sample_refs"] = note_refs
+                    evidence["support_count"] = len(note_refs)
                     normalized["evidence"] = evidence
+                    normalized["source_rule_ids"] = source_rule_ids
                     new_entries.append(normalized)
-                self.memory.add_entries(
-                    CROSS_DOMAIN_SCOPE, new_entries,
-                    removed_rule_ids=removed_rule_ids,
-                )
-                n_cross = len(self.memory.get_cross_domain_entries())
+                if removed_rule_ids:
+                    allowed_removed = {str(item).strip() for item in removed_rule_ids if str(item).strip()}
+                    new_entries = [
+                        entry for entry in new_entries
+                        if str(entry.get("rule_id", "")).strip() not in allowed_removed
+                    ]
+                self.memory.replace_entries(cross_scope, new_entries)
+                n_cross = len(self.memory.get_cross_domain_entries(bucket))
                 logger.info(
-                    f"[Distill MEMORY→cross_domain] Updated to {n_cross} cross-domain rules "
+                    f"[Distill MEMORY→cross_domain] {bucket}: updated to {n_cross} cross-domain rules "
                     f"(removed {len(removed_rule_ids)})"
                 )
                 return True
         except Exception as e:
-            logger.warning(f"[Distill MEMORY→cross_domain] failed: {e}")
+            logger.warning(f"[Distill MEMORY→cross_domain] {bucket} failed: {e}")
         return False
 
     # ── MEMORY → PLAYBOOKS/ ────────────────────────────────────────────
 
     async def maybe_distill_memory_to_skills(self, scope: str) -> bool:
-        """Generate/update a SKILLS/ SOP from MEMORY insights for a scope."""
+        """Rebuild a SKILLS/ SOP from the current full MEMORY view for one scope."""
         entries = self.memory.get_entries(scope)
         if len(entries) < 3:
-            return False
+            self.skills.delete_skill(scope)
+            return True
 
         skill_entries: list[str] = []
         for entry in entries:
@@ -2218,7 +3675,7 @@ class DistillationAgent:
                         f"  rationale: {entry.get('rationale', '')}",
                         f"  preferred_tools: {json.dumps(preferred_tools, ensure_ascii=False, default=str)}",
                         f"  avoid_tools: {json.dumps(avoid_tools, ensure_ascii=False, default=str)}",
-                        f"  support_count: {evidence.get('support_count', 0)}",
+                        f"  support_count: {self._entry_support_count(entry)}",
                         f"  injectable: {entry.get('injectable', True)}",
                     ]
                 )
@@ -2250,58 +3707,111 @@ class DistillationAgent:
     # ── Orchestration ─────────────────────────────────────────────────
 
     async def on_new_note(self, scope: str) -> None:
-        """Called after each daily note is added. Triggers distillation cascade."""
-        did_memory = await self.maybe_distill_notes_to_memory(scope)
-        if did_memory:
-            await self.maybe_distill_memory_to_cross_domain()
-            await self.maybe_distill_memory_to_skills(scope)
-            await self.maybe_distill_notes_to_tools()
+        """Backward-compatible wrapper for single-scope commits."""
+        await self.on_scope_commit([scope])
+        await self.on_global_commit([scope])
 
     async def force_distill_all(self) -> None:
-        """Force distillation for all scopes."""
+        """Force a full rebuild from current notes/memory sources."""
         scopes = set()
         for f in MEMORY_DIR.glob("*.json"):
             scopes.add(f.stem)
-        notes = self.daily.get_recent_notes(10000)
+        notes = self.notes.get_recent_notes(10000)
         for note in notes:
             scope = self._extract_scope_from_note(note)
             if scope:
                 scopes.add(scope)
 
         for scope in scopes:
-            if scope == CROSS_DOMAIN_SCOPE:
+            if _is_cross_domain_scope(scope):
                 continue
-            self._notes_distilled_at[scope] = 0
-            await self.maybe_distill_notes_to_memory(scope)
-            await self.maybe_distill_memory_to_skills(scope)
+            note_total = self.notes.scoped_total(scope)
+            await self._update_scope_state(
+                scope,
+                notes_total_seq=note_total,
+                notes_to_memory_done_seq=0,
+                notes_to_memory_inflight=False,
+                memory_fingerprint="",
+                memory_to_skills_done_fingerprint="",
+                memory_to_skills_inflight=False,
+                memory_to_tools_done_fingerprint="",
+                memory_to_tools_inflight=False,
+            )
+            self._ensure_scope_worker(scope, force=True)
 
-        self._memory_distilled_at = 0
-        await self.maybe_distill_memory_to_cross_domain()
-        await self.maybe_distill_notes_to_tools()
+        buckets = sorted({_task_bucket_from_scope(scope) for scope in scopes if not _is_cross_domain_scope(scope)})
+        for bucket in buckets:
+            if not bucket:
+                continue
+            await self._update_bucket_state(
+                bucket,
+                memory_fingerprint="",
+                memory_to_cross_done_fingerprint="",
+                memory_to_cross_inflight=False,
+            )
+            self._ensure_bucket_worker(bucket, force=True)
+        await self.distill_pending_all()
 
     async def distill_pending_all(self) -> None:
-        """Finish only pending incremental distillation without resetting counters."""
+        """Drain all currently pending distillation work, including short tails."""
         scopes = set()
         for f in MEMORY_DIR.glob("*.json"):
             scopes.add(f.stem)
-        notes = self.daily.get_recent_notes(10000)
+        notes = self.notes.get_recent_notes(10000)
         for note in notes:
             scope = self._extract_scope_from_note(note)
             if scope:
                 scopes.add(scope)
 
-        did_memory_any = False
-        for scope in scopes:
-            if scope == CROSS_DOMAIN_SCOPE:
-                continue
-            did_memory = await self.maybe_distill_notes_to_memory(scope)
-            if did_memory:
-                did_memory_any = True
-                await self.maybe_distill_memory_to_skills(scope)
+        scope_list = [scope for scope in scopes if not _is_cross_domain_scope(scope)]
+        bucket_list = sorted({_task_bucket_from_scope(scope) for scope in scope_list})
 
-        if did_memory_any:
-            await self.maybe_distill_memory_to_cross_domain()
-            await self.maybe_distill_notes_to_tools()
+        for scope in scope_list:
+            await self._update_scope_state(scope, notes_total_seq=self.notes.scoped_total(scope))
+
+        while True:
+            for scope in scope_list:
+                self._ensure_scope_worker(scope, force=True)
+
+            for bucket in bucket_list:
+                if not bucket:
+                    continue
+                self._ensure_bucket_worker(bucket, force=True)
+
+            scope_tasks = [task for task in self._scope_workers.values() if not task.done()]
+            bucket_tasks = [task for task in self._bucket_workers.values() if not task.done()]
+            pending = scope_tasks + bucket_tasks
+            if not pending:
+                break
+            await asyncio.gather(*pending)
+
+            tails_left = False
+            for scope in scope_list:
+                state = await self._get_scope_state(scope)
+                if self.notes.scoped_total(scope) > int(state.get("notes_to_memory_done_seq", 0) or 0):
+                    tails_left = True
+                    break
+                memory_fp = self._scope_memory_fingerprint(scope)
+                if memory_fp != str(state.get("memory_to_skills_done_fingerprint", "") or ""):
+                    tails_left = True
+                    break
+                if memory_fp != str(state.get("memory_to_tools_done_fingerprint", "") or ""):
+                    tails_left = True
+                    break
+
+            if tails_left:
+                continue
+
+            cross_left = False
+            for bucket in bucket_list:
+                if not bucket:
+                    continue
+                state = await self._get_bucket_state(bucket)
+                if self._bucket_memory_fingerprint(bucket) != str(state.get("memory_to_cross_done_fingerprint", "") or ""):
+                    cross_left = True
+                    break
+            if not cross_left:
+                break
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2313,7 +3823,7 @@ class HierarchicalMemory:
 
     Components (aligned with OpenClaw naming):
         soul_text   — Fixed SOUL.md (agent identity)
-        daily       — DailyNotes (raw experience log)
+        notes       — Notes (raw experience log)
         memory      — MemoryStore (causal insights, per-scope + cross_domain)
         tools       — ToolsStore (per-tool usage experience notes)
         skills      — SkillsStore (scene-specific SOPs)
@@ -2321,32 +3831,31 @@ class HierarchicalMemory:
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        self._pending_distill_tasks: set[asyncio.Task[Any]] = set()
         if enabled:
             MEMORY_ROOT.mkdir(parents=True, exist_ok=True)
             self.soul_text = load_soul()
-            self.daily = DailyNotes()
+            self.notes = Notes()
             self.memory = MemoryStore()
             self.tools = ToolsStore()
             self.skills = SkillsStore()
             self.distiller = DistillationAgent(
-                self.daily, self.memory,
+                self.notes, self.memory,
                 self.tools, self.skills,
             )
-            n_daily = self.daily.total
+            n_notes = self.notes.total
             n_memory = self.memory.total()
             n_cross = len(self.memory.get_cross_domain_entries())
             n_tools = self.tools.total()
             n_skills = self.skills.total()
-            if n_daily + n_memory > 0:
+            if n_notes + n_memory > 0:
                 logger.info(
                     f"[AgentMemory] Loaded: "
-                    f"daily={n_daily}, MEMORY={n_memory} (cross_domain={n_cross}), "
+                    f"notes={n_notes}, MEMORY={n_memory} (cross_domain={n_cross}), "
                     f"TOOLS={n_tools}, SKILLS={n_skills}"
                 )
         else:
             self.soul_text = ""
-            self.daily = None
+            self.notes = None
             self.memory = None
             self.tools = None
             self.skills = None
@@ -2355,7 +3864,7 @@ class HierarchicalMemory:
     # Backward compatibility aliases
     @property
     def l1(self):
-        return self.daily
+        return self.notes
 
     @property
     def l2(self):
@@ -2371,9 +3880,8 @@ class HierarchicalMemory:
         """Backward compat: renamed to skills."""
         return self.skills
 
-    async def record(self, **run_context) -> None:
-        if not self.enabled:
-            return
+    @staticmethod
+    def _normalized_scope_keys(run_context: dict[str, Any]) -> list[str]:
         scope_keys = run_context.get("scope_keys") or []
         if not scope_keys:
             scope_key = run_context.get("scope_key", "")
@@ -2385,12 +3893,30 @@ class HierarchicalMemory:
             if domain and task:
                 scope_keys = [f"{domain}_{task}"]
 
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw_scope in scope_keys:
+            scope = str(raw_scope).strip()
+            if not scope or scope in seen:
+                continue
+            seen.add(scope)
+            ordered.append(scope)
+        return ordered
+
+    async def record(self, **run_context) -> None:
+        if not self.enabled:
+            return
+        scope_keys = self._normalized_scope_keys(run_context)
+        if not scope_keys:
+            return
+
+        committed_scopes: list[str] = []
         for scope_key in scope_keys:
-            count = await self.daily.add({**run_context, "scope_key": scope_key})
-            if count % _DISTILL_L1_TO_L2 == 0 and scope_key:
-                task = asyncio.create_task(self.distiller.on_new_note(scope_key))
-                self._pending_distill_tasks.add(task)
-                task.add_done_callback(self._pending_distill_tasks.discard)
+            await self.notes.add({**run_context, "scope_key": scope_key})
+            if scope_key:
+                committed_scopes.append(scope_key)
+        if committed_scopes:
+            await self.distiller.on_commit(committed_scopes)
 
     def get_memory(
         self, query: str, domain: str = "", task: str = "",
@@ -2419,10 +3945,10 @@ class HierarchicalMemory:
     ) -> dict[str, str]:
         if not self.enabled or not self.tools:
             return {}
-        names = tool_names or list(self.tools.get_notes().keys())
         if scope_keys:
             merged: dict[str, str] = {}
             for scope in scope_keys:
+                names = tool_names or list(self.tools.get_notes(scope).keys())
                 scoped_notes = self.tools.get_prompt_for_tools(names, scope)
                 for tool_name, note in scoped_notes.items():
                     existing = merged.get(tool_name, "")
@@ -2435,6 +3961,7 @@ class HierarchicalMemory:
             return merged
 
         scope = f"{domain}_{task}" if domain and task else ""
+        names = tool_names or list(self.tools.get_notes(scope).keys())
         return self.tools.get_prompt_for_tools(names, scope)
 
     def get_skill(self, domain: str, task: str, scope_keys: list[str] | None = None) -> str:
@@ -2450,27 +3977,23 @@ class HierarchicalMemory:
         return self.get_skill(domain, task)
 
     async def flush(self) -> None:
-        if not self._pending_distill_tasks:
-            return
-        pending = tuple(self._pending_distill_tasks)
-        await asyncio.gather(*pending, return_exceptions=True)
+        if self.enabled and self.distiller:
+            await self.distiller.distill_pending_all()
 
     async def force_distill(self) -> None:
         if self.enabled and self.distiller:
             await self.distiller.force_distill_all()
 
     async def distill_pending(self) -> None:
-        if not self.enabled or not self.distiller:
-            return
-        await self.flush()
-        await self.distiller.distill_pending_all()
+        if self.enabled and self.distiller:
+            await self.distiller.distill_pending_all()
 
     def summary(self) -> dict[str, Any]:
         if not self.enabled:
             return {"enabled": False}
         return {
             "enabled": True,
-            "daily_notes": self.daily.total,
+            "notes": self.notes.total,
             "memory_insights": self.memory.total(),
             "cross_domain_insights": len(self.memory.get_cross_domain_entries()),
             "tool_notes": self.tools.total(),

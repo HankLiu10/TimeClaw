@@ -1,4 +1,4 @@
-"""TimesFM adapter: Google's time-series foundation model."""
+"""TimesFM adapter backed by Google TimesFM 2.0."""
 
 from __future__ import annotations
 
@@ -10,61 +10,78 @@ from loguru import logger
 from timeclaw.sbm.base import SBMBase, SBMConfig, SBMOutput, SBMTask
 
 TIMESFM_DEFAULT_CONFIG = SBMConfig(
-    model_name="timesfm",
+    model_name="timesfm2",
     model_path="google/timesfm-2.0-500m-pytorch",
-    context_length=512,
+    context_length=2048,
     prediction_length=128,
-    extra={
-        "num_layers": 50,
-        "model_dims": 1280,
-        "input_patch_len": 32,
-        "output_patch_len": 128,
-        "use_positional_embedding": False,
-    },
 )
+
+_TIMESFM2_FIXED_HPARAMS = {
+    "input_patch_len": 32,
+    "output_patch_len": 128,
+    "num_layers": 50,
+    "model_dims": 1280,
+    "use_positional_embedding": False,
+}
 
 
 class TimesFMAdapter(SBMBase):
-    """Adapter for Google TimesFM foundation model.
+    """Adapter for Google TimesFM 2.0.
 
-    TimesFM is a decoder-only model pre-trained on a large corpus of
-    real-world and synthetic time series, supporting zero-shot forecasting.
+    New definition:
+        TimeClaw now loads TimesFM through the official ``timesfm`` package and
+        the official ``google/timesfm-2.0-500m-pytorch`` checkpoint, instead of
+        the previous ad hoc Transformers 2.5 route.
+
+    Why the fixed hparams are required:
+        The official 500M checkpoint is not shape-compatible with arbitrary
+        defaults. The following parameters must match the model card exactly:
+        ``input_patch_len=32``, ``output_patch_len=128``, ``num_layers=50``,
+        ``model_dims=1280``, ``use_positional_embedding=False``.
     """
 
-    name: str = "timesfm"
+    name: str = "timesfm2"
     supported_tasks: list[SBMTask] = [SBMTask.FORECAST]
     requires_gpu: bool = True
 
     def load(self) -> None:
         try:
-            import timesfm as tfm
-        except ImportError:
+            import torch
+            import timesfm
+        except ImportError as e:
             raise ImportError(
-                "timesfm is required: pip install timesfm"
-            )
+                "TimesFM 2.0 requires the official `timesfm` package and torch"
+            ) from e
 
         model_path = self.config.model_path or "google/timesfm-2.0-500m-pytorch"
-        backend = "gpu" if self.config.device in ("cuda", "auto") else "cpu"
-        logger.info(f"Loading TimesFM from {model_path} on {backend}")
-        extra = self.config.extra
+        device = self.config.device
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self._model = tfm.TimesFm(
-            hparams=tfm.TimesFmHparams(
+        backend = "gpu" if str(device).startswith("cuda") and torch.cuda.is_available() else "cpu"
+        logger.info(f"Loading TimesFM 2.0 from {model_path} on {device} (backend={backend})")
+
+        model = timesfm.TimesFm(
+            hparams=timesfm.TimesFmHparams(
                 backend=backend,
-                per_core_batch_size=self.config.batch_size,
-                horizon_len=self.config.prediction_length,
                 context_len=self.config.context_length,
-                num_layers=extra.get("num_layers", 50),
-                model_dims=extra.get("model_dims", 1280),
-                input_patch_len=extra.get("input_patch_len", 32),
-                output_patch_len=extra.get("output_patch_len", 128),
-                use_positional_embedding=extra.get("use_positional_embedding", False),
+                horizon_len=self.config.prediction_length,
+                per_core_batch_size=max(1, int(self.config.batch_size)),
+                **_TIMESFM2_FIXED_HPARAMS,
             ),
-            checkpoint=tfm.TimesFmCheckpoint(
+            checkpoint=timesfm.TimesFmCheckpoint(
                 huggingface_repo_id=model_path,
             ),
         )
-        logger.info("TimesFM loaded successfully")
+
+        target_device = torch.device(device)
+        if model._device != target_device:
+            model._model.to(target_device)
+            model._device = target_device
+
+        self._model = model
+        self._device = target_device
+        logger.info("TimesFM 2.0 loaded successfully")
 
     def forecast(
         self,
@@ -75,32 +92,45 @@ class TimesFMAdapter(SBMBase):
         if not self.is_loaded:
             self.load()
 
-        pred_len = prediction_length or self.config.prediction_length
+        pred_len = int(prediction_length or self.config.prediction_length)
+        max_horizon = int(self.config.prediction_length)
+        if pred_len > max_horizon:
+            raise ValueError(
+                f"TimesFM 2.0 adapter is initialized with horizon_len={max_horizon}; got {pred_len}"
+            )
 
         if context.ndim == 1:
-            input_data = [context.astype(np.float32)]
+            univariate = np.asarray(context, dtype=np.float32)
         else:
-            input_data = [context[:, 0].astype(np.float32)]
+            univariate = np.asarray(context[:, 0], dtype=np.float32)
 
-        freq = kwargs.get("freq", [0])
+        ctx_len = min(len(univariate), self.config.context_length)
+        raw_freq = kwargs.get("freq", 0)
+        if isinstance(raw_freq, (list, tuple)):
+            freq = [int(raw_freq[0] if raw_freq else 0)]
+        else:
+            freq = [int(raw_freq)]
 
-        point_forecasts, quantile_forecasts = self._model.forecast(
-            input_data,
+        point, full = self._model.forecast(
+            [univariate[-ctx_len:]],
             freq=freq,
+            forecast_context_len=ctx_len,
         )
 
-        point = point_forecasts[0][:pred_len]
-
-        quantiles = {}
-        if quantile_forecasts is not None and len(quantile_forecasts) > 0:
-            qf = quantile_forecasts[0]
-            default_qs = [0.1, 0.5, 0.9]
-            for i, q in enumerate(default_qs):
-                if i < qf.shape[1] if qf.ndim > 1 else False:
-                    quantiles[q] = qf[:pred_len, i]
+        point_forecast = np.asarray(point[0], dtype=np.float32)[:pred_len]
+        quantiles: dict[float, np.ndarray] = {}
+        model_quantiles = list(getattr(self._model, "quantiles", []) or [])
+        full_forecast = np.asarray(full[0], dtype=np.float32)[:pred_len]
+        for idx, q in enumerate(model_quantiles, start=1):
+            if idx < full_forecast.shape[-1]:
+                quantiles[float(q)] = full_forecast[:, idx]
 
         return SBMOutput(
-            point_forecast=point,
+            point_forecast=point_forecast,
             quantile_forecast=quantiles if quantiles else None,
-            metadata={"model": "timesfm", "prediction_length": pred_len},
+            metadata={
+                "model": "timesfm-2.0-500m-pytorch",
+                "prediction_length": pred_len,
+                "context_length": ctx_len,
+            },
         )

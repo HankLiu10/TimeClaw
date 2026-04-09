@@ -66,6 +66,8 @@ def discover_and_register() -> int:
             for _importer, modname, _ispkg in pkgutil.iter_modules(pkg.__path__):
                 if modname.startswith("_"):
                     continue
+                # Unsupported prediction helpers: keep modules on disk for reference,
+                # but do not expose them to the agent or test suite as usable tools.
                 if sub_pkg == "prediction" and modname in {"checkpoint", "ensemble"}:
                     continue
                 try:

@@ -1,0 +1,30 @@
+# Restored from arXiv (2026-04-02). Use https://arxiv.org/abs/<id> or https://arxiv.org/pdf/<id>.pdf
+
+2603.16112v1.pdf  ->  Yim et al., Automated Skill Distillation and Adaptation (ASDA)
+
+Chen 等 - 2026 - MTBench ...  ->  2503.16858
+Garza和Rosillo - 2025 - TimeCopilot.pdf  ->  2509.00616
+Jalori 等 - 2025 - FLAIRR-TS ...  ->  2508.19279
+Jiang 等 - 2025 - DART ...  ->  2506.11752
+Jiang 等 - 2025 - TimeXL ...  ->  2503.01013
+Jin 等 - 2024 - Position ...  ->  2402.02713
+Lee 等 - 2025 - TimeCAP ...  ->  2502.11418
+Lin 等 - 2025 - Decoding Time Series with LLMs ...  ->  2410.17462
+Liu 等 - 2025 - TS-Agent ...  ->  2510.07432
+Ruan和Liang - 2026 - Visual Reasoning ... (MAS4TS)  ->  2602.03026
+Sui 等 - 2025 - Training-Free ...  ->  2510.05950
+Tang 等 - 2025 - LLMAgent-as-Data-Analyst A Survey.pdf  ->  2509.23988  (full title uses "LLM/Agent-as-Data-Analyst")
+Trirat 等 - 2026 - TS-Debate ...  ->  2601.19151
+Wang 等 - 2024 - From News to Forecast ...  ->  2409.17515
+Wawer和Chudziak - 2025 - Integrating Traditional Technical Analysis ...  ->  2506.16813
+Weng 等 - 2026 - TemporalBench ...  ->  2602.13272
+Wu 等 - 2026 - TimeART ...  ->  2601.13653
+Xu 等 - 2026 - Can Multimodal LLMs ...  ->  2502.17812  (arXiv year 2025; filename kept as before)
+Yeh 等 - 2025 - Empowering ...  ->  2508.04231
+Ye 等 - 2025 - Domain-Oriented ...  ->  2410.04047
+Ye 等 - 2025 - When LLM Meets Time Series ...  ->  2509.01822
+Zhang 等 - 2025 - Can Competition Enhance ...  ->  2504.10210
+Zhao 等 - 2025 - TimeSeriesScientist ...  ->  2510.01538
+
+NOT RESTORED (local draft only):
+TimeClaw_0320.pdf  —  see README_TimeClaw_draft.txt

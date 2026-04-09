@@ -25,7 +25,8 @@ class LLMConfig(BaseModel):
     """LLM routing configuration."""
 
     models: LLMModelConfig = Field(default_factory=LLMModelConfig)
-    fallback: str | None = "azure/gpt-5.1"
+    fallback: str | None = None
+    allow_fallback: bool = False
     max_retries: int = 3
     timeout: float = 180.0
     temperature: float = 0.1
@@ -110,6 +111,26 @@ class MCPServerEntry(BaseModel):
     enabled: bool = True
 
 
+class BenchmarkConfig(BaseModel):
+    """MTBench on-disk layout. Paths in ``DATASET_REGISTRY`` are relative to ``repo_root``."""
+
+    repo_root: str = "."
+    splits_dir: str = "data/splits"
+
+
+class SBMRuntimeConfig(BaseModel):
+    """Runtime placement for local time-series foundation models.
+
+    New definition:
+    - ``device`` is the default device for all local SBM adapters.
+    - ``devices`` optionally overrides the device per model name, e.g.
+      ``chronos2: cuda:2`` or ``moirai1_1_r_base: cuda:3``.
+    """
+
+    device: str = "cuda"
+    devices: dict[str, str] = Field(default_factory=dict)
+
+
 class MCPConfig(BaseModel):
     """MCP (Model Context Protocol) tool server configuration.
 
@@ -145,6 +166,8 @@ class TimeClawConfig(BaseModel):
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     fusion: FusionConfig = Field(default_factory=FusionConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+    benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
+    sbm: SBMRuntimeConfig = Field(default_factory=SBMRuntimeConfig)
     log_level: str = "INFO"
     workspace_dir: str = ".timeclaw"
 

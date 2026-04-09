@@ -47,7 +47,7 @@ async def main():
             print(f"  ERROR: {e}")
 
         mem = pipeline.memory_summary()
-        print(f"  Memory: daily={mem.get('daily_notes',0)}, L2={mem.get('memory_insights',0)}, "
+        print(f"  Memory: notes={mem.get('notes',0)}, L2={mem.get('memory_insights',0)}, "
               f"cross_domain={mem.get('cross_domain_insights',0)}, tools={mem.get('tool_notes',0)}, "
               f"skills={mem.get('skills',0)}")
         print()
@@ -69,13 +69,13 @@ async def main():
     else:
         print("\n[WARNING] No L2 memory files found — distillation did not trigger")
 
-    # Show L1 daily notes
-    daily_dir = Path(".timeclaw/hierarchical_memory/daily")
-    if daily_dir.exists():
-        for f in sorted(daily_dir.glob("*.md")):
+    # Show L1 notes
+    notes_dir = Path(".timeclaw/hierarchical_memory/notes")
+    if notes_dir.exists():
+        for f in sorted(notes_dir.glob("*.md")):
             content = f.read_text()
             n_entries = content.count("### [")
-            print(f"\n=== L1 Daily Notes: {f.name} ({n_entries} entries) ===")
+            print(f"\n=== L1 Notes: {f.name} ({n_entries} entries) ===")
             # Show first entry as sample
             lines = content.strip().split("\n")
             for line in lines[:6]:

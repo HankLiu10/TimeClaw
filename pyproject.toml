@@ -52,16 +52,20 @@ image = [
     "Pillow>=10.0",
 ]
 sbm-chronos = [
-    "chronos-forecasting",
+    "chronos-forecasting>=2.2",
 ]
 sbm-moirai = [
     "uni2ts",
 ]
 sbm-timesfm = [
-    "timesfm",
+    "torch>=2.2",
+    "transformers @ git+https://github.com/huggingface/transformers.git",
+]
+sbm-aurora = [
+    "aurora-model==0.2.0",
 ]
 sbm = [
-    "timeclaw[sbm-chronos,sbm-moirai,sbm-timesfm]",
+    "timeclaw[sbm-chronos,sbm-moirai]",
 ]
 all = [
     "timeclaw[dl,signal,prediction,image]",

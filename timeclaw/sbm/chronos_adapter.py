@@ -1,4 +1,4 @@
-"""Chronos adapter: Amazon's probabilistic time-series foundation model."""
+"""Chronos adapter backed by Amazon Chronos-2."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from loguru import logger
 from timeclaw.sbm.base import SBMBase, SBMConfig, SBMOutput, SBMTask
 
 CHRONOS_DEFAULT_CONFIG = SBMConfig(
-    model_name="chronos",
-    model_path="amazon/chronos-t5-large",
+    model_name="chronos2",
+    model_path="amazon/chronos-2",
     context_length=512,
     prediction_length=64,
     num_samples=20,
@@ -19,22 +19,22 @@ CHRONOS_DEFAULT_CONFIG = SBMConfig(
 
 
 class ChronosAdapter(SBMBase):
-    """Adapter for Amazon Chronos probabilistic forecasting model.
+    """Adapter for Amazon Chronos-2 forecasting model.
 
-    Chronos tokenizes time series into discrete bins and uses a T5-style
-    language model for probabilistic forecasting via ancestral sampling.
+    Chronos-2 produces direct point/quantile forecasts and supports richer
+    forecasting interfaces than the original Chronos family.
     """
 
-    name: str = "chronos"
+    name: str = "chronos2"
     supported_tasks: list[SBMTask] = [SBMTask.FORECAST]
     requires_gpu: bool = True
 
     def load(self) -> None:
         try:
-            from chronos import ChronosPipeline
+            from chronos import Chronos2Pipeline
         except ImportError:
             raise ImportError(
-                "chronos-forecasting is required: pip install chronos-forecasting"
+                "chronos-forecasting>=2.2 is required: pip install 'chronos-forecasting>=2.2'"
             )
 
         import torch
@@ -43,15 +43,15 @@ class ChronosAdapter(SBMBase):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        model_path = self.config.model_path or "amazon/chronos-t5-large"
-        logger.info(f"Loading Chronos from {model_path} on {device}")
+        model_path = self.config.model_path or "amazon/chronos-2"
+        logger.info(f"Loading Chronos-2 from {model_path} on {device}")
 
-        self._model = ChronosPipeline.from_pretrained(
+        self._model = Chronos2Pipeline.from_pretrained(
             model_path,
             device_map=device,
             torch_dtype=torch.float32 if device == "cpu" else torch.bfloat16,
         )
-        logger.info("Chronos loaded successfully")
+        logger.info("Chronos-2 loaded successfully")
 
     def forecast(
         self,
@@ -62,32 +62,38 @@ class ChronosAdapter(SBMBase):
         if not self.is_loaded:
             self.load()
 
-        import torch
-
         pred_len = prediction_length or self.config.prediction_length
-        num_samples = kwargs.get("num_samples", self.config.num_samples)
 
         if context.ndim == 1:
-            ctx_tensor = torch.tensor(context, dtype=torch.float32).unsqueeze(0)
+            univariate = np.asarray(context, dtype=np.float32)
         else:
-            ctx_tensor = torch.tensor(context[:, 0], dtype=torch.float32).unsqueeze(0)
+            # Keep the previous TimeClaw behavior for non-1D inputs: use the
+            # first variate only, because the public tool contract is still
+            # documented as univariate forecasting.
+            univariate = np.asarray(context[:, 0], dtype=np.float32)
+        model_input = univariate[None, None, :]
 
-        samples = self._model.predict(
-            ctx_tensor,
+        quantile_tensors, mean_tensors = self._model.predict_quantiles(
+            model_input,
             prediction_length=pred_len,
-            num_samples=num_samples,
+            quantile_levels=self.config.quantile_levels,
+            limit_prediction_length=False,
         )
 
-        samples_np = samples.numpy().squeeze(0)  # (num_samples, pred_len)
-        point_forecast = np.median(samples_np, axis=0)
+        point_forecast = mean_tensors[0].detach().cpu().numpy()
+        if point_forecast.ndim > 1 and point_forecast.shape[0] == 1:
+            point_forecast = point_forecast.squeeze(0)
 
         quantiles = {}
-        for q in self.config.quantile_levels:
-            quantiles[q] = np.quantile(samples_np, q, axis=0)
+        first_quantiles = quantile_tensors[0].detach().cpu().numpy()
+        if first_quantiles.ndim > 2 and first_quantiles.shape[0] == 1:
+            first_quantiles = first_quantiles.squeeze(0)
+        for idx, q in enumerate(self.config.quantile_levels):
+            quantile_forecast = first_quantiles[..., idx]
+            quantiles[q] = quantile_forecast
 
         return SBMOutput(
             point_forecast=point_forecast,
             quantile_forecast=quantiles,
-            samples=samples_np,
-            metadata={"model": "chronos", "prediction_length": pred_len},
+            metadata={"model": "chronos-2", "prediction_length": pred_len},
         )

@@ -7,7 +7,7 @@ Usage examples:
     # Full pipeline on all datasets
     python -m timeclaw.benchmark.run_learning --all
 
-    # Split only
+    # Regenerate official MTBench sample-list JSONs only (data/splits/)
     python -m timeclaw.benchmark.run_learning --split
 
     # Train on specific domain/task
@@ -61,7 +61,9 @@ def cmd_download(args: argparse.Namespace) -> None:
 
 def cmd_split(args: argparse.Namespace) -> None:
     from timeclaw.benchmark.dataset_split import split_all_datasets
-    results = split_all_datasets()
+    from timeclaw.core.config import TimeClawConfig
+
+    results = split_all_datasets(config=TimeClawConfig.load())
     total_train = sum(r["train"] for r in results.values())
     total_test = sum(r["test"] for r in results.values())
     logger.info(f"Split done: {total_train} train, {total_test} test across {len(results)} datasets")
@@ -81,6 +83,7 @@ async def cmd_train(args: argparse.Namespace) -> None:
         concurrency=args.concurrency,
         per_task_concurrency=args.per_task_concurrency,
         indicator_concurrency=args.indicator_concurrency,
+        merge_checkpoint=not getattr(args, "no_merge_checkpoint", False),
     )
 
     out = Path(".timeclaw/train_results/train_summary.json")
@@ -104,6 +107,7 @@ async def cmd_test(args: argparse.Namespace) -> None:
 
     if args.compare:
         logger.info("[RunLearning] Compare: running with memory...")
+        mc = not getattr(args, "no_merge_checkpoint", False)
         with_mem = await run_pipeline_eval(
             dataset_name=args.dataset, task_filter=args.task,
             max_samples=args.max_samples, verbose=args.verbose,
@@ -112,6 +116,7 @@ async def cmd_test(args: argparse.Namespace) -> None:
             per_task_concurrency=args.per_task_concurrency,
             indicator_concurrency=args.indicator_concurrency,
             use_skills=True, label="with_memory", split="test",
+            merge_checkpoint=mc,
         )
         logger.info("[RunLearning] Compare: running without memory...")
         without_mem = await run_pipeline_eval(
@@ -122,6 +127,7 @@ async def cmd_test(args: argparse.Namespace) -> None:
             per_task_concurrency=args.per_task_concurrency,
             indicator_concurrency=args.indicator_concurrency,
             use_skills=False, label="no_memory", split="test",
+            merge_checkpoint=mc,
         )
         result = {"with_memory": with_mem, "no_memory": without_mem}
     else:
@@ -137,6 +143,7 @@ async def cmd_test(args: argparse.Namespace) -> None:
             per_task_concurrency=args.per_task_concurrency,
             indicator_concurrency=args.indicator_concurrency,
             split="test",
+            merge_checkpoint=not getattr(args, "no_merge_checkpoint", False),
         )
 
     out = Path(".timeclaw/test_results/test_summary.json")
@@ -150,7 +157,7 @@ async def cmd_all(args: argparse.Namespace) -> None:
     t0 = time.time()
 
     logger.info("=" * 60)
-    logger.info("Step 1/4: Splitting datasets")
+    logger.info("Step 1/4: Regenerating official sample-list JSONs (data/splits/)")
     logger.info("=" * 60)
     cmd_split(args)
 
@@ -181,12 +188,12 @@ def main() -> None:
     )
 
     steps = parser.add_argument_group("Pipeline steps")
-    steps.add_argument("--all", action="store_true", help="Run full pipeline (split -> train -> distill -> test)")
+    steps.add_argument("--all", action="store_true", help="Full pipeline: regenerate data/splits lists -> train -> distill -> test")
     steps.add_argument("--download", action="store_true", help="Download all MTBench datasets")
-    steps.add_argument("--split", action="store_true", help="Split datasets into train/test")
+    steps.add_argument("--split", action="store_true", help="Regenerate data/splits train_files/test_files (time-partitioned lists on official processed data)")
     steps.add_argument("--train", action="store_true", help="Run training loop")
     steps.add_argument("--distill", action="store_true", help="Distill skills from experience")
-    steps.add_argument("--test", action="store_true", help="Evaluate on test set")
+    steps.add_argument("--test", action="store_true", help="Evaluate using official test_files.json lists")
 
     filters = parser.add_argument_group("Filters")
     filters.add_argument("--dataset", type=str, default=None,
@@ -210,7 +217,7 @@ def main() -> None:
     options.add_argument("--max-samples", type=int, default=None,
                          help="Max samples per dataset")
     options.add_argument("--sample-index-file", type=str, default=None,
-                         help="JSON file mapping dataset names to split-local sample indices")
+                         help="JSON file mapping dataset names to indices into load_split output for that dataset")
     options.add_argument("--compare", action="store_true",
                          help="Compare with/without memory (test mode)")
     options.add_argument("--no-skills", action="store_true",
@@ -223,6 +230,11 @@ def main() -> None:
                          help="Optional override for indicator-task concurrency")
     options.add_argument("--verbose", action="store_true",
                          help="Enable verbose trace logging")
+    options.add_argument(
+        "--no-merge-checkpoint",
+        action="store_true",
+        help="Train/test: do not merge existing JSON checkpoints (full re-eval per dataset).",
+    )
 
     args = parser.parse_args()
 

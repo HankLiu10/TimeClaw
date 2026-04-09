@@ -39,6 +39,9 @@ class SegmentTool(ClawTool):
         "Output: dict with 'segments' (list of sub-arrays as lists), 'num_segments', "
         "'window_size', and 'step_size'. Use this for batch analysis, pattern mining, or "
         "preparing fixed-length input chunks for models that require uniform-length sequences. "
+        "This tool only cuts the series into windows; it does NOT aggregate each segment into "
+        "one value. For example, segmenting 336 hourly points with window_size=24 and "
+        "step_size=24 returns 14 daily windows of 24 readings each, not 14 daily means. "
         "Parameters: window_size (int, default 100), step_size (int, default 50 — set equal "
         "to window_size for non-overlapping segments)."
     )

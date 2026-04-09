@@ -1,8 +1,15 @@
-"""Split MTBench datasets into train/test by time (no overlap).
+"""Build and load **named sample lists** for official MTBench processed data.
 
-Supports all 8 MTBench datasets (weather + finance).  Each dataset is
-split independently based on its own time distribution.  The split
-point is chosen so that roughly 70-75 % of samples go to train.
+Writes JSON under ``data/splits/<dataset>/`` (``train_files.json``,
+``test_files.json``).  Names are historical: this module **time-partitions**
+the official processed pool into two filename lists (~70–75% earlier years
+vs remainder).  That is **not** the same thing as the project's **disjoint
+independent training corpus** under ``data_preparation/independent/``.
+
+- ``load_split(..., "test")`` → standard benchmark evaluation subset.
+- ``load_split(..., "train")`` → subset used by default ``train_loop`` on
+  **official** ``data/processed/``, not the independent corpus unless you
+  rewire paths.
 """
 
 from __future__ import annotations
@@ -14,12 +21,15 @@ from typing import Any
 import numpy as np
 from loguru import logger
 
+from timeclaw.core.config import TimeClawConfig
 from timeclaw.benchmark.mtbench_adapter import (
     DATASET_REGISTRY,
     MTBenchSample,
+    benchmark_splits_dir,
     load_dataset,
 )
 
+# Legacy default (cwd-relative).  Prefer ``benchmark_splits_dir(config)`` / YAML ``benchmark.splits_dir``.
 SPLITS_DIR = Path("data/splits")
 
 
@@ -48,19 +58,20 @@ def split_dataset(
     split_year: int | None = None,
     sample_ratio: float = 1.0,
     seed: int = 42,
+    config: TimeClawConfig | None = None,
 ) -> dict[str, Any]:
-    """Split a single dataset by time.
+    """Time-partition one official dataset into two filename lists (train/test JSON).
 
     Args:
-        sample_ratio: Fraction of samples to keep in each split (0, 1].
-                      Applied *after* the temporal split so the train/test
-                      boundary is unchanged.  A ratio of 0.2 means each
-                      split keeps 20 % of its original samples.
+        sample_ratio: Fraction of samples to keep in each list (0, 1].
+                      Applied *after* the temporal boundary so the early/late
+                      partition is unchanged.  A ratio of 0.2 means each
+                      list keeps 20 % of its original samples.
         seed: Random seed for reproducible sub-sampling.
 
     Returns dict with train/test sample lists and metadata.
     """
-    samples = load_dataset(dataset_name)
+    samples = load_dataset(dataset_name, config=config)
     if not samples:
         raise ValueError(f"No samples loaded for {dataset_name}")
 
@@ -112,9 +123,10 @@ def save_split(
     train: list[MTBenchSample],
     test: list[MTBenchSample],
     split_year: int,
+    config: TimeClawConfig | None = None,
 ) -> dict[str, Path]:
     """Persist split file lists to JSON."""
-    out = SPLITS_DIR / dataset_name
+    out = benchmark_splits_dir(config) / dataset_name
     out.mkdir(parents=True, exist_ok=True)
 
     train_files = [s.file for s in train]
@@ -147,9 +159,11 @@ def save_split(
 def load_split(
     dataset_name: str,
     split: str = "train",
+    *,
+    config: TimeClawConfig | None = None,
 ) -> list[MTBenchSample]:
     """Load samples for a given split of a dataset."""
-    split_dir = SPLITS_DIR / dataset_name
+    split_dir = benchmark_splits_dir(config) / dataset_name
     list_path = split_dir / f"{split}_files.json"
 
     if not list_path.exists():
@@ -158,13 +172,14 @@ def load_split(
         )
 
     filenames = set(json.loads(list_path.read_text()))
-    all_samples = load_dataset(dataset_name)
+    all_samples = load_dataset(dataset_name, config=config)
     return [s for s in all_samples if s.file in filenames]
 
 
 def split_all_datasets(
     split_years: dict[str, int] | None = None,
     sample_ratio: float = 1.0,
+    config: TimeClawConfig | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Split all available MTBench datasets.
 
@@ -178,8 +193,12 @@ def split_all_datasets(
     for name in DATASET_REGISTRY:
         try:
             year = overrides.get(name)
-            result = split_dataset(name, split_year=year, sample_ratio=sample_ratio)
-            save_split(name, result["train"], result["test"], result["split_year"])
+            result = split_dataset(
+                name, split_year=year, sample_ratio=sample_ratio, config=config,
+            )
+            save_split(
+                name, result["train"], result["test"], result["split_year"], config=config,
+            )
             results[name] = {
                 "split_year": result["split_year"],
                 "train": result["train_count"],

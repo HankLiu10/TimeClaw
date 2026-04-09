@@ -13,6 +13,7 @@ class TestModelRouter:
         assert "manager" in assignments
         assert "analyzer" in assignments
         assert "fallback" in assignments
+        assert assignments["fallback_enabled"] == "false"
 
     def test_custom_config(self):
         config = LLMConfig(
@@ -23,17 +24,41 @@ class TestModelRouter:
                 reasoner="gpt-4o",
             ),
             fallback="claude-sonnet-4-20250514",
+            allow_fallback=True,
         )
         router = ModelRouter(config)
         assignments = router.list_assignments()
         assert assignments["manager"] == "gpt-4o"
         assert assignments["fallback"] == "claude-sonnet-4-20250514"
+        assert assignments["fallback_enabled"] == "true"
 
     def test_get_backend_caching(self):
         router = ModelRouter()
         b1 = router.get_backend("manager")
         b2 = router.get_backend("manager")
         assert b1 is b2
+
+    def test_fallback_is_disabled_by_default_even_when_configured(self):
+        router = ModelRouter(
+            LLMConfig(
+                models=LLMModelConfig(manager="model-a"),
+                fallback="model-b",
+                allow_fallback=False,
+            )
+        )
+        backend = router.get_backend("manager")
+        assert backend.fallback_model is None
+
+    def test_fallback_is_enabled_only_when_opted_in(self):
+        router = ModelRouter(
+            LLMConfig(
+                models=LLMModelConfig(manager="model-a"),
+                fallback="model-b",
+                allow_fallback=True,
+            )
+        )
+        backend = router.get_backend("manager")
+        assert backend.fallback_model == "model-b"
 
     def test_different_roles_different_backends(self):
         config = LLMConfig(

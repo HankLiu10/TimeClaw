@@ -1,4 +1,5 @@
-"""Test Evaluation: evaluate TimeClaw on all MTBench test splits.
+"""Test evaluation on MTBench using the **official test sample list**
+(``test_files.json`` under ``data/splits/`` by default; see ``load_split``).
 
 For **forecast** tasks the pipeline prediction is used directly.
 
@@ -24,7 +25,11 @@ import numpy as np
 from loguru import logger
 
 from timeclaw.benchmark.dataset_split import load_split
-from timeclaw.benchmark.mtbench_adapter import DATASET_REGISTRY, MTBenchSample
+from timeclaw.benchmark.mtbench_adapter import (
+    DATASET_REGISTRY,
+    MTBenchSample,
+    datasets_with_benchmark_tasks,
+)
 from timeclaw.benchmark.mtbench_support import (
     build_task_description,
     expand_dataset_tasks,
@@ -39,12 +44,119 @@ from timeclaw.benchmark.baseline_eval import (
     _weather_trend_3way_label,
     _weather_trend_past_3way_label,
 )
+from timeclaw.benchmark import mtbench_prompts as prompts
 from timeclaw.core.config import TimeClawConfig
 from timeclaw.core import trace_logger as trace
 from timeclaw.llm.router import ModelRouter
 from timeclaw.pipeline.runner import PipelineRunner
 
 RESULTS_DIR = Path(".timeclaw/eval_results")
+
+
+def _result_artifact_fields(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "trace_id": result.get("trace_id"),
+        "tool_chain": _extract_tool_chain(result),
+        "gate": "PASS" if result.get("gate_accepted") else "FAIL",
+        "gate_accepted": result.get("gate_accepted"),
+        "gate_rejections": result.get("gate_rejections") or [],
+        "total_ms": result.get("total_ms"),
+    }
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, (np.floating,)):
+        f = float(value)
+        return f if np.isfinite(f) else None
+    if isinstance(value, (int, str, bool)) or value is None:
+        return value
+    return value
+
+
+def _result_status(row: dict[str, Any]) -> str:
+    metrics = row.get("metrics") or {}
+    if isinstance(metrics, dict) and metrics.get("error"):
+        return "error"
+    return "completed"
+
+
+def _artifact_trace_path(trace_id: Any) -> str | None:
+    if not trace_id:
+        return None
+    return str((Path(".timeclaw/traces") / f"{trace_id}.jsonl").as_posix())
+
+
+def _result_row_for_artifact(
+    row: dict[str, Any], ds_name: str, label: str,
+) -> dict[str, Any]:
+    json_path = RESULTS_DIR / f"{label}_{ds_name}.json"
+    md_path = RESULTS_DIR / f"{label}_{ds_name}.md"
+    normalized = dict(row)
+    normalized["sample_index"] = row.get("idx")
+    normalized["status"] = _result_status(row)
+    normalized["prediction"] = row.get("predicted")
+    normalized["answer"] = row.get("predicted")
+    normalized["trace_path"] = _artifact_trace_path(row.get("trace_id"))
+    normalized["artifact_path"] = str(json_path.as_posix())
+    normalized["markdown_path"] = str(md_path.as_posix())
+    return _json_safe(normalized)
+
+
+def _load_eval_checkpoint(ds_name: str, label: str) -> list[dict[str, Any]]:
+    path = RESULTS_DIR / f"{label}_{ds_name}.json"
+    if not path.exists() or path.stat().st_size <= 10:
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    return [r for r in data if isinstance(r, dict)]
+
+
+def _eval_done_keys(rows: list[dict[str, Any]]) -> set[tuple[int, str]]:
+    out: set[tuple[int, str]] = set()
+    for r in rows:
+        if "idx" in r and "task" in r:
+            try:
+                out.add((int(r["idx"]), str(r["task"])))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _merge_eval_rows(
+    existing: list[dict[str, Any]], new_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    by_key: dict[tuple[int, str], dict[str, Any]] = {}
+    for r in existing:
+        if "idx" not in r or "task" not in r:
+            continue
+        try:
+            k = (int(r["idx"]), str(r["task"]))
+        except (TypeError, ValueError):
+            continue
+        by_key[k] = r
+    for r in new_rows:
+        if "idx" not in r or "task" not in r:
+            continue
+        try:
+            k = (int(r["idx"]), str(r["task"]))
+        except (TypeError, ValueError):
+            continue
+        by_key[k] = r
+    merged = list(by_key.values())
+    merged.sort(key=lambda x: (int(x.get("idx", 0)), str(x.get("task", ""))))
+    return merged
 
 # ── Final-reasoning LLM (lazy singleton) ──────────────────────────────
 
@@ -54,43 +166,17 @@ _record_enabled = False
 
 
 def _train_kwargs(sample: "MTBenchSample", task: str) -> dict[str, Any]:
-    """Build extra kwargs for pipeline.run() when in training mode."""
-    if not _record_enabled:
-        return {}
-    gt: Any = None
-    if task == "forecast" and sample.output_window is not None:
-        gt = list(sample.output_window)
-    elif task == "mcqa":
-        gt = sample.answer
-    elif task == "trend":
-        if sample.domain == "weather":
-            gt = _weather_trend_3way_label(sample)
-        else:
-            gt = sample.labels.get("trend_label", "")
-    elif task == "trend_past":
-        if sample.domain == "weather":
-            gt = _weather_trend_past_3way_label(sample)
-    elif task == "indicator":
-        if sample.domain == "weather" and sample.output_window is not None:
-            gt = {"max": float(np.max(sample.output_window)),
-                  "min": float(np.min(sample.output_window)),
-                  "diff": float(np.max(sample.output_window) - np.min(sample.output_window))}
-        else:
-            gt_parts: dict[str, Any] = {}
-            if sample.labels.get("out_macd") is not None:
-                gt_parts["macd"] = float(sample.labels["out_macd"])
-            if sample.labels.get("out_upper_bb") is not None:
-                gt_parts["upper_bb"] = float(sample.labels["out_upper_bb"])
-            gt = gt_parts or None
-    elif task == "indicator_macd":
-        if sample.labels.get("out_macd") is not None:
-            gt = {"macd": float(sample.labels["out_macd"])}
-    elif task == "indicator_upper_bb":
-        if sample.labels.get("out_upper_bb") is not None:
-            gt = {"upper_bb": float(sample.labels["out_upper_bb"])}
-    elif task == "correlation":
-        gt = sample.labels.get("correlation", "")
-    return {"mode": "train", "ground_truth": gt, "defer_learning_record": True}
+    """Pipeline-eval always runs the executor in test mode.
+
+    New definition:
+        - Even when ``split="train"`` is used to collect memory records, the
+          pipeline run itself remains a **test-mode single-path analysis**.
+        - Learning records are generated externally via ``record_outcome()``
+          after task metrics are computed, instead of exposing GT-evaluation
+          tools or training-mode multi-candidate exploration to the executor.
+    """
+    del sample, task
+    return {}
 
 
 def _get_final_llm():
@@ -202,7 +288,7 @@ def _record_correctness(task: str, metrics: dict[str, Any]) -> bool | None:
         - forecast / indicator-style regression tasks do not synthesize a
           boolean ``correct`` from arbitrary thresholds. They should be
           recorded as scored outcomes and rendered as ``SCORED`` by the
-          daily-note layer.
+          notes layer.
         - classification / QA style tasks may still provide explicit binary
           correctness from the evaluator.
     """
@@ -246,6 +332,21 @@ async def _final_llm_call(
     return None
 
 
+async def _final_llm_text_call(
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    llm = _get_final_llm()
+    messages = prompts.prompt_messages(system_prompt, user_prompt)
+    try:
+        resp = await llm.complete(messages)
+        trace.llm_call("FinalLLM-OfficialPrompt", messages, resp)
+        return resp.text or ""
+    except Exception as e:
+        logger.debug(f"[FinalLLM-Text] failed: {e}")
+        return ""
+
+
 def _fmt_ts_compact(arr: np.ndarray, max_points: int = 200) -> str:
     """Format time series for LLM prompt (compact)."""
     a = np.asarray(arr).ravel()
@@ -257,7 +358,7 @@ def _fmt_ts_compact(arr: np.ndarray, max_points: int = 200) -> str:
 # ── Lightweight extractors (tried BEFORE self-correction) ────────────
 
 def _extract_forecast_array(result_data: Any) -> np.ndarray | None:
-    """Best-effort extraction of a numeric array from various formats."""
+    """Extract a numeric forecast only from structured payloads."""
     if result_data is None:
         return None
     if isinstance(result_data, np.ndarray):
@@ -273,14 +374,7 @@ def _extract_forecast_array(result_data: Any) -> np.ndarray | None:
         try:
             return _extract_forecast_array(json.loads(result_data))
         except (json.JSONDecodeError, TypeError):
-            pass
-        numbers = re.findall(r"-?\d+\.?\d*", result_data)
-        if numbers:
-            try:
-                return np.asarray([float(n) for n in numbers], dtype=np.float64)
-            except (ValueError, TypeError):
-                pass
-        return None
+            return None
     if isinstance(result_data, dict):
         for key in ("point_forecast", "forecast", "prediction", "values",
                      "temperatures", "predictions", "data"):
@@ -293,17 +387,6 @@ def _extract_forecast_array(result_data: Any) -> np.ndarray | None:
             sub = _extract_forecast_array(result_data["answer"])
             if sub is not None and len(sub) > 1:
                 return sub
-        list_vals = []
-        for v in result_data.values():
-            if isinstance(v, (list, np.ndarray)):
-                try:
-                    arr = np.asarray(v, dtype=np.float64).ravel()
-                    if len(arr) >= 2:
-                        list_vals.extend(arr.tolist())
-                except (ValueError, TypeError):
-                    pass
-        if list_vals:
-            return np.asarray(list_vals, dtype=np.float64)
     return None
 
 
@@ -329,15 +412,31 @@ def _extract_indicator_dict(
             if isinstance(parsed, dict):
                 return _extract_indicator_dict(parsed, keys)
         except (json.JSONDecodeError, TypeError):
-            pass
-        result = {}
-        for k in keys:
-            m = re.search(rf'["\']?{k}["\']?\s*[:=]\s*(-?\d+\.?\d*)', prediction)
-            if m:
-                result[k] = float(m.group(1))
-        if result:
-            return result
+            return None
     return None
+
+
+def _extract_indicator_array(prediction: Any, key: str) -> np.ndarray | None:
+    if prediction is None:
+        return None
+    if isinstance(prediction, str):
+        try:
+            prediction = json.loads(prediction)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if isinstance(prediction, dict):
+        if key in prediction:
+            try:
+                return np.asarray(prediction[key], dtype=np.float64).ravel()
+            except (ValueError, TypeError):
+                return None
+        if "answer" in prediction and isinstance(prediction["answer"], dict):
+            return _extract_indicator_array(prediction["answer"], key)
+    return None
+
+
+def _prefixed_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    return {f"{prefix}_{k}": v for k, v in metrics.items()}
 
 
 def _quick_extract_letter(pred: str) -> str:
@@ -437,7 +536,12 @@ async def _eval_forecast(
                 description=desc,
                 candidate_traces=_record_candidate_traces(result),
             )
-        return {"metrics": metrics, "trace_id": result.get("trace_id")}
+        return {
+            "metrics": metrics,
+            "predicted": pred_arr.tolist(),
+            "ground_truth": np.asarray(sample.output_window, dtype=np.float64).ravel().tolist(),
+            **_result_artifact_fields(result),
+        }
     return {"metrics": {"error": "no prediction"}}
 
 
@@ -465,29 +569,17 @@ async def _eval_mcqa(
     )
 
     analysis = _build_pipeline_analysis_summary(result)
+    sys_prompt, base_user_prompt = prompts.build_prompt(sample, "mcqa")
+    user_prompt = prompts.append_tool_analysis(base_user_prompt, analysis)
+    raw = await _final_llm_text_call(sys_prompt, user_prompt)
+    answer_char = prompts.extract_mcqa_letter(raw)
 
-    ts_str = _fmt_ts_compact(sample.input_window)
-    text_section = f"\nContextual text:\n{sample.text[:10000]}\n" if sample.text else ""
-
-    sys_prompt = (
-        f"You are an expert {sample.domain} analyst. "
-        "Answer the multiple-choice question by choosing exactly one of A, B, C, or D.\n"
-        'Return ONLY JSON: {{"answer": "X"}}'
-    )
-    user_prompt = (
-        f"Time series data:\n[{ts_str}]\n"
-        f"{text_section}\n"
-        f"Question:\n{sample.question}\n\n"
-        f"=== Tool Analysis ===\n{analysis}\n\n"
-        'Choose the best answer. Return: {{"answer": "X"}}'
-    )
-
-    parsed = await _final_llm_call(sys_prompt, user_prompt)
-    answer_char = ""
-    if isinstance(parsed, dict):
-        c = str(parsed.get("answer", "")).strip().upper()[:1]
-        if c in ("A", "B", "C", "D"):
-            answer_char = c
+    if not answer_char:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict):
+            c = str(parsed.get("answer", "")).strip().upper()[:1]
+            if c in ("A", "B", "C", "D"):
+                answer_char = c
 
     if not answer_char:
         pred = str(result.get("prediction", ""))
@@ -519,6 +611,7 @@ async def _eval_mcqa(
         "metrics": {"accuracy": 1.0 if correct else 0.0},
         "predicted": answer_char,
         "ground_truth": gt,
+        **_result_artifact_fields(result),
     }
 
 
@@ -544,33 +637,18 @@ async def _eval_trend(
 
     analysis = _build_pipeline_analysis_summary(result)
     tool_chain = _extract_tool_chain(result)
-    ts_str = _fmt_ts_compact(sample.input_window)
-    text_section = f"\nContextual text:\n{sample.text[:10000]}\n" if sample.text else ""
+    sys_prompt, base_user_prompt = prompts.build_prompt(sample, "trend")
+    user_prompt = prompts.append_tool_analysis(base_user_prompt, analysis)
+    raw = await _final_llm_text_call(sys_prompt, user_prompt)
 
     if sample.domain == "weather":
         gt_label = _weather_trend_3way_label(sample)
-        sys_prompt = (
-            "You are a weather forecasting AI. "
-            "The input time-series represents temperature readings from a US location. "
-            "Every 24 readings represent a full day from 00:00 to 23:00.\n"
-            "Predict the temperature trend for the next 1 day. "
-            "Compare the mean temperature of the last 24-hour period with the predicted "
-            "next-day mean: if difference >= 0.5, 'increasing'; if <= -0.5, 'decreasing'; "
-            "otherwise 'stable'.\n"
-            'Return ONLY JSON: {"trend": "<increasing|decreasing|stable>"}'
-        )
-        user_prompt = (
-            f"Temperature time series (past 7 days, hourly, °C):\n[{ts_str}]\n"
-            f"{text_section}\n"
-            f"=== Tool Analysis ===\n{analysis}\n\n"
-            "What is the future temperature trend? "
-            '{"trend": "..."}'
-        )
-        parsed = await _final_llm_call(sys_prompt, user_prompt)
-        matched = None
+        matched = prompts.parse_weather_trend_output(raw)
         valid = {"increasing", "decreasing", "stable"}
-        if isinstance(parsed, dict) and "trend" in parsed:
-            matched = _quick_match_label(str(parsed["trend"]).lower(), valid)
+        if matched is None:
+            parsed = _parse_json_from_text(raw)
+            if isinstance(parsed, dict) and "trend" in parsed:
+                matched = _quick_match_label(str(parsed["trend"]).lower(), valid)
         if matched is None:
             matched = "stable"
 
@@ -597,32 +675,18 @@ async def _eval_trend(
             "metrics": {"accuracy": 1.0 if matched == gt_label else 0.0},
             "predicted": matched,
             "ground_truth": gt_label,
+            **_result_artifact_fields(result),
         }
     else:
         gt_label = sample.labels.get("trend_label", "")
         if not gt_label:
             return {"metrics": {"error": "no_trend_label"}}
         valid_5 = {"<-4%", "-2% ~ -4%", "-2% ~ +2%", "+2% ~ +4%", ">+4%"}
-        sys_prompt = (
-            "You are a financial prediction expert with knowledge of advanced "
-            "machine learning models and time-series analysis.\n"
-            "Categorize the future stock price percentage change into one of: "
-            '"<-4%", "-2% ~ -4%", "-2% ~ +2%", "+2% ~ +4%", ">+4%".\n'
-            "Think step-by-step. Analyze the time-series data and news to identify "
-            "future trends.\n"
-            'Return ONLY JSON: {"trend": "<label>"}'
-        )
-        user_prompt = (
-            f"Stock price time-series:\n[{ts_str}]\n"
-            f"{text_section}\n"
-            f"=== Tool Analysis ===\n{analysis}\n\n"
-            "Classify the future price change. "
-            '{"trend": "..."}'
-        )
-        parsed = await _final_llm_call(sys_prompt, user_prompt)
-        matched = None
-        if isinstance(parsed, dict) and "trend" in parsed:
-            matched = _quick_match_label(str(parsed["trend"]).strip(), valid_5)
+        matched = prompts.parse_finance_trend_output(raw)
+        if matched is None:
+            parsed = _parse_json_from_text(raw)
+            if isinstance(parsed, dict) and "trend" in parsed:
+                matched = _quick_match_label(str(parsed["trend"]).strip(), valid_5)
         if matched is None:
             matched = "-2% ~ +2%"
 
@@ -649,6 +713,7 @@ async def _eval_trend(
             "metrics": {"accuracy": 1.0 if matched == gt_label else 0.0},
             "predicted": matched,
             "ground_truth": gt_label,
+            **_result_artifact_fields(result),
         }
 
 
@@ -678,31 +743,16 @@ async def _eval_trend_past(
 
     analysis = _build_pipeline_analysis_summary(result)
     tool_chain = _extract_tool_chain(result)
-    ts_str = _fmt_ts_compact(sample.input_window)
-    text_section = f"\nContextual text:\n{sample.text[:10000]}\n" if sample.text else ""
     gt_label = _weather_trend_past_3way_label(sample)
-    sys_prompt = (
-        "You are a weather forecasting AI. "
-        "The input time-series represents temperature readings from a US location. "
-        "Every 24 readings represent a full day from 00:00 to 23:00.\n"
-        f"Analyze the past {input_days} days's of temperature trend. "
-        "Compute the daily mean temperature and fit a linear trend. "
-        "If the slope is >= 0.25, return 'increasing'; if <= -0.25, "
-        "return 'decreasing'; otherwise return 'stable'.\n"
-        'Return ONLY JSON: {"trend": "<increasing|decreasing|stable>"}'
-    )
-    user_prompt = (
-        f"Temperature time series (historical, hourly, °C):\n[{ts_str}]\n"
-        f"{text_section}\n"
-        f"=== Tool Analysis ===\n{analysis}\n\n"
-        f"What is the temperature trend for the past {input_days} days? "
-        '{"trend": "..."}'
-    )
-    parsed = await _final_llm_call(sys_prompt, user_prompt)
-    matched = None
+    sys_prompt, base_user_prompt = prompts.build_prompt(sample, "trend_past")
+    user_prompt = prompts.append_tool_analysis(base_user_prompt, analysis)
+    raw = await _final_llm_text_call(sys_prompt, user_prompt)
+    matched = prompts.parse_weather_trend_output(raw)
     valid = {"increasing", "decreasing", "stable"}
-    if isinstance(parsed, dict) and "trend" in parsed:
-        matched = _quick_match_label(str(parsed["trend"]).lower(), valid)
+    if matched is None:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict) and "trend" in parsed:
+            matched = _quick_match_label(str(parsed["trend"]).lower(), valid)
     if matched is None:
         matched = "stable"
 
@@ -729,6 +779,7 @@ async def _eval_trend_past(
         "metrics": {"accuracy": 1.0 if matched == gt_label else 0.0},
         "predicted": matched,
         "ground_truth": gt_label,
+        **_result_artifact_fields(result),
     }
 
 
@@ -751,17 +802,15 @@ async def _eval_weather_indicator(
     if sample.text:
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
 
-    gt_max = float(np.max(sample.output_window))
-    gt_min = float(np.min(sample.output_window))
-    gt_diff = gt_max - gt_min
+    gt = prompts.weather_indicator_ground_truth(sample.output_window)
+    gt_max = gt["max"]
+    gt_min = gt["min"]
+    gt_diff = gt["diff"]
 
     if gt_diff < 0.01:
         return {"metrics": {"skipped": "flat_gt"}}
 
-    gt = {"max": gt_max, "min": gt_min, "diff": gt_diff}
-
-    n_hours = len(sample.output_window)
-    n_days = max(1, n_hours // 24)
+    n_hours = prompts.weather_indicator_horizon_hours(sample.output_window)
     result = await pipeline.run(
         data=sample.input_window,
         task_type="indicator",
@@ -783,6 +832,7 @@ async def _eval_weather_indicator(
     if pred is None:
         pred_arr = _extract_forecast_array(prediction)
         if pred_arr is not None and len(pred_arr) >= 1:
+            pred_arr = pred_arr[:n_hours]
             pred = {
                 "max": float(np.max(pred_arr)),
                 "min": float(np.min(pred_arr)),
@@ -794,24 +844,13 @@ async def _eval_weather_indicator(
 
     if pred is None:
         analysis = _build_pipeline_analysis_summary(result)
-        ts_str = _fmt_ts_compact(sample.input_window)
-        text_section = f"\nWeather report:\n{sample.text[:10000]}\n" if sample.text else ""
-        sys_prompt = (
-            "You are a weather forecasting AI. "
-            "The input time-series represents temperature readings from a location in "
-            "the United States. Every 24 readings represent a full day from 00:00 to 23:00.\n"
-            f"Predict the next {n_days} day(s) highest temperature, lowest temperature, and the "
-            "difference between them.\n"
-            'Return ONLY JSON: {{"max": <number>, "min": <number>, "diff": <number>}}'
-        )
-        user_prompt = (
-            f"Temperature time series (past 7 days, hourly, °C):\n[{ts_str}]\n"
-            f"{text_section}\n"
-            f"=== Tool Analysis ===\n{analysis}\n\n"
-            'Predict: {{"max": ..., "min": ..., "diff": ...}}'
-        )
-        parsed = await _final_llm_call(sys_prompt, user_prompt)
-        pred = _extract_indicator_dict(parsed, ["max", "min", "diff"])
+        sys_prompt, base_user_prompt = prompts.build_prompt(sample, "indicator")
+        user_prompt = prompts.append_tool_analysis(base_user_prompt, analysis)
+        raw = await _final_llm_text_call(sys_prompt, user_prompt)
+        pred = prompts.parse_weather_indicator_output(raw)
+        if pred is None:
+            parsed = _parse_json_from_text(raw)
+            pred = _extract_indicator_dict(parsed, ["max", "min", "diff"])
 
     if pred:
         metrics = {f"{k}_mae": abs(gt[k] - pred.get(k, 0.0)) for k in gt}
@@ -841,7 +880,12 @@ async def _eval_weather_indicator(
                 description=build_task_description(sample, "indicator"),
                 candidate_traces=_record_candidate_traces(result),
             )
-        return {"metrics": metrics, "predicted": pred, "ground_truth": gt}
+        return {
+            "metrics": metrics,
+            "predicted": pred,
+            "ground_truth": gt,
+            **_result_artifact_fields(result),
+        }
     return {"metrics": {"error": "no prediction"}}
 
 
@@ -869,12 +913,22 @@ async def _eval_stock_indicator(
         return {"metrics": {"error": "indicator_label_missing"}}
 
     task_name = "indicator" if indicator_field is None else f"indicator_{indicator_field}"
+    target_horizon = 0
+    if indicator_field == "macd" and gt_macd is not None:
+        target_horizon = len(np.asarray(gt_macd, dtype=np.float64).ravel())
+    elif indicator_field == "upper_bb" and gt_bb is not None:
+        target_horizon = len(np.asarray(gt_bb, dtype=np.float64).ravel())
+    else:
+        if gt_macd is not None:
+            target_horizon = max(target_horizon, len(np.asarray(gt_macd, dtype=np.float64).ravel()))
+        if gt_bb is not None:
+            target_horizon = max(target_horizon, len(np.asarray(gt_bb, dtype=np.float64).ravel()))
 
     result = await pipeline.run(
         data=sample.input_window,
         task_type="indicator",
         description=build_task_description(sample, task_name),
-        horizon=len(sample.output_window) if sample.output_window is not None else 78,
+        horizon=target_horizon or (len(sample.output_window) if sample.output_window is not None else 78),
         text_data=text_data,
         verbose=verbose,
         domain="finance",
@@ -883,57 +937,27 @@ async def _eval_stock_indicator(
     )
 
     analysis = _build_pipeline_analysis_summary(result)
-    ts_str = _fmt_ts_compact(sample.input_window)
-    text_section = f"\nFinancial analysis:\n{sample.text[:10000]}\n" if sample.text else ""
-
-    ds = sample.dataset
-    input_desc = "7 days at 5-minute intervals" if "short" in ds else "30 days of daily prices"
-
-    schema_parts = []
-    if indicator_field in (None, "macd") and gt_macd is not None:
-        schema_parts.append('"macd": <number>')
-    if indicator_field in (None, "upper_bb") and gt_bb is not None:
-        schema_parts.append('"upper_bb": <number>')
-    target_schema = "{" + ", ".join(schema_parts) + "}"
-
-    sys_prompt = (
-        "You are a quantitative finance analyst. "
-        f"Given {input_desc} of stock price data, predict the following technical "
-        f"indicators for the NEXT trading day: {', '.join(indicator_names)}.\n"
-        "MACD = EMA(12) - EMA(26) of closing price.\n"
-        "Upper Bollinger Band = SMA(20) + 2 * StdDev(20).\n"
-        f"Return ONLY JSON: {target_schema}"
-    )
-    user_prompt = (
-        f"Historical stock price time-series:\n[{ts_str}]\n"
-        f"{text_section}\n"
-        f"=== Tool Analysis ===\n{analysis}\n\n"
-        f"Predict the next-day indicators: {', '.join(indicator_names)}.\n"
-        f"Return: {target_schema}"
-    )
-
-    parsed = await _final_llm_call(sys_prompt, user_prompt)
+    sys_prompt, base_user_prompt = prompts.build_prompt(sample, task_name)
+    user_prompt = prompts.append_tool_analysis(base_user_prompt, analysis)
+    raw = await _final_llm_text_call(sys_prompt, user_prompt)
     metrics: dict[str, float] = {}
-    if isinstance(parsed, dict):
-        if indicator_field in (None, "macd") and gt_macd is not None and "macd" in parsed:
-            try:
-                metrics["macd_mae"] = abs(float(gt_macd) - float(parsed["macd"]))
-            except (ValueError, TypeError):
-                pass
-        if indicator_field in (None, "upper_bb") and gt_bb is not None and "upper_bb" in parsed:
-            try:
-                metrics["upper_bb_mae"] = abs(float(gt_bb) - float(parsed["upper_bb"]))
-            except (ValueError, TypeError):
-                pass
+    parsed_sequence = prompts.parse_finance_value_output(raw)
+    if parsed_sequence is not None:
+        if indicator_field == "macd" and gt_macd is not None:
+            metrics.update(_prefixed_metrics("macd", _forecast_metrics(gt_macd, parsed_sequence)))
+        elif indicator_field == "upper_bb" and gt_bb is not None:
+            metrics.update(_prefixed_metrics("upper_bb", _forecast_metrics(gt_bb, parsed_sequence)))
 
     if not metrics:
         prediction = result.get("prediction")
-        pred_dict = _extract_indicator_dict(prediction, ["macd", "upper_bb"])
-        if pred_dict:
-            if indicator_field in (None, "macd") and gt_macd is not None and "macd" in pred_dict:
-                metrics["macd_mae"] = abs(float(gt_macd) - float(pred_dict["macd"]))
-            if indicator_field in (None, "upper_bb") and gt_bb is not None and "upper_bb" in pred_dict:
-                metrics["upper_bb_mae"] = abs(float(gt_bb) - float(pred_dict["upper_bb"]))
+        if indicator_field in (None, "macd") and gt_macd is not None:
+            pred_macd = _extract_indicator_array(prediction, "macd")
+            if pred_macd is not None and pred_macd.size > 0:
+                metrics.update(_prefixed_metrics("macd", _forecast_metrics(gt_macd, pred_macd)))
+        if indicator_field in (None, "upper_bb") and gt_bb is not None:
+            pred_bb = _extract_indicator_array(prediction, "upper_bb")
+            if pred_bb is not None and pred_bb.size > 0:
+                metrics.update(_prefixed_metrics("upper_bb", _forecast_metrics(gt_bb, pred_bb)))
 
     if not metrics:
         return {"metrics": {"error": "no prediction or labels"}}
@@ -957,10 +981,7 @@ async def _eval_stock_indicator(
             scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), task_name),
             task="stock_indicator" if indicator_field is None else task_name,
             tool_chain=_record_tool_chain(result, metrics),
-            predicted=json.dumps({
-                k: v for k, v in (parsed if isinstance(parsed, dict) else {}).items()
-                if k in predicted_fields
-            }),
+            predicted=json.dumps(parsed_sequence if parsed_sequence is not None else result.get("prediction"), default=str),
             ground_truth=json.dumps(gt_payload),
             correct=_record_correctness("stock_indicator", metrics),
             metrics=metrics,
@@ -970,7 +991,24 @@ async def _eval_stock_indicator(
             candidate_traces=_record_candidate_traces(result),
         )
 
-    return {"metrics": metrics}
+    predicted_payload: dict[str, Any] = {}
+    ground_truth_payload: dict[str, Any] = {}
+    if indicator_field in (None, "macd") and gt_macd is not None:
+        ground_truth_payload["macd"] = np.asarray(gt_macd, dtype=np.float64).ravel().tolist()
+    if indicator_field in (None, "upper_bb") and gt_bb is not None:
+        ground_truth_payload["upper_bb"] = np.asarray(gt_bb, dtype=np.float64).ravel().tolist()
+    if parsed_sequence is not None:
+        series_key = "values" if indicator_field is not None else "parsed_sequence"
+        predicted_payload[series_key] = np.asarray(parsed_sequence, dtype=np.float64).ravel().tolist()
+    elif isinstance(result.get("prediction"), dict):
+        predicted_payload = result.get("prediction") or {}
+
+    return {
+        "metrics": metrics,
+        "predicted": predicted_payload or None,
+        "ground_truth": ground_truth_payload or None,
+        **_result_artifact_fields(result),
+    }
 
 
 async def _eval_indicator_macd(
@@ -1037,31 +1075,14 @@ async def _eval_correlation(
     )
 
     analysis = _build_pipeline_analysis_summary(result)
-    ts_str = _fmt_ts_compact(sample.input_window)
-    text_section = f"\nFinancial news:\n{sample.text[:10000]}\n" if sample.text else ""
-
-    sys_prompt = (
-        "You are an expert in finance and stock market analysis.\n"
-        "Predict the correlation between the stock's price fluctuations in the "
-        "next 7 days and the analysis sentiment. Positive correlation indicates "
-        "that positive analysis leads to price increase and negative analysis "
-        "leads to price decrease.\n"
-        "Choose one of: Strong Positive Correlation, Moderate Positive Correlation, "
-        "No Correlation, Moderate Negative Correlation, Strong Negative Correlation.\n"
-        'Return ONLY JSON: {"correlation": "<label>"}'
-    )
-    user_prompt = (
-        f"Stock price time-series:\n[{ts_str}]\n"
-        f"{text_section}\n"
-        f"=== Tool Analysis ===\n{analysis}\n\n"
-        "Classify the news-price correlation. "
-        '{"correlation": "..."}'
-    )
-
-    parsed = await _final_llm_call(sys_prompt, user_prompt)
-    matched = None
-    if isinstance(parsed, dict) and "correlation" in parsed:
-        matched = _match_correlation(str(parsed["correlation"]))
+    sys_prompt, base_user_prompt = prompts.build_prompt(sample, "correlation")
+    user_prompt = prompts.append_tool_analysis(base_user_prompt, analysis)
+    raw = await _final_llm_text_call(sys_prompt, user_prompt)
+    matched = _match_correlation(raw)
+    if matched is None:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict) and "correlation" in parsed:
+            matched = _match_correlation(str(parsed["correlation"]))
 
     if matched is None:
         pred = str(result.get("prediction", ""))
@@ -1095,6 +1116,7 @@ async def _eval_correlation(
         "metrics": {"accuracy": 1.0 if correct else 0.0},
         "predicted": matched,
         "ground_truth": gt_corr,
+        **_result_artifact_fields(result),
     }
 
 
@@ -1170,20 +1192,28 @@ async def run_pipeline_eval(
     full_dataset: bool = False,
     use_strategy: bool = True,
     split: str = "test",
+    merge_checkpoint: bool = True,
 ) -> dict[str, Any]:
     """Run TimeClaw pipeline on dataset(s) and evaluate results.
 
-    This is the single entry point for both training and testing:
-      - Training: split="train" — runs pipeline on train set, records outcomes
-        into hierarchical memory (daily notes → distillation).
-      - Testing: split="test" — runs pipeline on test set with learned memory.
+    This is the single entry point for both memory-recording runs and eval:
+      - ``split="train"``: load **official** ``train_files.json`` subset (see
+        ``dataset_split``) and record outcomes into hierarchical memory.
+      - ``split="test"``: load **official** ``test_files.json`` subset (default
+        benchmark eval).  This is **not** “the same pool as independent training
+        split in half”—independent training data lives under
+        ``data_preparation/independent/`` unless you rewire loaders.
 
     Args:
-        split: Which data split to load ("train" or "test").
+        split: Which **named JSON list** to use: ``"train"`` or ``"test"``
+               (filenames under ``data/splits/<dataset>/``).
                Ignored when full_dataset=True.
         use_skills: If False (ablation), disables all memory components.
         full_dataset: If True, loads the entire dataset (ignores split).
         use_strategy: Enables online task strategy learning.
+        merge_checkpoint: If True (default), reuse ``{label}_{ds}.json`` under
+            ``.timeclaw/eval_results`` and only evaluate (idx, task) pairs
+            not already stored; then merge and save.
     """
     cfg = config or TimeClawConfig.load()
     # Disable MCP for benchmark: in-process calls are faster under high concurrency
@@ -1223,7 +1253,9 @@ async def run_pipeline_eval(
         _record_enabled = (split == "train")
         sem = asyncio.Semaphore(concurrency)
         datasets_to_run = (
-            [dataset_name] if dataset_name else list(DATASET_REGISTRY.keys())
+            [dataset_name]
+            if dataset_name
+            else datasets_with_benchmark_tasks()
         )
         all_results: dict[str, Any] = {}
         task_sems: dict[tuple[str, str], asyncio.Semaphore] = {}
@@ -1253,9 +1285,9 @@ async def run_pipeline_eval(
 
             try:
                 if full_dataset:
-                    samples = load_dataset(ds_name)
+                    samples = load_dataset(ds_name, config=cfg)
                 else:
-                    samples = load_split(ds_name, split)
+                    samples = load_split(ds_name, split, config=cfg)
             except FileNotFoundError:
                 logger.warning(f"[PipelineEval] No data for {ds_name}")
                 continue
@@ -1270,39 +1302,53 @@ async def run_pipeline_eval(
             if not supported_tasks:
                 continue
 
+            existing_eval = _load_eval_checkpoint(ds_name, label) if merge_checkpoint else []
+            done_eval = _eval_done_keys(existing_eval)
+
+            work_specs: list[tuple[int, MTBenchSample, str]] = []
+            for idx, sample in enumerate(samples):
+                for task in supported_tasks:
+                    if merge_checkpoint and (idx, task) in done_eval:
+                        continue
+                    work_specs.append((idx, sample, task))
+
             total_tasks = len(samples) * len(supported_tasks)
             ptc_str = f", per_task_concurrency={per_task_concurrency}" if per_task_concurrency else ""
             ic_str = f", indicator_concurrency={indicator_concurrency}" if indicator_concurrency else ""
             logger.info(
                 f"[PipelineEval:{label}] {ds_name}: {len(samples)} samples "
-                f"× {len(supported_tasks)} tasks = {total_tasks} evals, "
+                f"× {len(supported_tasks)} tasks = {total_tasks} evals "
+                f"({len(work_specs)} pending, {len(done_eval)} in checkpoint), "
                 f"concurrency={concurrency}{ptc_str}{ic_str}"
             )
             t0 = time.time()
 
-            coros = [
-                _eval_one_task(
-                    ds_name, idx, sample, task, pipeline, verbose, sem,
-                    _get_task_sem(ds_name, task),
-                )
-                for idx, sample in enumerate(samples)
-                for task in supported_tasks
-            ]
-            flat_results = await asyncio.gather(*coros, return_exceptions=True)
-
-            ds_results: list[dict[str, Any]] = []
-            for r in flat_results:
-                if isinstance(r, Exception):
-                    logger.error(f"[PipelineEval] {ds_name}: task error: {r}")
-                    continue
-                ds_results.append(r)
+            if work_specs:
+                coros = [
+                    _eval_one_task(
+                        ds_name, idx, sample, task, pipeline, verbose, sem,
+                        _get_task_sem(ds_name, task),
+                    )
+                    for idx, sample, task in work_specs
+                ]
+                flat_results = await asyncio.gather(*coros, return_exceptions=True)
+                new_rows: list[dict[str, Any]] = []
+                for r in flat_results:
+                    if isinstance(r, Exception):
+                        logger.error(f"[PipelineEval] {ds_name}: task error: {r}")
+                        continue
+                    new_rows.append(r)
+                ds_results = _merge_eval_rows(existing_eval, new_rows)
+            else:
+                ds_results = list(existing_eval)
 
             elapsed = time.time() - t0
             _save_results(ds_results, ds_name, label)
             summary = _summarize(ds_results)
             all_results[ds_name] = {
                 "total": len(ds_results),
-                "elapsed_s": round(elapsed, 1),
+                "elapsed_s": _result_total_seconds(ds_results),
+                "run_elapsed_s": round(elapsed, 1),
                 "summary": summary,
             }
             logger.info(
@@ -1319,6 +1365,7 @@ async def run_pipeline_eval(
             except Exception as e:
                 logger.debug(f"[PipelineEval] Memory distill error: {e}")
 
+        _save_readable_summary(all_results, label)
         return {"label": label, "results": all_results}
 
     finally:
@@ -1334,7 +1381,11 @@ def _save_results(
 ) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = RESULTS_DIR / f"{label}_{ds_name}.json"
-    path.write_text(json.dumps(results, indent=2, default=str))
+    artifact_rows = [_result_row_for_artifact(row, ds_name, label) for row in results]
+    path.write_text(
+        json.dumps(artifact_rows, indent=2, ensure_ascii=False, allow_nan=False, default=str),
+    )
+    _save_readable_results(results, ds_name, label)
 
 
 def _summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1345,17 +1396,184 @@ def _summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         if task not in by_task:
             by_task[task] = {}
         for k, v in metrics.items():
-            if isinstance(v, (int, float)):
-                by_task[task].setdefault(k, []).append(v)
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)) and np.isfinite(float(v)):
+                by_task[task].setdefault(k, []).append(float(v))
 
     summary: dict[str, Any] = {}
     for task, metric_lists in by_task.items():
         task_summary: dict[str, Any] = {}
         for k, vals in metric_lists.items():
-            task_summary[f"avg_{k}"] = round(float(np.mean(vals)), 4)
+            task_summary[f"avg_{k}"] = round(float(np.mean(vals)), 3)
             task_summary["n"] = len(vals)
         summary[task] = task_summary
     return summary
+
+
+def _result_total_seconds(results: list[dict[str, Any]]) -> float:
+    total_ms = 0.0
+    for row in results:
+        value = row.get("total_ms")
+        if isinstance(value, (int, float)) and np.isfinite(float(value)):
+            total_ms += float(value)
+    return round(total_ms / 1000.0, 3)
+
+
+def _round_number(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, (int, float)):
+        if not np.isfinite(float(value)):
+            return None
+        return round(float(value), 3)
+    return value
+
+
+def _round_nested(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _round_nested(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_round_nested(v) for v in value]
+    if isinstance(value, tuple):
+        return [_round_nested(v) for v in value]
+    return _round_number(value)
+
+
+def _compact_value(value: Any, *, max_chars: int = 300) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        try:
+            text = json.dumps(_round_nested(value), ensure_ascii=False, default=str)
+        except TypeError:
+            text = str(value)
+    text = text.replace("\n", " ").strip()
+    if len(text) > max_chars:
+        return text[:max_chars] + " ..."
+    return text
+
+
+def _format_metric_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{float(value):.3f}"
+    return str(value)
+
+
+def _summary_table(summary: dict[str, Any]) -> str:
+    if not summary:
+        return "_No numeric metrics available._\n"
+
+    metric_keys: list[str] = []
+    seen: set[str] = set()
+    for task_summary in summary.values():
+        if not isinstance(task_summary, dict):
+            continue
+        for key in task_summary.keys():
+            if key not in seen:
+                metric_keys.append(key)
+                seen.add(key)
+
+    headers = ["task"] + metric_keys
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for task in sorted(summary.keys()):
+        task_summary = summary.get(task, {})
+        row = [task]
+        for key in metric_keys:
+            row.append(_format_metric_value(task_summary.get(key, "-")))
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def _save_readable_results(
+    results: list[dict[str, Any]], ds_name: str, label: str,
+) -> None:
+    summary = _summarize(results)
+    lines = [
+        f"# Evaluation Results: {label} / {ds_name}",
+        "",
+        "## Test Flow",
+        "- Executor runs in `test` mode.",
+        "- `spawn_subagent` and all `evaluate_*` tools are hidden in test mode.",
+        "- `forecast` uses the pipeline prediction directly.",
+        "- Non-forecast tasks use TimeClaw tool analysis first, then an official MTBench-style final reasoning prompt with appended tool analysis.",
+        "",
+        "## Dataset Summary",
+        f"- Total evaluated rows: {len(results)}",
+        "",
+        "## Task Summary",
+        _summary_table(summary).rstrip(),
+        "",
+        "## Sample Details",
+    ]
+
+    for row in sorted(results, key=lambda item: (int(item.get("idx", 0)), str(item.get("task", "")))):
+        idx = row.get("idx", "?")
+        task = row.get("task", "unknown")
+        file_name = row.get("file", "-")
+        lines.extend([
+            "",
+            f"### idx={idx} task={task}",
+            f"- file: `{file_name}`",
+            f"- domain: `{row.get('domain', '-')}`",
+            f"- trace_id: `{row.get('trace_id') or '-'}`",
+            f"- total_ms: `{row.get('total_ms') if row.get('total_ms') is not None else '-'}`",
+            f"- gate_accepted: `{row.get('gate_accepted')}`",
+            f"- gate_rejections: {_compact_value(row.get('gate_rejections') or [])}",
+            f"- tool_chain: {_compact_value(row.get('tool_chain') or [])}",
+            f"- metrics: {_compact_value({k: _round_number(v) for k, v in (row.get('metrics') or {}).items()}, max_chars=400)}",
+        ])
+        if "predicted" in row:
+            lines.append(f"- predicted: {_compact_value(row.get('predicted'), max_chars=600)}")
+        if "ground_truth" in row:
+            lines.append(f"- ground_truth: {_compact_value(row.get('ground_truth'), max_chars=600)}")
+
+    path = RESULTS_DIR / f"{label}_{ds_name}.md"
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _save_readable_summary(all_results: dict[str, Any], label: str) -> None:
+    lines = [
+        f"# Evaluation Summary: {label}",
+        "",
+        "## Test Flow",
+        "- Test-time executor keeps the same core prompt skeleton as training, but visible tools are reduced.",
+        "- Test mode hides `spawn_subagent` and all GT-based `evaluate_*` tools, so execution is single-path.",
+        "- For non-forecast tasks, the final answer comes from an official MTBench-style reasoning prompt plus appended TimeClaw tool analysis.",
+        "- For forecast tasks, the final answer is taken directly from the pipeline prediction.",
+        "",
+        "## Datasets",
+    ]
+    if not all_results:
+        lines.append("_No datasets were evaluated._")
+    else:
+        for ds_name in sorted(all_results.keys()):
+            ds_info = all_results.get(ds_name, {})
+            lines.extend([
+                "",
+                f"### {ds_name}",
+                f"- total rows: {ds_info.get('total', 0)}",
+                f"- elapsed_s: {_format_metric_value(ds_info.get('elapsed_s', '-'))}",
+                f"- run_elapsed_s: {_format_metric_value(ds_info.get('run_elapsed_s', '-'))}",
+            ])
+            summary = ds_info.get("summary", {})
+            if summary:
+                lines.append("")
+                lines.append(_summary_table(summary).rstrip())
+
+    path = RESULTS_DIR / f"{label}_summary.md"
+    path.write_text("\n".join(lines) + "\n")
 
 
 async def main() -> None:
@@ -1371,6 +1589,11 @@ async def main() -> None:
     parser.add_argument("--per-task-concurrency", type=int, default=None)
     parser.add_argument("--indicator-concurrency", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--no-merge-checkpoint",
+        action="store_true",
+        help="Ignore existing eval_results/{label}_*.json when resuming.",
+    )
     args = parser.parse_args()
 
     result = await run_pipeline_eval(
@@ -1378,6 +1601,7 @@ async def main() -> None:
         task_filter=args.task,
         max_samples=args.max_samples,
         sample_indices=args.sample_index_file,
+        merge_checkpoint=not args.no_merge_checkpoint,
         use_skills=not args.no_skills,
         verbose=args.verbose,
         label="timeclaw_no_skills" if args.no_skills else "timeclaw",

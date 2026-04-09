@@ -54,11 +54,7 @@ class ImageClassifyTool(ClawTool):
         ])
 
         if llm is None:
-            return {
-                "category": "unknown",
-                "confidence": 0.0,
-                "reason": "No LLM available for classification",
-            }
+            raise ValueError("LLM backend is required for image classification")
 
         cats_str = ", ".join(categories)
         prompt = (
@@ -66,28 +62,18 @@ class ImageClassifyTool(ClawTool):
             "Return JSON with keys: category, confidence (0-1), reason (brief explanation)."
         )
 
-        try:
-            resp = await llm.complete_multimodal(
-                text=prompt,
-                image_paths=[path],
-                response_format="json",
-            )
-            if resp.parsed:
-                result = resp.parsed
-                if "category" not in result:
-                    result["category"] = "unknown"
-                return result
-            return {
-                "category": "unknown",
-                "confidence": 0.0,
-                "raw_response": resp.text,
-            }
-        except Exception as e:
-            return {
-                "category": "unknown",
-                "confidence": 0.0,
-                "error": str(e),
-            }
+        resp = await llm.complete_multimodal(
+            text=prompt,
+            image_paths=[path],
+            response_format="json",
+        )
+        result = resp.parsed if isinstance(resp.parsed, dict) else None
+        if result is None:
+            raise ValueError("Image classifier returned non-JSON response")
+        category = str(result.get("category", "")).strip()
+        if not category:
+            raise ValueError("Image classifier JSON is missing non-empty 'category'")
+        return result
 
 
 tool = ImageClassifyTool()

@@ -104,6 +104,27 @@ class TestProcessingTools:
         sliced = np.asarray(result.data)
         assert len(sliced) == 40
 
+    async def test_value_at(self, ts_data):
+        result = await _run_tool("value_at", ts_data, index=-1)
+        assert result.success is True
+        assert isinstance(result.data, dict)
+        assert result.data["resolved_index"] == len(ts_data) - 1
+        assert result.data["value"] == pytest.approx(float(ts_data[-1]))
+
+    async def test_window_stats(self, ts_data):
+        result = await _run_tool("window_stats", ts_data, start=-10, end=len(ts_data))
+        assert result.success is True
+        assert isinstance(result.data, dict)
+        assert result.data["length"] == 10
+        assert result.data["resolved_start"] == len(ts_data) - 10
+        assert result.data["resolved_end"] == len(ts_data)
+
+    async def test_window_stats_reports_current_sequence_bounds_in_error(self, ts_data):
+        result = await _run_tool("window_stats", ts_data[:24], start=144, end=168)
+        assert result.success is False
+        assert "Current sequence length is 24" in result.error
+        assert "first 24 points are start=0, end=24" in result.error
+
 
 # ---------------------------------------------------------------------------
 # Profiling tools
@@ -128,6 +149,15 @@ class TestProfilingTools:
         assert result.success is True
         assert isinstance(result.data, dict)
         assert "adf" in result.data
+
+    async def test_stationarity_test_handles_constant_series(self):
+        data = np.ones(32)
+        result = await _run_tool("stationarity_test", data)
+        assert result.success is True
+        assert result.data["is_constant"] is True
+        assert result.data["conclusion"] == "constant_stationary"
+        assert result.data["adf"]["is_stationary"] is True
+        assert result.data["kpss"]["is_stationary"] is True
 
     async def test_hurst_exponent(self, ts_data):
         result = await _run_tool("hurst_exponent", ts_data)
@@ -312,19 +342,6 @@ class TestPredictionTools:
         assert result.success is True
         assert isinstance(result.data, dict)
         assert "forecast" in result.data
-
-    async def test_ensemble_forecast(self, ts_data):
-        result = await _run_tool(
-            "ensemble_forecast",
-            ts_data,
-            forecasts=[[1, 2, 3], [4, 5, 6]],
-            method="mean",
-        )
-        assert result.success is True
-        assert isinstance(result.data, dict)
-        assert "forecast" in result.data
-        expected = [2.5, 3.5, 4.5]
-        np.testing.assert_allclose(result.data["forecast"], expected)
 
 
 # ---------------------------------------------------------------------------

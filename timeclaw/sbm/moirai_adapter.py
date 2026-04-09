@@ -14,8 +14,8 @@ from loguru import logger
 from timeclaw.sbm.base import SBMBase, SBMConfig, SBMOutput, SBMTask
 
 MOIRAI_DEFAULT_CONFIG = SBMConfig(
-    model_name="moirai",
-    model_path="Salesforce/moirai-1.1-R-large",
+    model_name="moirai1_1_r_base",
+    model_path="Salesforce/moirai-1.1-R-base",
     context_length=512,
     prediction_length=96,
     num_samples=20,
@@ -62,7 +62,7 @@ class MoiraiAdapter(SBMBase):
     supporting variable context/prediction lengths and multivariate input.
     """
 
-    name: str = "moirai"
+    name: str = "moirai1_1_r_base"
     supported_tasks: list[SBMTask] = [SBMTask.FORECAST]
     requires_gpu: bool = True
 
@@ -75,7 +75,7 @@ class MoiraiAdapter(SBMBase):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        model_path = self.config.model_path or "Salesforce/moirai-1.1-R-large"
+        model_path = self.config.model_path or "Salesforce/moirai-1.1-R-base"
         logger.info(f"Loading Moirai from {model_path} on {device}")
 
         module = MoiraiModule.from_pretrained(model_path)
@@ -151,10 +151,10 @@ class MoiraiAdapter(SBMBase):
                 point_forecast=point_forecast,
                 quantile_forecast=quantiles,
                 samples=samples_2d,
-                metadata={"model": "moirai", "prediction_length": pred_len},
+                metadata={"model": "Salesforce/moirai-1.1-R-base", "prediction_length": pred_len},
             )
 
         return SBMOutput(
             point_forecast=np.zeros(pred_len),
-            metadata={"model": "moirai", "error": "no forecasts generated"},
+            metadata={"model": "Salesforce/moirai-1.1-R-base", "error": "no forecasts generated"},
         )

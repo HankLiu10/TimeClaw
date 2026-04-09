@@ -210,7 +210,7 @@ Sub-agent 最多执行 MAX_SUB_REACT_STEPS = 5 步（主 agent 为 10 步）。
   Step 1: detect_seasonality -> 发现周期性
   Step 2: spawn_subagent
     - Sub-Agent 0: "使用 prophet_forecast 预测"
-    - Sub-Agent 1: "使用 chronos_forecast 预测"
+    - Sub-Agent 1: "使用 chronos2_forecast 预测"
   Step 3: 比较两个预测结果 -> 选择更优的
 ```
 

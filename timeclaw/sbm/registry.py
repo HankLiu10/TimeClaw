@@ -82,6 +82,25 @@ class SBMRegistry:
 _global_registry = SBMRegistry()
 
 
+def configured_default_config(name: str, default_config: SBMConfig) -> SBMConfig:
+    """Apply TimeClaw's SBM runtime device mapping to one adapter config."""
+    try:
+        from timeclaw.core.config import TimeClawConfig
+
+        runtime_cfg = TimeClawConfig.load().sbm
+        device = (
+            runtime_cfg.devices.get(name)
+            or runtime_cfg.devices.get(default_config.model_name)
+            or runtime_cfg.device
+        )
+        if not device:
+            return default_config
+        return default_config.model_copy(update={"device": device})
+    except Exception as e:
+        logger.debug(f"SBM config load failed for {name}: {e}")
+        return default_config
+
+
 def get_global_registry() -> SBMRegistry:
     """Get the global SBM registry singleton."""
     return _global_registry
@@ -114,31 +133,58 @@ def auto_register(server_url: str = "http://localhost:8100") -> int:
 
     try:
         from timeclaw.sbm.chronos_adapter import ChronosAdapter, CHRONOS_DEFAULT_CONFIG
-        registry.register("chronos", ChronosAdapter, CHRONOS_DEFAULT_CONFIG)
+        registry.register(
+            "chronos2",
+            ChronosAdapter,
+            configured_default_config("chronos2", CHRONOS_DEFAULT_CONFIG),
+        )
         count += 1
     except ImportError:
         logger.debug("Chronos adapter not available (missing dependencies)")
 
     try:
         from timeclaw.sbm.moirai_adapter import MoiraiAdapter, MOIRAI_DEFAULT_CONFIG
-        registry.register("moirai", MoiraiAdapter, MOIRAI_DEFAULT_CONFIG)
+        registry.register(
+            "moirai1_1_r_base",
+            MoiraiAdapter,
+            configured_default_config("moirai1_1_r_base", MOIRAI_DEFAULT_CONFIG),
+        )
         count += 1
     except ImportError:
         logger.debug("Moirai adapter not available (missing dependencies)")
 
     try:
         from timeclaw.sbm.timesfm_adapter import TimesFMAdapter, TIMESFM_DEFAULT_CONFIG
-        registry.register("timesfm", TimesFMAdapter, TIMESFM_DEFAULT_CONFIG)
+        registry.register(
+            "timesfm2",
+            TimesFMAdapter,
+            configured_default_config("timesfm2", TIMESFM_DEFAULT_CONFIG),
+        )
         count += 1
     except ImportError:
         logger.debug("TimesFM adapter not available (missing dependencies)")
 
     try:
         from timeclaw.sbm.timer_adapter import TimerAdapter, TIMER_DEFAULT_CONFIG
-        registry.register("timer", TimerAdapter, TIMER_DEFAULT_CONFIG)
+        registry.register(
+            "sundial_base_128m",
+            TimerAdapter,
+            configured_default_config("sundial_base_128m", TIMER_DEFAULT_CONFIG),
+        )
         count += 1
     except ImportError:
         logger.debug("Timer adapter not available (missing dependencies)")
+
+    try:
+        from timeclaw.sbm.aurora_adapter import AuroraAdapter, AURORA_DEFAULT_CONFIG
+        registry.register(
+            "aurora",
+            AuroraAdapter,
+            configured_default_config("aurora", AURORA_DEFAULT_CONFIG),
+        )
+        count += 1
+    except ImportError:
+        logger.debug("Aurora adapter not available (missing dependencies)")
 
     logger.info(f"SBM auto-register: {count} local adapters available")
     return count

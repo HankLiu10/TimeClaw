@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 from contextvars import ContextVar
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -29,6 +30,10 @@ _full_dump: bool = False
 _trace_dir: Path = Path(".timeclaw/traces")
 _active_trace_path_var: ContextVar[Path | None] = ContextVar(
     "timeclaw_active_trace_path",
+    default=None,
+)
+_seen_content_refs_var: ContextVar[set[str] | None] = ContextVar(
+    "timeclaw_seen_content_refs",
     default=None,
 )
 
@@ -46,14 +51,34 @@ def start_run(trace_id: str, metadata: dict[str, Any] | None = None) -> None:
     _trace_dir.mkdir(parents=True, exist_ok=True)
     active_trace_path = _trace_dir / f"{trace_id}.jsonl"
     _active_trace_path_var.set(active_trace_path)
+    _seen_content_refs_var.set(set())
     if active_trace_path.exists():
         active_trace_path.unlink()
-    _record_event("run_start", metadata or {})
+    full_path = active_trace_path.with_suffix(".full.jsonl")
+    if full_path.exists():
+        full_path.unlink()
+    payload = dict(metadata or {})
+    if "description" in payload:
+        description = str(payload.pop("description") or "")
+        block = _store_content_block("run_description", description)
+        payload["description"] = block
+    _record_event("run_start", payload)
 
 
 def end_run(status: str, metadata: dict[str, Any] | None = None) -> None:
     _record_event("run_end", {"status": status, **(metadata or {})})
     _active_trace_path_var.set(None)
+    _seen_content_refs_var.set(None)
+
+
+def detach_context() -> None:
+    """Clear the active trace context for the current async context.
+
+    This is used when spawning background work that must not inherit the
+    sample-level trace sink, such as post-commit memory distillation.
+    """
+    _active_trace_path_var.set(None)
+    _seen_content_refs_var.set(None)
 
 
 def _json_safe(value: Any) -> Any:
@@ -84,6 +109,23 @@ def _record_event(event_type: str, payload: dict[str, Any] | Any) -> None:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
         logger.debug(f"[trace_logger] failed to persist trace event: {exc}")
+
+
+def _record_full_dump(event_type: str, payload: dict[str, Any] | Any) -> None:
+    active_trace_path = _active_trace_path_var.get()
+    if active_trace_path is None:
+        return
+    full_path = active_trace_path.with_suffix(".full.jsonl")
+    record = {
+        "ts": time.time(),
+        "event": event_type,
+        "payload": _json_safe(payload),
+    }
+    try:
+        with full_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.debug(f"[trace_logger] failed to persist full trace event: {exc}")
 
 
 # ── Formatting helpers ──────────────────────────────────────────
@@ -129,6 +171,183 @@ def _smart_trunc(obj: Any, limit: int = 2000) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + f"… [{len(s)} chars total]"
+
+
+def _normalize_whitespace(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def _preview_text(text: Any, limit: int = 220) -> str:
+    normalized = _normalize_whitespace(str(text))
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[:limit] + f"… [{len(normalized)} chars]"
+
+
+def _text_fingerprint(text: Any) -> str:
+    raw = str(text).encode("utf-8", errors="ignore")
+    return hashlib.sha1(raw).hexdigest()[:10]
+
+
+def _flatten_message_content(content: Any) -> tuple[str, bool]:
+    if isinstance(content, str):
+        return content, False
+    if not isinstance(content, list):
+        return str(content), False
+
+    text_parts: list[str] = []
+    has_image = False
+    for item in content:
+        if not isinstance(item, dict):
+            text_parts.append(str(item))
+            continue
+        item_type = item.get("type")
+        if item_type == "text":
+            text_parts.append(str(item.get("text", "")))
+        elif item_type == "image_url":
+            has_image = True
+            text_parts.append("[IMAGE]")
+        else:
+            text_parts.append(str(item))
+    return "\n".join(text_parts), has_image
+
+
+def _summarize_messages(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    outlined: list[dict[str, Any]] = []
+    total_chars = 0
+    for idx, msg in enumerate(messages):
+        role = str(msg.get("role", "?"))
+        content, has_image = _flatten_message_content(msg.get("content", ""))
+        total_chars += len(content)
+        outlined.append({
+            "index": idx,
+            "role": role,
+            "chars": len(content),
+            "has_image": has_image,
+            "hash": _text_fingerprint(content),
+            "preview": _preview_text(content, 180),
+        })
+    return {
+        "message_count": len(messages),
+        "total_chars": total_chars,
+        "messages": outlined,
+    }
+
+
+def _store_content_block(kind: str, text: Any) -> dict[str, Any]:
+    content = str(text)
+    ref = f"{kind}:{_text_fingerprint(content)}"
+    ref_payload = {
+        "ref": ref,
+        "kind": kind,
+        "chars": len(content),
+    }
+    seen = _seen_content_refs_var.get()
+    if seen is None:
+        return ref_payload
+    if ref not in seen:
+        seen.add(ref)
+        _record_event("content_block", {
+            **ref_payload,
+            "preview": _preview_text(content, 220),
+            "content": content,
+        })
+    return ref_payload
+
+
+def _summarize_messages_with_refs(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    outlined: list[dict[str, Any]] = []
+    context_blocks: list[dict[str, Any]] = []
+    total_chars = 0
+    for idx, msg in enumerate(messages):
+        role = str(msg.get("role", "?"))
+        content, has_image = _flatten_message_content(msg.get("content", ""))
+        total_chars += len(content)
+        ref_payload = _store_content_block(f"prompt_message/{role}", content)
+        outlined.append({
+            "index": idx,
+            "role": role,
+            "has_image": has_image,
+            **ref_payload,
+        })
+        context_blocks.append({
+            "index": idx,
+            "role": role,
+            "ref": ref_payload["ref"],
+            "kind": ref_payload["kind"],
+            "chars": ref_payload["chars"],
+        })
+    return {
+        "message_count": len(messages),
+        "total_chars": total_chars,
+        "messages": outlined,
+        "context_blocks": context_blocks,
+    }
+
+
+def _summarize_mapping(mapping: dict[str, Any], *, value_limit: int = 180) -> dict[str, Any]:
+    summarized: dict[str, Any] = {}
+    for key, value in mapping.items():
+        if value is None or isinstance(value, (bool, int, float)):
+            summarized[str(key)] = value
+            continue
+        if isinstance(value, str):
+            summarized[str(key)] = _preview_text(value, value_limit)
+            continue
+        if isinstance(value, (list, tuple)):
+            items = list(value)
+            preview = [_preview_text(item, 80) for item in items[:4]]
+            summarized[str(key)] = {"len": len(items), "preview": preview}
+            continue
+        if isinstance(value, dict):
+            summarized[str(key)] = {
+                "keys": list(value.keys())[:8],
+                "preview": _preview_text(_smart_trunc(value, 300), value_limit),
+            }
+            continue
+        summarized[str(key)] = _preview_text(value, value_limit)
+    return summarized
+
+
+def _summarize_trace_value(value: Any, *, limit: int = 220) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _preview_text(value, limit)
+    if isinstance(value, dict):
+        return {
+            "keys": list(value.keys())[:8],
+            "preview": _preview_text(_smart_trunc(value, min(400, limit * 2)), limit),
+        }
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        return {
+            "len": len(items),
+            "preview": [_summarize_trace_value(item, limit=80) for item in items[:4]],
+        }
+    return _preview_text(value, limit)
+
+
+def _summarize_response(parsed: Any, text: str, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if tool_calls:
+        return {
+            "kind": "tool_calls",
+            "tool_calls": _json_safe(tool_calls),
+        }
+    if parsed is not None:
+        summary = {
+            "kind": "parsed",
+            "decision": _extract_llm_decision(parsed),
+        }
+        if isinstance(parsed, dict):
+            summary["parsed"] = _json_safe(parsed)
+        return summary
+    if text:
+        return {
+            "kind": "text",
+            **_store_content_block("response_text", text),
+        }
+    return {"kind": "empty"}
 
 
 def _format_result_data(data: Any) -> str:
@@ -211,7 +430,7 @@ def _extract_llm_decision(parsed: Any) -> str:
 
 def stage(name: str, extra: str = "") -> None:
     """Mark a major pipeline stage."""
-    _record_event("stage", {"name": name, "extra": extra})
+    _record_event("stage", {"name": name, "extra": _preview_text(extra, 220)})
     if not _verbose:
         return
     msg = f"\n{_SEPARATOR}\n  {name}\n{_SEPARATOR}"
@@ -222,7 +441,7 @@ def stage(name: str, extra: str = "") -> None:
 
 def thinking(agent: str, description: str) -> None:
     """Show that an agent is about to think (LLM call)."""
-    _record_event("thinking", {"agent": agent, "description": description})
+    _record_event("thinking", {"agent": agent, "description": _preview_text(description, 220)})
     if not _verbose:
         return
     logger.info(f"[{agent}] 思考中… {description}")
@@ -237,10 +456,13 @@ def llm_call(
 ) -> None:
     """Log an LLM call — focus on the decision, not the raw prompt."""
     resp_parsed = None
+    resp_tool_calls = []
     resp_usage = {}
     resp_text = ""
     if hasattr(response, "parsed"):
         resp_parsed = response.parsed
+    if hasattr(response, "tool_calls"):
+        resp_tool_calls = response.tool_calls or []
     if hasattr(response, "usage"):
         resp_usage = response.usage or {}
     if hasattr(response, "text"):
@@ -251,12 +473,21 @@ def llm_call(
 
     _record_event("llm_call", {
         "caller": caller,
-        "messages": messages,
         "response_format": response_format,
-        "response_text": resp_text,
-        "response_parsed": resp_parsed,
         "usage": resp_usage,
+        "prompt": _summarize_messages_with_refs(messages),
+        "response": _summarize_response(resp_parsed, resp_text, resp_tool_calls),
     })
+    if _full_dump:
+        _record_full_dump("llm_call_full", {
+            "caller": caller,
+            "messages": messages,
+            "response_format": response_format,
+            "response_text": resp_text,
+            "response_parsed": resp_parsed,
+            "response_tool_calls": resp_tool_calls,
+            "usage": resp_usage,
+        })
 
     if not _verbose:
         return
@@ -282,10 +513,16 @@ def llm_call(
         parts.append("")
         parts.append("【LLM 原始返回】:")
         parts.append(f"  {resp_text}")
+        if resp_tool_calls:
+            parts.append("【LLM Tool Calls】:")
+            parts.append(f"  {json.dumps(resp_tool_calls, ensure_ascii=False)}")
         parts.append(f"{_THIN_SEP}")
         logger.info("\n".join(parts))
     else:
-        decision = _extract_llm_decision(resp_parsed)
+        if resp_tool_calls:
+            decision = _smart_trunc(resp_tool_calls, 2000)
+        else:
+            decision = _extract_llm_decision(resp_parsed)
         logger.info(
             f"[{caller}] LLM 返回 (tokens: {tokens_in} in / {tokens_out} out):\n"
             f"    {decision}"
@@ -297,7 +534,12 @@ def llm_prompt_detail(
     messages: list[dict[str, Any]],
 ) -> None:
     """Log full LLM prompt — only when extra detail is needed."""
-    _record_event("llm_prompt_detail", {"caller": caller, "messages": messages})
+    _record_event("llm_prompt_detail", {
+        "caller": caller,
+        "prompt": _summarize_messages_with_refs(messages),
+    })
+    if _full_dump:
+        _record_full_dump("llm_prompt_detail_full", {"caller": caller, "messages": messages})
     if not _verbose:
         return
     parts = []
@@ -314,7 +556,7 @@ def llm_prompt_detail(
 
 def decision(agent: str, text: str) -> None:
     """Log a key decision point."""
-    _record_event("decision", {"agent": agent, "text": text})
+    _record_event("decision", {"agent": agent, "text": _preview_text(text, 260)})
     if not _verbose:
         return
     logger.info(f"[{agent}] → {text}")
@@ -335,11 +577,11 @@ def tool_exec(
     _record_event("tool_exec", {
         "caller": caller,
         "tool_name": tool_name,
-        "args": args,
+        "args": _summarize_mapping(args, value_limit=120),
         "success": success,
-        "data": data,
+        "result": _summarize_trace_value(data, limit=220),
         "error": error,
-        "metadata": metadata,
+        "metadata": _summarize_mapping(metadata, value_limit=120) if isinstance(metadata, dict) else _summarize_trace_value(metadata, limit=120),
     })
 
     if not _verbose:
@@ -365,7 +607,12 @@ def agent_step(
     data: dict[str, Any] | Any,
 ) -> None:
     """Log an agent lifecycle phase — extract key info only."""
-    _record_event("agent_step", {"agent": agent, "phase": phase, "data": data})
+    event_payload: dict[str, Any] = {"agent": agent, "phase": phase}
+    if isinstance(data, dict):
+        event_payload["summary"] = _summarize_mapping(data, value_limit=160)
+    else:
+        event_payload["summary"] = _summarize_trace_value(data, limit=200)
+    _record_event("agent_step", event_payload)
     if not _verbose:
         return
 
@@ -454,7 +701,12 @@ def pipeline_stage(
     data: dict[str, Any] | Any,
 ) -> None:
     """Log a pipeline stage — minimal, key facts only."""
-    _record_event("pipeline_stage", {"stage_name": stage_name, "data": data})
+    payload = {"stage_name": stage_name}
+    if isinstance(data, dict):
+        payload["summary"] = _summarize_mapping(data, value_limit=160)
+    else:
+        payload["summary"] = _summarize_trace_value(data, limit=200)
+    _record_event("pipeline_stage", payload)
     if not _verbose:
         return
     # Pipeline stages are already covered by stage() + agent logs.
@@ -473,9 +725,9 @@ def reasoning_step(
     _record_event("reasoning_step", {
         "caller": caller,
         "step": step,
-        "thought": thought,
-        "observation": observation,
-        "critic": critic,
+        "thought": _summarize_mapping(thought, value_limit=160) if isinstance(thought, dict) else _summarize_trace_value(thought, limit=180),
+        "observation": _summarize_trace_value(observation, limit=180),
+        "critic": _preview_text(critic, 200) if critic else None,
     })
     if not _verbose:
         return

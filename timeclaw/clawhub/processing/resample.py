@@ -26,7 +26,10 @@ class ResampleTool(ClawTool):
         "Output: dict with keys 'data' (resampled values as list), 'original_length', and "
         "'target_length'. Use this to align data from different sources to a common cadence, "
         "downsample high-frequency data, or upsample sparse data before feeding into models "
-        "that require fixed-length input. "
+        "that require fixed-length input. This tool performs interpolation / resampling only: "
+        "it does NOT compute grouped statistics such as one mean per day, one max per segment, "
+        "or one summary value per window. For example, resampling a 336-point hourly series to "
+        "14 points creates a 14-point interpolated series, not 14 daily means. "
         "Parameters: freq (str, e.g. '5min', '1H', '1D' — for datetime-indexed pandas data) "
         "or target_length (int — for numeric resampling via scipy)."
     )

@@ -82,11 +82,12 @@ class DatasetLoader:
                 "source": "huggingface",
             }
         except ImportError:
-            logger.warning("datasets library not installed, using synthetic fallback")
-            return self._load_synthetic("random_walk", length=1000)
+            raise RuntimeError(
+                "datasets library not installed; cannot load HuggingFace dataset "
+                f"'{dataset_name}'"
+            )
         except Exception as e:
-            logger.warning(f"Failed to load HF dataset {dataset_name}: {e}")
-            return self._load_synthetic("random_walk", length=1000)
+            raise RuntimeError(f"Failed to load HF dataset {dataset_name}: {e}") from e
 
     def _load_synthetic(self, pattern: str = "sine", **kwargs: Any) -> dict[str, Any]:
         length = kwargs.get("length", 1000)
@@ -148,17 +149,15 @@ class DatasetLoader:
         }
 
         if name.lower() in standard_hf_map:
-            try:
-                return self._load_huggingface(standard_hf_map[name.lower()], **kwargs)
-            except Exception:
-                pass
+            return self._load_huggingface(standard_hf_map[name.lower()], **kwargs)
 
         csv_path = self.cache_dir / f"{name}.csv"
         if csv_path.exists():
             return self._load_csv(str(csv_path), **kwargs)
 
-        logger.info(f"Dataset '{name}' not found locally, generating synthetic substitute")
-        return self._load_synthetic("sine", length=kwargs.get("length", 2000))
+        raise FileNotFoundError(
+            f"Dataset '{name}' not found in cache_dir '{self.cache_dir}' and no explicit source was provided"
+        )
 
     def load_classification(
         self, name: str = "synthetic", **kwargs: Any

@@ -1,4 +1,4 @@
-"""Chronos forecast tool — Amazon's probabilistic time-series foundation model."""
+"""Chronos-2 forecast tool — Amazon Chronos-2 foundation model."""
 
 from __future__ import annotations
 
@@ -13,33 +13,25 @@ from timeclaw.clawhub.tool_base import ClawTool, ToolCategory, ToolIOType
 _load_lock = threading.Lock()
 
 
-def _statistical_fallback(ts_data: Any, horizon: int) -> dict[str, Any]:
-    arr = np.asarray(ts_data, dtype=np.float32).ravel()
-    if len(arr) < 2:
-        forecast = np.full(horizon, arr[-1] if len(arr) > 0 else 0.0)
-    else:
-        trend = (arr[-1] - arr[-min(10, len(arr))]) / min(10, len(arr))
-        forecast = arr[-1] + trend * np.arange(1, horizon + 1)
-    return {"model": "chronos_fallback", "horizon": horizon, "point_forecast": forecast.tolist()}
-
-
 def _run_chronos(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, Any]:
-    from timeclaw.sbm.registry import get_global_registry, auto_register
+    from timeclaw.sbm.registry import configured_default_config, get_global_registry
 
     registry = get_global_registry()
-    if "chronos" not in registry.list_available():
+    if "chronos2" not in registry.list_available():
         try:
             from timeclaw.sbm.chronos_adapter import ChronosAdapter, CHRONOS_DEFAULT_CONFIG
-            registry.register("chronos", ChronosAdapter, CHRONOS_DEFAULT_CONFIG)
+            registry.register(
+                "chronos2",
+                ChronosAdapter,
+                configured_default_config("chronos2", CHRONOS_DEFAULT_CONFIG),
+            )
         except ImportError:
-            logger.warning("[chronos_forecast] chronos-forecasting not installed")
-            return _statistical_fallback(ts_data, horizon)
+            raise RuntimeError("chronos-forecasting>=2.2 not installed")
 
     try:
-        adapter = registry.get("chronos")
+        adapter = registry.get("chronos2")
     except KeyError:
-        logger.warning("[chronos_forecast] adapter not available")
-        return _statistical_fallback(ts_data, horizon)
+        raise RuntimeError("chronos2 adapter not available")
 
     context = np.asarray(ts_data, dtype=np.float32)
     if context.ndim == 0:
@@ -50,17 +42,15 @@ def _run_chronos(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str,
             if not adapter.is_loaded:
                 try:
                     adapter.load()
-                    logger.info("[chronos_forecast] model loaded")
+                    logger.info("[chronos2_forecast] model loaded")
                 except Exception as e:
-                    logger.error(f"[chronos_forecast] load failed: {e}")
-                    result = _statistical_fallback(ts_data, horizon)
-                    result["model_error"] = f"load failed: {e}"
-                    return result
+                    logger.error(f"[chronos2_forecast] load failed: {e}")
+                    raise RuntimeError(f"chronos load failed: {e}") from e
 
     try:
         output = adapter.forecast(context, prediction_length=horizon, num_samples=num_samples)
         result: dict[str, Any] = {
-            "model": "chronos",
+            "model": str(output.metadata.get("model", "chronos-2")),
             "horizon": horizon,
             "point_forecast": output.point_forecast.tolist() if output.point_forecast is not None else None,
         }
@@ -68,10 +58,8 @@ def _run_chronos(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str,
             result["quantiles"] = {str(q): v.tolist() for q, v in output.quantile_forecast.items()}
         return result
     except Exception as e:
-        logger.error(f"[chronos_forecast] inference failed: {e}")
-        result = _statistical_fallback(ts_data, horizon)
-        result["model_error"] = str(e)
-        return result
+        logger.error(f"[chronos2_forecast] inference failed: {e}")
+        raise RuntimeError(f"chronos inference failed: {e}") from e
 
 
 _PARAM_SCHEMA: dict[str, Any] = {
@@ -84,16 +72,14 @@ _PARAM_SCHEMA: dict[str, Any] = {
 
 
 class ChronosForecastTool(ClawTool):
-    name: str = "chronos_forecast"
+    name: str = "chronos2_forecast"
     category: ToolCategory = ToolCategory.PREDICTION
     description: str = (
-        "Forecast a univariate time series using Amazon Chronos, a language-model-based time series model "
-        "that tokenizes values into bins and generates probabilistic forecasts. "
+        "Forecast a univariate time series using Amazon Chronos-2. "
         "Input: 1-D numeric array. "
         "Output: dict with 'point_forecast' (array), 'horizon', 'model', and optional 'quantiles' for uncertainty. "
-        "Strengths: excellent uncertainty quantification, robust to outliers; "
+        "Strengths: strong zero-shot forecasting and direct quantile prediction; "
         "handles short to medium series well (50-500 points). Runs on GPU. "
-        "Falls back to a linear-trend statistical forecast if the model server is unavailable. "
         "Key params: 'horizon' (steps ahead, default 96)."
     )
     io_type: ToolIOType = ToolIOType.X_TO_X

@@ -21,14 +21,16 @@ class BatchEvaluateAgainstGTTool(ClawTool):
         "properties": {
             "predictions": {
                 "type": "array",
-                "description": "List of candidate predictions to compare.",
+                "description": (
+                    "List of candidate predictions to compare. Each item may be either "
+                    "a raw prediction payload or an object like "
+                    "{name: ..., prediction: ...}."
+                ),
                 "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "prediction": {"description": "Candidate prediction payload."},
-                    },
-                    "required": ["prediction"],
+                    "description": (
+                        "Raw prediction payload or wrapper object containing "
+                        "`prediction` and optional `name`."
+                    ),
                 },
             },
             "task_type": {
@@ -43,6 +45,23 @@ class BatchEvaluateAgainstGTTool(ClawTool):
     }
     is_stub: bool = False
 
+    @staticmethod
+    def _normalise_prediction_item(item: Any, idx: int) -> tuple[str, Any] | None:
+        """Accept either wrapped items or raw prediction payloads."""
+        if isinstance(item, dict) and "prediction" in item:
+            pred = item.get("prediction")
+            if pred is None:
+                return None
+            name = str(item.get("name") or f"approach_{idx}")
+            return name, pred
+
+        if item is None:
+            return None
+
+        # Root-cause fix: agents often pass raw prediction payloads directly.
+        # Treat the entire item as the prediction instead of silently dropping it.
+        return f"approach_{idx}", item
+
     async def _run(self, ts_data: Any = None, **params: Any) -> Any:
         task_type = params.get("task_type", "")
         predictions = params.get("predictions") or []
@@ -55,15 +74,14 @@ class BatchEvaluateAgainstGTTool(ClawTool):
 
         results = []
         for idx, item in enumerate(predictions):
-            if not isinstance(item, dict):
-                item = {"prediction": item}
-            pred = item.get("prediction")
-            if pred is None:
+            normalised = self._normalise_prediction_item(item, idx)
+            if normalised is None:
                 continue
+            name, pred = normalised
             metrics = EvaluateAgainstGTTool()._compute_metrics(pred, ground_truth, task_type)
             results.append({
                 "index": idx,
-                "name": item.get("name", f"approach_{idx}"),
+                "name": name,
                 "metrics": metrics,
                 "prediction": EvaluateAgainstGTTool._serialise(pred),
             })

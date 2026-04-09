@@ -1,8 +1,8 @@
 """Unified adapter for all MTBench datasets.
 
 Normalises weather (JSON) and finance (JSON/Parquet) samples into a
-common ``MTBenchSample`` dataclass so that downstream code (split,
-train-loop, evaluation) never has to worry about format differences.
+common ``MTBenchSample`` dataclass so that downstream code (sample-list
+loading, train-loop, evaluation) never has to worry about format differences.
 """
 
 from __future__ import annotations
@@ -16,7 +16,14 @@ from typing import Any
 import numpy as np
 from loguru import logger
 
+from timeclaw.core.config import TimeClawConfig
+
 # ── Dataset registry ──────────────────────────────────────────────────
+#
+# Train/eval use datasets with non-empty ``tasks``.  ``indicator`` on finance
+# aligned sets expands to ``indicator_macd`` + ``indicator_upper_bb``.
+# Weather QA sets intentionally have no tasks (TimeART-style 18-scope subset).
+# Expected expanded (dataset, task) count = 18.
 
 DATASET_REGISTRY: dict[str, dict[str, Any]] = {
     # Weather
@@ -24,25 +31,44 @@ DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "domain": "weather",
         "path": "data/processed/weather/aligned_in7days_out1days",
         "format": "json",
-        "tasks": ["forecast", "trend", "trend_past", "indicator"],
+        "tasks": [
+            "forecast",
+            "trend",
+            "trend_past",
+            # Excluded to match the TimeART MTBench evaluation subset.
+            # "indicator",
+        ],
     },
     "weather_aligned_long": {
         "domain": "weather",
         "path": "data/processed/weather/aligned_in14days_out3days",
         "format": "json",
-        "tasks": ["forecast", "trend", "trend_past", "indicator"],
+        "tasks": [
+            "forecast",
+            "trend",
+            "trend_past",
+            # Excluded to match the TimeART MTBench evaluation subset.
+            # "indicator",
+        ],
     },
     "weather_qa_short": {
         "domain": "weather",
         "path": "data/processed/weather/QAshort",
         "format": "json",
-        "tasks": ["mcqa"],
+        "tasks": [
+            # Excluded to match the TimeART MTBench evaluation subset.
+            # "mcqa",
+        ],
     },
     "weather_qa_long": {
         "domain": "weather",
         "path": "data/processed/weather/QAlong",
         "format": "json",
-        "tasks": ["forecast", "mcqa"],
+        "tasks": [
+            # Excluded to match the TimeART MTBench evaluation subset.
+            # "forecast",
+            # "mcqa",
+        ],
     },
     # Finance
     "finance_aligned_short": {
@@ -70,6 +96,39 @@ DATASET_REGISTRY: dict[str, dict[str, Any]] = {
         "tasks": ["mcqa", "correlation"],
     },
 }
+
+BENCHMARK_EXPANDED_TASK_TARGET = 18
+
+
+def _coerce_benchmark_config(config: TimeClawConfig | None) -> TimeClawConfig:
+    return config if config is not None else TimeClawConfig()
+
+
+def benchmark_repo_root(config: TimeClawConfig | None = None) -> Path:
+    return Path(_coerce_benchmark_config(config).benchmark.repo_root)
+
+
+def benchmark_splits_dir(config: TimeClawConfig | None = None) -> Path:
+    cfg = _coerce_benchmark_config(config)
+    root = Path(cfg.benchmark.repo_root)
+    sdir = Path(cfg.benchmark.splits_dir)
+    return sdir if sdir.is_absolute() else (root / sdir)
+
+
+def datasets_with_benchmark_tasks() -> list[str]:
+    """Registry names that run in train/eval (non-empty ``tasks``)."""
+    return [name for name, meta in DATASET_REGISTRY.items() if meta.get("tasks")]
+
+
+def expanded_benchmark_task_specs() -> list[tuple[str, str]]:
+    """(dataset, scope_task) pairs; length should match ``BENCHMARK_EXPANDED_TASK_TARGET``."""
+    from timeclaw.benchmark.mtbench_support.scope_keys import expand_dataset_tasks
+
+    specs: list[tuple[str, str]] = []
+    for name in datasets_with_benchmark_tasks():
+        for task in expand_dataset_tasks(name, list(DATASET_REGISTRY[name]["tasks"])):
+            specs.append((name, task))
+    return specs
 
 
 @dataclass
@@ -138,6 +197,8 @@ def _load_weather_json(path: Path, dataset_name: str, info: dict) -> list[MTBenc
 
         ts_raw = raw.get("input_timestamps", [])
         timestamps = [_parse_timestamp_to_epoch(t) for t in ts_raw]
+        out_ts_raw = raw.get("output_timestamps", [])
+        output_timestamps = [_parse_timestamp_to_epoch(t) for t in out_ts_raw]
         start_year = _epoch_to_year(timestamps[0]) if timestamps else 0
 
         input_win = np.asarray(raw.get("input_window", []), dtype=np.float64)
@@ -165,7 +226,10 @@ def _load_weather_json(path: Path, dataset_name: str, info: dict) -> list[MTBenc
             question=question,
             answer=answer,
             labels=labels,
-            metadata={"station": f.stem.rsplit("_", 1)[0]},
+            metadata={
+                "station": f.stem.rsplit("_", 1)[0],
+                "output_timestamps": output_timestamps,
+            },
         ))
     return samples
 
@@ -180,6 +244,8 @@ def _load_finance_json(path: Path, dataset_name: str, info: dict) -> list[MTBenc
 
         ts_raw = raw.get("input_timestamps", [])
         timestamps = [_parse_timestamp_to_epoch(t) for t in ts_raw]
+        out_ts_raw = raw.get("output_timestamps", [])
+        output_timestamps = [_parse_timestamp_to_epoch(t) for t in out_ts_raw]
         start_year = _epoch_to_year(timestamps[0]) if timestamps else 0
 
         input_win = np.asarray(raw.get("input_window", []), dtype=np.float64)
@@ -214,6 +280,7 @@ def _load_finance_json(path: Path, dataset_name: str, info: dict) -> list[MTBenc
             metadata={
                 "sticker": sticker,
                 "published_utc": raw.get("published_utc"),
+                "output_timestamps": output_timestamps,
             },
         ))
     return samples
@@ -236,6 +303,11 @@ def _load_finance_parquet(path: Path, dataset_name: str, info: dict) -> list[MTB
                 timestamps = [float(t) for t in np.asarray(ts_raw).ravel()]
             else:
                 timestamps = []
+            out_ts_raw = row.get("output_timestamps")
+            if out_ts_raw is not None:
+                output_timestamps = [float(t) for t in np.asarray(out_ts_raw).ravel()]
+            else:
+                output_timestamps = []
             start_year = _epoch_to_year(timestamps[0]) if timestamps else 0
 
             input_win = np.asarray(row.get("input_window", []), dtype=np.float64).ravel()
@@ -266,12 +338,10 @@ def _load_finance_parquet(path: Path, dataset_name: str, info: dict) -> list[MTB
                 if isinstance(tech_raw, dict):
                     out_macd = tech_raw.get("out_macd")
                     if isinstance(out_macd, list):
-                        valid = [v for v in out_macd if v is not None and not (isinstance(v, float) and np.isnan(v))]
-                        labels["out_macd"] = float(np.mean(valid)) if valid else None
+                        labels["out_macd"] = np.asarray(out_macd, dtype=np.float64).ravel().tolist()
                     out_bb = tech_raw.get("out_upper_bb")
                     if isinstance(out_bb, list):
-                        valid = [v for v in out_bb if v is not None and not (isinstance(v, float) and np.isnan(v))]
-                        labels["out_upper_bb"] = float(np.mean(valid)) if valid else None
+                        labels["out_upper_bb"] = np.asarray(out_bb, dtype=np.float64).ravel().tolist()
 
             fname = f"{idx:05d}.parquet_row"
 
@@ -286,22 +356,35 @@ def _load_finance_parquet(path: Path, dataset_name: str, info: dict) -> list[MTB
                 timestamps=timestamps,
                 start_year=start_year,
                 labels=labels,
-                metadata={"parquet_file": pf.name, "row_idx": int(idx)},
+                metadata={
+                    "parquet_file": pf.name,
+                    "row_idx": int(idx),
+                    "output_timestamps": output_timestamps,
+                },
             ))
     return samples
 
 
 # ── Public API ────────────────────────────────────────────────────────
 
-def load_dataset(dataset_name: str) -> list[MTBenchSample]:
-    """Load all samples from a named MTBench dataset."""
+def load_dataset(
+    dataset_name: str,
+    *,
+    config: TimeClawConfig | None = None,
+) -> list[MTBenchSample]:
+    """Load all samples from a named MTBench dataset.
+
+    Paths in the registry are resolved under ``config.benchmark.repo_root``
+    (default ``.``, i.e. repository root when cwd is the repo).
+    """
     if dataset_name not in DATASET_REGISTRY:
         raise ValueError(
             f"Unknown dataset '{dataset_name}'. "
             f"Available: {list(DATASET_REGISTRY.keys())}"
         )
     info = DATASET_REGISTRY[dataset_name]
-    path = Path(info["path"])
+    cfg = _coerce_benchmark_config(config)
+    path = Path(cfg.benchmark.repo_root) / info["path"]
     if not path.exists():
         raise FileNotFoundError(
             f"Dataset directory not found: {path}. "
@@ -322,12 +405,15 @@ def load_dataset(dataset_name: str) -> list[MTBenchSample]:
     return samples
 
 
-def load_all_datasets() -> dict[str, list[MTBenchSample]]:
+def load_all_datasets(
+    *,
+    config: TimeClawConfig | None = None,
+) -> dict[str, list[MTBenchSample]]:
     """Load all available MTBench datasets."""
     result = {}
     for name in DATASET_REGISTRY:
         try:
-            result[name] = load_dataset(name)
+            result[name] = load_dataset(name, config=config)
         except FileNotFoundError:
             logger.warning(f"[MTBenchAdapter] Dataset '{name}' not found, skipping")
     return result

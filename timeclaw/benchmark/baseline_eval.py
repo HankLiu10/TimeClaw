@@ -18,8 +18,13 @@ import numpy as np
 from loguru import logger
 
 from timeclaw.benchmark.dataset_split import load_split
-from timeclaw.benchmark.mtbench_adapter import DATASET_REGISTRY, MTBenchSample
+from timeclaw.benchmark.mtbench_adapter import (
+    DATASET_REGISTRY,
+    MTBenchSample,
+    datasets_with_benchmark_tasks,
+)
 from timeclaw.benchmark.mtbench_support import (
+    expand_dataset_tasks,
     load_sample_indices,
     select_samples_by_index,
 )
@@ -119,10 +124,17 @@ def _extract_number_array(parsed: Any, expected_len: int, raw_text: str = "") ->
 def _forecast_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     y_true = np.asarray(y_true, dtype=np.float64).ravel()
     y_pred = np.asarray(y_pred, dtype=np.float64).ravel()
-    n = min(len(y_true), len(y_pred))
-    if n == 0:
+    if len(y_true) == 0 or len(y_pred) == 0:
         return {"mse": 999.0, "mae": 999.0, "rmse": 999.0, "mape": 999.0}
-    y_true, y_pred = y_true[:n], y_pred[:n]
+    if len(y_true) != len(y_pred) and len(y_pred) > 1:
+        y_pred = np.interp(
+            np.linspace(0, 1, len(y_true)),
+            np.linspace(0, 1, len(y_pred)),
+            y_pred,
+        )
+    else:
+        n = min(len(y_true), len(y_pred))
+        y_true, y_pred = y_true[:n], y_pred[:n]
     mask = np.isfinite(y_true) & np.isfinite(y_pred)
     y_true, y_pred = y_true[mask], y_pred[mask]
     if len(y_true) == 0:
@@ -136,6 +148,15 @@ def _forecast_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float
     return {"mse": mse, "mae": mae, "rmse": rmse, "mape": mape}
 
 
+def _prompt_messages(sample: MTBenchSample, task: str) -> list[dict[str, str]]:
+    sys_p, user_p = prompts.build_prompt(sample, task)
+    return prompts.prompt_messages(sys_p, user_p)
+
+
+def _prefixed_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
+    return {f"{prefix}_{k}": v for k, v in metrics.items()}
+
+
 # ── Per-task baseline handlers ────────────────────────────────────────
 
 async def _baseline_weather_forecast(
@@ -143,18 +164,13 @@ async def _baseline_weather_forecast(
 ) -> dict[str, Any]:
     if sample.output_window is None:
         return {"error": "no output_window"}
-    horizon_days = len(sample.output_window) // 24
-    if horizon_days < 1:
-        horizon_days = 1
-    sys_p, user_p = prompts.weather_forecast(
-        sample.input_window, sample.timestamps, sample.text, horizon_days,
-    )
-    resp = await llm.complete(
-        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-    )
+    resp = await llm.complete(_prompt_messages(sample, "forecast"))
     raw = resp.text or ""
-    parsed = _parse_json_from_text(raw)
-    pred = _extract_number_array(parsed, len(sample.output_window), raw)
+    pred = prompts.parse_weather_forecast_output(raw)
+    if pred is None:
+        parsed = _parse_json_from_text(raw)
+        pred_arr = _extract_number_array(parsed, len(sample.output_window), raw)
+        pred = pred_arr.tolist() if pred_arr is not None else None
     if pred is not None:
         metrics = _forecast_metrics(sample.output_window, pred)
         return {"metrics": metrics, "pred_len": len(pred)}
@@ -164,17 +180,14 @@ async def _baseline_weather_forecast(
 async def _baseline_weather_trend(
     sample: MTBenchSample, llm: Any,
 ) -> dict[str, Any]:
-    sys_p, user_p = prompts.weather_trend_future(
-        sample.input_window, sample.timestamps, sample.text,
-    )
-    resp = await llm.complete(
-        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-        response_format="json",
-    )
-    parsed = _parse_json_from_text(resp.text or "")
-    pred_label = ""
-    if isinstance(parsed, dict):
-        pred_label = str(parsed.get("trend", "")).strip().lower()
+    resp = await llm.complete(_prompt_messages(sample, "trend"))
+    raw = resp.text or ""
+    pred_label = prompts.parse_weather_trend_output(raw)
+    if pred_label is None:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict):
+            pred_label = _quick_match_label(str(parsed.get("trend", "")).strip().lower(), {"increasing", "decreasing", "stable"})
+    pred_label = pred_label or ""
 
     gt_label = _weather_trend_3way_label(sample)
     correct = pred_label == gt_label
@@ -190,25 +203,22 @@ async def _baseline_weather_indicator(
 ) -> dict[str, Any]:
     if sample.output_window is None:
         return {"metrics": {"error": "no output_window"}}
-    gt_max = float(np.max(sample.output_window))
-    gt_min = float(np.min(sample.output_window))
-    gt_diff = gt_max - gt_min
+    gt = prompts.weather_indicator_ground_truth(sample.output_window)
+    gt_max = gt["max"]
+    gt_min = gt["min"]
+    gt_diff = gt["diff"]
     if gt_diff < 0.01:
         return {"metrics": {"skipped": "flat_gt"}}
-    sys_p, user_p = prompts.weather_indicator(
-        sample.input_window, sample.timestamps, sample.text,
-    )
-    resp = await llm.complete(
-        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-        response_format="json",
-    )
-    parsed = _parse_json_from_text(resp.text or "")
-    gt = {"max": gt_max, "min": gt_min, "diff": gt_diff}
-    if isinstance(parsed, dict):
-        pred = {k: float(parsed.get(k, 0)) for k in ("max", "min", "diff") if k in parsed}
-        if pred:
-            metrics = {f"{k}_mae": abs(gt[k] - pred.get(k, 0)) for k in gt}
-            return {"metrics": metrics, "predicted": pred, "ground_truth": gt}
+    resp = await llm.complete(_prompt_messages(sample, "indicator"))
+    raw = resp.text or ""
+    pred = prompts.parse_weather_indicator_output(raw)
+    if pred is None:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict):
+            pred = {k: float(parsed.get(k, 0)) for k in ("max", "min", "diff") if k in parsed}
+    if pred:
+        metrics = {f"{k}_mae": abs(gt[k] - pred.get(k, 0)) for k in gt}
+        return {"metrics": metrics, "predicted": pred, "ground_truth": gt}
     return {"metrics": {"error": "parse_fail"}}
 
 
@@ -217,17 +227,13 @@ async def _baseline_weather_mcqa(
 ) -> dict[str, Any]:
     if not sample.question or not sample.answer:
         return {"metrics": {"error": "no_qa"}}
-    sys_p, user_p = prompts.weather_mcqa(
-        sample.input_window, sample.timestamps, sample.text, sample.question,
-    )
-    resp = await llm.complete(
-        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-        response_format="json",
-    )
-    parsed = _parse_json_from_text(resp.text or "")
-    pred = ""
-    if isinstance(parsed, dict):
-        pred = str(parsed.get("answer", "")).strip().upper()[:1]
+    resp = await llm.complete(_prompt_messages(sample, "mcqa"))
+    raw = resp.text or ""
+    pred = prompts.extract_mcqa_letter(raw)
+    if not pred:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict):
+            pred = str(parsed.get("answer", "")).strip().upper()[:1]
     gt = sample.answer.strip().upper()[:1]
     return {
         "metrics": {"accuracy": 1.0 if pred == gt else 0.0},
@@ -242,21 +248,13 @@ async def _baseline_stock_forecast(
     if sample.output_window is None:
         return {"metrics": {"error": "no output_window"}}
     horizon = len(sample.output_window)
-    ds = sample.dataset
-    if "short" in ds:
-        input_desc, output_desc = "7 days at 5-minute intervals", "next 1 day"
-    else:
-        input_desc, output_desc = "30 days at 1-hour intervals", "next 7 days"
-    sys_p, user_p = prompts.stock_forecast(
-        sample.input_window, sample.timestamps, sample.text,
-        horizon, input_desc, output_desc,
-    )
-    resp = await llm.complete(
-        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-    )
+    resp = await llm.complete(_prompt_messages(sample, "forecast"))
     raw = resp.text or ""
-    parsed = _parse_json_from_text(raw)
-    pred = _extract_number_array(parsed, horizon, raw)
+    pred = prompts.parse_finance_value_output(raw)
+    if pred is None:
+        parsed = _parse_json_from_text(raw)
+        pred_arr = _extract_number_array(parsed, horizon, raw)
+        pred = pred_arr.tolist() if pred_arr is not None else None
     if pred is not None:
         metrics = _forecast_metrics(sample.output_window, pred)
         return {"metrics": metrics, "pred_len": len(pred)}
@@ -269,22 +267,14 @@ async def _baseline_stock_trend(
     gt_label = sample.labels.get("trend_label", "")
     if not gt_label:
         return {"metrics": {"error": "no_trend_label"}}
-    ds = sample.dataset
-    if "short" in ds:
-        input_desc = "5-minute intervals over the last week"
-    else:
-        input_desc = "1-hour intervals over the last month"
-    sys_p, user_p = prompts.stock_trend_5way(
-        sample.input_window, sample.timestamps, sample.text, input_desc,
-    )
-    resp = await llm.complete(
-        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-        response_format="json",
-    )
-    parsed = _parse_json_from_text(resp.text or "")
-    pred_label = ""
-    if isinstance(parsed, dict):
-        pred_label = str(parsed.get("trend", "")).strip()
+    resp = await llm.complete(_prompt_messages(sample, "trend"))
+    raw = resp.text or ""
+    pred_label = prompts.parse_finance_trend_output(raw)
+    if pred_label is None:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict):
+            pred_label = str(parsed.get("trend", "")).strip()
+    pred_label = pred_label or ""
     correct = pred_label == gt_label
     return {
         "metrics": {"accuracy": 1.0 if correct else 0.0},
@@ -301,33 +291,21 @@ async def _baseline_stock_indicator(
     if gt_macd is None and gt_bb is None:
         return {"metrics": {"error": "no_indicator_labels"}}
 
-    ds = sample.dataset
-    input_desc = "7 days" if "short" in ds else "30 days"
     metrics: dict[str, float] = {}
 
     if gt_macd is not None:
-        sys_p, user_p = prompts.stock_indicator_macd(
-            sample.input_window, sample.timestamps, sample.text, input_desc,
-        )
-        resp = await llm.complete(
-            [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-            response_format="json",
-        )
-        parsed = _parse_json_from_text(resp.text or "")
-        if isinstance(parsed, dict) and "macd" in parsed:
-            metrics["macd_mae"] = abs(float(gt_macd) - float(parsed["macd"]))
+        resp = await llm.complete(_prompt_messages(sample, "indicator_macd"))
+        raw = resp.text or ""
+        pred_macd = prompts.parse_finance_value_output(raw)
+        if pred_macd is not None:
+            metrics.update(_prefixed_metrics("macd", _forecast_metrics(gt_macd, pred_macd)))
 
     if gt_bb is not None:
-        sys_p, user_p = prompts.stock_indicator_bb(
-            sample.input_window, sample.timestamps, sample.text, input_desc,
-        )
-        resp = await llm.complete(
-            [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-            response_format="json",
-        )
-        parsed = _parse_json_from_text(resp.text or "")
-        if isinstance(parsed, dict) and "upper_bb" in parsed:
-            metrics["upper_bb_mae"] = abs(float(gt_bb) - float(parsed["upper_bb"]))
+        resp = await llm.complete(_prompt_messages(sample, "indicator_upper_bb"))
+        raw = resp.text or ""
+        pred_bb = prompts.parse_finance_value_output(raw)
+        if pred_bb is not None:
+            metrics.update(_prefixed_metrics("upper_bb", _forecast_metrics(gt_bb, pred_bb)))
 
     if not metrics:
         return {"metrics": {"error": "parse_fail"}}
@@ -340,17 +318,13 @@ async def _baseline_stock_correlation(
     gt_corr = sample.labels.get("correlation", "")
     if not gt_corr:
         return {"metrics": {"error": "no_correlation_label"}}
-    sys_p, user_p = prompts.stock_correlation_5way(
-        sample.input_window, sample.timestamps, sample.text,
-    )
-    resp = await llm.complete(
-        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-        response_format="json",
-    )
-    parsed = _parse_json_from_text(resp.text or "")
-    pred = ""
-    if isinstance(parsed, dict):
-        pred = str(parsed.get("correlation", "")).strip()
+    resp = await llm.complete(_prompt_messages(sample, "correlation"))
+    raw = resp.text or ""
+    pred = raw.strip()
+    if not pred:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict):
+            pred = str(parsed.get("correlation", "")).strip()
     correct = pred.lower() == gt_corr.lower()
     return {
         "metrics": {"accuracy": 1.0 if correct else 0.0},
@@ -364,17 +338,13 @@ async def _baseline_stock_mcqa(
 ) -> dict[str, Any]:
     if not sample.question or not sample.answer:
         return {"metrics": {"error": "no_qa"}}
-    sys_p, user_p = prompts.stock_mcqa(
-        sample.input_window, sample.timestamps, sample.text, sample.question,
-    )
-    resp = await llm.complete(
-        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-        response_format="json",
-    )
-    parsed = _parse_json_from_text(resp.text or "")
-    pred = ""
-    if isinstance(parsed, dict):
-        pred = str(parsed.get("answer", "")).strip().upper()[:1]
+    resp = await llm.complete(_prompt_messages(sample, "mcqa"))
+    raw = resp.text or ""
+    pred = prompts.extract_mcqa_letter(raw)
+    if not pred:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict):
+            pred = str(parsed.get("answer", "")).strip().upper()[:1]
     gt = sample.answer.strip().upper()[:1]
     return {
         "metrics": {"accuracy": 1.0 if pred == gt else 0.0},
@@ -431,17 +401,14 @@ def _weather_trend_past_3way_label(sample: MTBenchSample) -> str:
 async def _baseline_weather_trend_past(
     sample: MTBenchSample, llm: Any,
 ) -> dict[str, Any]:
-    sys_p, user_p = prompts.weather_trend_past(
-        sample.input_window, sample.timestamps, sample.text,
-    )
-    resp = await llm.complete(
-        [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-        response_format="json",
-    )
-    parsed = _parse_json_from_text(resp.text or "")
-    pred_label = ""
-    if isinstance(parsed, dict):
-        pred_label = str(parsed.get("trend", "")).strip().lower()
+    resp = await llm.complete(_prompt_messages(sample, "trend_past"))
+    raw = resp.text or ""
+    pred_label = prompts.parse_weather_trend_output(raw)
+    if pred_label is None:
+        parsed = _parse_json_from_text(raw)
+        if isinstance(parsed, dict):
+            pred_label = _quick_match_label(str(parsed.get("trend", "")).strip().lower(), {"increasing", "decreasing", "stable"})
+    pred_label = pred_label or ""
 
     gt_label = _weather_trend_past_3way_label(sample)
     correct = pred_label == gt_label
@@ -466,6 +433,8 @@ BASELINE_HANDLERS: dict[str, dict[str, Any]] = {
         "forecast": _baseline_stock_forecast,
         "trend": _baseline_stock_trend,
         "indicator": _baseline_stock_indicator,
+        "indicator_macd": _baseline_stock_indicator,
+        "indicator_upper_bb": _baseline_stock_indicator,
         "mcqa": _baseline_stock_mcqa,
         "correlation": _baseline_stock_correlation,
     },
@@ -512,8 +481,14 @@ async def run_baseline(
     sample_indices: dict[str, list[int]] | str | Path | None = None,
     concurrency: int = 80,
     full_dataset: bool = False,
+    reuse_existing: bool = True,
 ) -> dict[str, Any]:
-    """Run direct-LLM baseline on test splits or full dataset."""
+    """Run direct-LLM baseline on the official **test list** or full dataset.
+
+    If ``reuse_existing`` is True (default) and ``baseline_<ds>.json`` already
+    exists under ``.timeclaw/test_results`` with non-trivial size, skip that
+    dataset (baseline only needs to be computed once for a fixed sample list).
+    """
     cfg = config or TimeClawConfig.load()
     router = ModelRouter(cfg.llm)
     llm = router.get_backend("executor")
@@ -526,18 +501,36 @@ async def run_baseline(
 
     from timeclaw.benchmark.mtbench_adapter import load_dataset
 
-    datasets = [dataset_name] if dataset_name else list(DATASET_REGISTRY.keys())
+    datasets = (
+        [dataset_name] if dataset_name else datasets_with_benchmark_tasks()
+    )
     all_results: dict[str, Any] = {}
 
     for ds_name in datasets:
         info = DATASET_REGISTRY.get(ds_name)
         if not info:
             continue
+        bl_path = RESULTS_DIR / f"baseline_{ds_name}.json"
+        if reuse_existing and bl_path.exists() and bl_path.stat().st_size > 10:
+            try:
+                prev = json.loads(bl_path.read_text())
+                summary = _summarize(prev if isinstance(prev, list) else [])
+                all_results[ds_name] = {
+                    "total": len(prev) if isinstance(prev, list) else 0,
+                    "elapsed_s": 0.0,
+                    "summary": summary,
+                    "reused": True,
+                }
+                logger.info(f"[Baseline] {ds_name}: reuse_existing, skipping ({bl_path})")
+                continue
+            except (json.JSONDecodeError, OSError):
+                logger.warning(f"[Baseline] {ds_name}: corrupt baseline file, will re-run")
+
         try:
             if full_dataset:
-                samples = load_dataset(ds_name)
+                samples = load_dataset(ds_name, config=cfg)
             else:
-                samples = load_split(ds_name, "test")
+                samples = load_split(ds_name, "test", config=cfg)
         except FileNotFoundError:
             logger.warning(f"[Baseline] No data for {ds_name}")
             continue
@@ -546,7 +539,7 @@ async def run_baseline(
         if max_samples:
             samples = samples[:max_samples]
 
-        tasks = info["tasks"]
+        tasks = expand_dataset_tasks(ds_name, list(info["tasks"]))
         if task_filter:
             tasks = [t for t in tasks if t == task_filter]
         if not tasks:
@@ -588,7 +581,7 @@ async def _llm_reasoning_call(llm: Any, sample: MTBenchSample, question: str, ou
         arr = np.asarray(sample.input_window, dtype=np.float64).ravel()
         ts_section = f"Time-series data ({len(arr)} data points):\n[{_fmt_array(arr)}]\n\n"
     domain_section = f"Domain context:\n{sample.domain}\n\n" if sample.domain else ""
-    text_section = f"Contextual information:\n{sample.text[:10000]}\n\n" if sample.text else ""
+    text_section = f"Contextual information:\n{sample.text}\n\n" if sample.text else ""
     system_prompt = (
         "You are a data analysis expert. Analyze the provided data "
         "and any contextual information to answer the question.\n"
@@ -664,10 +657,11 @@ async def _llmr_indicator(sample: MTBenchSample, llm: Any) -> dict[str, Any]:
     if sample.output_window is None:
         return {"metrics": {"error": "no output_window"}}
     if sample.domain == "weather":
-        n_days = max(1, len(sample.output_window) // 24)
-        gt_max = float(np.max(sample.output_window))
-        gt_min = float(np.min(sample.output_window))
-        gt_diff = gt_max - gt_min
+        gt = prompts.weather_indicator_ground_truth(sample.output_window)
+        n_days = 1
+        gt_max = gt["max"]
+        gt_min = gt["min"]
+        gt_diff = gt["diff"]
         if gt_diff < 0.01:
             return {"metrics": {"skipped": "flat_gt"}}
         question = (
@@ -686,18 +680,25 @@ async def _llmr_indicator(sample: MTBenchSample, llm: Any) -> dict[str, Any]:
             }}
         return {"metrics": {"error": "parse_fail"}}
     else:
-        gt_macd = sample.labels.get("macd")
-        gt_upper_bb = sample.labels.get("upper_bollinger")
+        gt_macd = sample.labels.get("out_macd")
+        gt_upper_bb = sample.labels.get("out_upper_bb")
         if gt_macd is None and gt_upper_bb is None:
             return {"metrics": {"error": "no indicator labels"}}
-        question = "Calculate the MACD value and the upper Bollinger Band for this stock."
-        parsed = await _llm_reasoning_call(llm, sample, question, '{"macd": number, "upper_bollinger": number}')
+        question = (
+            "Predict the future MACD values and upper Bollinger Band values for the next time steps."
+        )
+        parsed = await _llm_reasoning_call(
+            llm,
+            sample,
+            question,
+            '{"macd": [array of numbers], "upper_bb": [array of numbers]}',
+        )
         metrics: dict[str, float] = {}
         if isinstance(parsed, dict):
             if gt_macd is not None and "macd" in parsed:
-                metrics["macd_mae"] = abs(float(parsed["macd"]) - float(gt_macd))
-            if gt_upper_bb is not None and "upper_bollinger" in parsed:
-                metrics["upper_bb_mae"] = abs(float(parsed["upper_bollinger"]) - float(gt_upper_bb))
+                metrics.update(_prefixed_metrics("macd", _forecast_metrics(gt_macd, parsed["macd"])))
+            if gt_upper_bb is not None and "upper_bb" in parsed:
+                metrics.update(_prefixed_metrics("upper_bb", _forecast_metrics(gt_upper_bb, parsed["upper_bb"])))
         if not metrics:
             return {"metrics": {"error": "parse_fail"}}
         return {"metrics": metrics}
@@ -716,7 +717,7 @@ async def _llmr_mcqa(sample: MTBenchSample, llm: Any) -> dict[str, Any]:
 
 
 async def _llmr_correlation(sample: MTBenchSample, llm: Any) -> dict[str, Any]:
-    gt = sample.labels.get("correlation_label", "")
+    gt = sample.labels.get("correlation", "")
     if not gt:
         return {"metrics": {"error": "no_label"}}
     question = (
@@ -756,7 +757,9 @@ async def run_llm_reasoning_baseline(
 
     from timeclaw.benchmark.mtbench_adapter import load_dataset
 
-    datasets = [dataset_name] if dataset_name else list(DATASET_REGISTRY.keys())
+    datasets = (
+        [dataset_name] if dataset_name else datasets_with_benchmark_tasks()
+    )
     all_results: dict[str, Any] = {}
 
     for ds_name in datasets:
@@ -765,15 +768,15 @@ async def run_llm_reasoning_baseline(
             continue
         try:
             if full_dataset:
-                samples = load_dataset(ds_name)
+                samples = load_dataset(ds_name, config=cfg)
             else:
-                samples = load_split(ds_name, "test")
+                samples = load_split(ds_name, "test", config=cfg)
         except FileNotFoundError:
             logger.warning(f"[LLM-Reasoning] No data for {ds_name}")
             continue
         if max_samples:
             samples = samples[:max_samples]
-        tasks = info["tasks"]
+        tasks = expand_dataset_tasks(ds_name, list(info["tasks"]))
         if task_filter:
             tasks = [t for t in tasks if t == task_filter]
         if not tasks:

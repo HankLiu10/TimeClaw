@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
 import pytest
 
+from timeclaw.core import trace_logger as trace
 from timeclaw.core.config import LLMConfig, LLMModelConfig, TimeClawConfig
 from timeclaw.llm.base import LLMResponse
 from timeclaw.pipeline.runner import PipelineRunner
@@ -84,3 +87,112 @@ def _make_mock_litellm_response(*args, **kwargs):
     response.usage.completion_tokens = 50
     response.usage.total_tokens = 150
     return response
+
+
+@pytest.mark.asyncio
+async def test_pipeline_cancellation_writes_run_end(tmp_path, monkeypatch):
+    config = TimeClawConfig(
+        llm=LLMConfig(
+            models=LLMModelConfig(
+                manager="mock-model",
+                analyzer="mock-model",
+                executor="mock-model",
+                reasoner="mock-model",
+            ),
+            fallback=None,
+        ),
+        workspace_dir=str(tmp_path / "workspace"),
+    )
+    runner = PipelineRunner(config, disable_memory=True)
+
+    monkeypatch.setattr(trace, "_trace_dir", tmp_path / "traces")
+    trace.configure(verbose=False, full_dump=False)
+
+    class _FakeTask:
+        def __init__(self) -> None:
+            self.metadata = {}
+
+    class _FakeEnvelope:
+        def __init__(self) -> None:
+            self.task = _FakeTask()
+
+        def update_environment(self, **kwargs) -> None:
+            return None
+
+        def with_agent(self, agent_name: str):
+            return self
+
+    class _BlockingExecutor:
+        async def run(self, envelope):
+            await asyncio.sleep(3600)
+
+    async def _fake_preprocess(*args, **kwargs):
+        return {
+            "fingerprint": {"length": 3},
+            "modalities": ["timeseries"],
+            "profiling_results": {},
+        }
+
+    monkeypatch.setattr(runner, "_ensure_tools", AsyncMock())
+    monkeypatch.setattr(runner, "_build_envelope", lambda **kwargs: _FakeEnvelope())
+    monkeypatch.setattr(runner, "_preprocess", _fake_preprocess)
+    monkeypatch.setattr(runner, "_create_executor", lambda: _BlockingExecutor())
+
+    task = asyncio.create_task(
+        runner.run(
+            data=[1.0, 2.0, 3.0],
+            task_type="forecast",
+            description="cancel me",
+        )
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    trace_files = list((tmp_path / "traces").glob("*.jsonl"))
+    assert len(trace_files) == 1
+    records = [json.loads(line) for line in trace_files[0].read_text().splitlines()]
+    assert records[-1]["event"] == "run_end"
+    assert records[-1]["payload"]["status"] == "cancelled"
+
+
+def test_sanitize_reasoning_clause_keeps_evidence_but_drops_framework_preface():
+    cleaned = PipelineRunner._sanitize_reasoning_clause(
+        "The required hinted tool was used: entropy returned sample_entropy 0.778, "
+        "which suggests the series is predictable enough for a smooth continuation."
+    )
+
+    assert "required hinted tool" not in cleaned.lower()
+    assert cleaned.startswith("entropy returned sample_entropy 0.778")
+    assert "predictable enough" in cleaned
+
+
+def test_sanitize_reasoning_clause_rewrites_first_person_tool_use():
+    cleaned = PipelineRunner._sanitize_reasoning_clause(
+        "I used value_at on the input series with index -1 and obtained the latest observed price: 3.95."
+    )
+
+    assert "i used value_at" not in cleaned.lower()
+    assert cleaned.startswith("value_at was used on the input series")
+    assert "latest observed price: 3.95" in cleaned
+
+
+def test_sanitize_reasoning_clause_strips_required_by_branch_tail():
+    cleaned = PipelineRunner._sanitize_reasoning_clause(
+        "I used spectral_density as required by the branch."
+    )
+
+    assert "i used spectral_density" not in cleaned.lower()
+    assert "required by the branch" not in cleaned.lower()
+    assert cleaned == "spectral_density was used"
+
+
+def test_sanitize_reasoning_clause_rewrites_i_ran_tool():
+    cleaned = PipelineRunner._sanitize_reasoning_clause(
+        "I ran hurst_exponent on the full 130-point series."
+    )
+
+    assert "i ran hurst_exponent" not in cleaned.lower()
+    assert cleaned == "hurst_exponent was run on the full 130-point series"

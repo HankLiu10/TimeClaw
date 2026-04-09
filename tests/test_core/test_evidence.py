@@ -41,6 +41,24 @@ class TestEvidenceLog:
         assert "detect_trend" in summary
         assert "Step 0" in summary
 
+    def test_summary_without_predicates_falls_back_to_tool_coverage(self):
+        log = EvidenceLog()
+        log.append(
+            EvidenceEntry(
+                step=0,
+                thought="forecast next window",
+                tool_name="timesfm2_forecast",
+                observation={"forecast": [1.0]},
+            )
+        )
+        log.append(EvidenceEntry(step=1, thought="classify the label", tool_name="llm_reasoning_classification"))
+
+        summary = log.summary()
+
+        assert "Tool coverage:" in summary
+        assert "timesfm2_forecast x1" in summary
+        assert "Successful steps: 1/2" in summary
+
 
 class TestQualityGate:
     def test_accept_valid_prediction(self):

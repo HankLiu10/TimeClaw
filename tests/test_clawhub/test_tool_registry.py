@@ -53,6 +53,10 @@ class TestToolRegistry:
         names = [t.name for t in all_tools]
         assert "basic_stats" in names
         assert "detect_trend" in names
+        assert "value_at" in names
+        assert "window_stats" in names
+        assert "ensemble_forecast" not in names
+        assert "checkpoint_forecast" not in names
 
     def test_function_schema(self):
         tool = DummyTool()
@@ -111,6 +115,31 @@ class TestRealTools:
         assert result.success
         assert "acf" in result.data
         assert abs(result.data["acf"][0] - 1.0) < 0.01
+
+    @pytest.mark.asyncio
+    async def test_value_at(self):
+        tool = get_tool_instance("value_at")
+        data = np.array([10.0, 20.0, 30.0, 40.0])
+        result = await tool.execute(data, index=-1)
+        assert result.success
+        assert result.data["index"] == -1
+        assert result.data["resolved_index"] == 3
+        assert result.data["value"] == 40.0
+
+    @pytest.mark.asyncio
+    async def test_window_stats(self):
+        tool = get_tool_instance("window_stats")
+        data = np.array([1.0, 3.0, 2.0, 5.0, 4.0])
+        result = await tool.execute(data, start=1, end=4)
+        assert result.success
+        assert result.data["resolved_start"] == 1
+        assert result.data["resolved_end"] == 4
+        assert result.data["length"] == 3
+        assert result.data["start_value"] == 3.0
+        assert result.data["end_value"] == 5.0
+        assert result.data["min"] == 2.0
+        assert result.data["max"] == 5.0
+        assert result.data["delta"] == 2.0
 
     @pytest.mark.asyncio
     async def test_fft_spectrum(self):

@@ -95,17 +95,17 @@ python scripts/download_mtbench.py
 
 ### 3.3 与默认 benchmark 代码的关系（必读）
 
-当前 **`timeclaw.benchmark` 默认只认两套固定相对路径**：
+路径由 **`TimeClawConfig.benchmark`** 决定（YAML 中 `benchmark.repo_root` / `benchmark.splits_dir`，默认分别为 `"."` 与 `"data/splits"`），与 `scripts/download_mtbench.py` 的目录布局一致：
 
-1. 样本文件：`DATASET_REGISTRY` 中的 `data/processed/...`（**仅 MTBench 官方目录**）
-2. 列表根目录：`dataset_split.SPLITS_DIR = Path("data/splits")`（**仅官方 MTBench 列表**）
+1. 样本文件：`repo_root` + `DATASET_REGISTRY[...]["path"]`（通常为 `.../data/processed/...`）
+2. 列表根目录：`repo_root` + `splits_dir`（内含各 `dataset_name/train_files.json` 等）
 
 因此：
 
 - **`run_pipeline_eval(split="test")`**：正确使用 **官方 `test_files.json`** ✓  
-- **`run_train_loop()`**：默认使用 **官方 `train_files.json` + `data/processed/`**，**不是** `data_preparation/independent/`（若你要「只在独立语料上训练」，需自行接线或改配置）
+- **`run_train_loop()`**：默认使用 **官方 `train_files.json` + 上述 processed 路径**，**不是** `data_preparation/independent/`（若你要「只在独立语料上训练」，需自行接线或改 `repo_root`/注册表路径）
 
-若要在 **不修改核心库** 的前提下用独立语料驱动与 `MTBenchSample` 相同的训练逻辑，需要自行实现或扩展加载器（例如：从 `data_preparation/independent/splits` 与对应 `processed` 构造 `MTBenchSample` 列表），或经团队约定后调整 `DATASET_REGISTRY` / `SPLITS_DIR` 指向独立路径（需谨慎，避免与官方评测目录混淆）。
+若要在 **不修改核心库** 的前提下用独立语料驱动与 `MTBenchSample` 相同的训练逻辑，需要自行实现或扩展加载器（例如：从 `data_preparation/independent/splits` 与对应 `processed` 构造 `MTBenchSample` 列表），或经团队约定后调整 `DATASET_REGISTRY` / YAML `benchmark` 段（需谨慎，避免与官方评测目录混淆）。
 
 ---
 

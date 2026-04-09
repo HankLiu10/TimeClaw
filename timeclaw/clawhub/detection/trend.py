@@ -24,7 +24,10 @@ class DetectTrendTool(ClawTool):
         "Input: 1D numeric array or array-like. "
         "Output: dict with 'direction' ('up', 'down', or 'flat'), 'slope' (float), and 'p_value' (float). "
         "Direction is 'flat' when p_value > 0.05 (not statistically significant). "
-        "Use to determine if the data has a significant upward or downward tendency before choosing a model. "
+        "Use to determine if the CURRENT input sequence has a significant upward or downward tendency "
+        "before choosing a model. It does not perform grouped aggregation for you. For example, if the "
+        "task requires a trend over 14 daily means, you must first produce the 14-value daily-mean "
+        "series; running detect_trend directly on 336 hourly points answers a different question. "
         "No required parameters."
     )
     io_type: ToolIOType = ToolIOType.X_TO_C

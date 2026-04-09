@@ -55,9 +55,25 @@ class EvidenceLog(BaseModel):
         lines = [f"Evidence Log ({self.num_steps} steps):"]
         for e in self.entries:
             status = "OK" if e.is_successful else "FAIL"
-            lines.append(f"  [{status}] Step {e.step}: {e.tool_name} -> {e.thought[:500]}")
-        lines.append(f"  Covered: {self.covered_predicates}")
-        lines.append(f"  Gaps: {self.gap_predicates}")
+            detail = str(e.thought or "").strip() or "no thought recorded"
+            lines.append(f"  [{status}] Step {e.step}: {e.tool_name} -> {detail[:500]}")
+        if self.covered_predicates or self.gap_predicates or self.required_predicates:
+            lines.append(f"  Covered: {sorted(self.covered_predicates)}")
+            lines.append(f"  Gaps: {sorted(self.gap_predicates)}")
+        else:
+            tool_counts: dict[str, int] = {}
+            for entry in self.entries:
+                tool = str(entry.tool_name or "").strip() or "unknown_tool"
+                tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            if tool_counts:
+                ranked = sorted(tool_counts.items(), key=lambda item: (-item[1], item[0]))
+                lines.append(
+                    "  Tool coverage: " +
+                    ", ".join(f"{name} x{count}" for name, count in ranked[:8])
+                )
+            if self.entries:
+                successful = [e for e in self.entries if e.is_successful]
+                lines.append(f"  Successful steps: {len(successful)}/{len(self.entries)}")
         return "\n".join(lines)
 
 

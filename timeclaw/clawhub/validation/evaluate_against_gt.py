@@ -95,12 +95,12 @@ class EvaluateAgainstGTTool(ClawTool):
     @staticmethod
     def _forecast_metrics(pred: Any, gt: Any) -> dict[str, float]:
         if isinstance(pred, dict):
-            for key in ("point_forecast", "forecast", "prediction", "values"):
+            for key in ("point_forecast", "forecast", "prediction", "values", "answer"):
                 if key in pred and isinstance(pred[key], (list, np.ndarray)):
                     pred = pred[key]
                     break
         if isinstance(gt, dict):
-            for key in ("point_forecast", "forecast", "values"):
+            for key in ("point_forecast", "forecast", "values", "answer"):
                 if key in gt and isinstance(gt[key], (list, np.ndarray)):
                     gt = gt[key]
                     break
@@ -114,10 +114,10 @@ class EvaluateAgainstGTTool(ClawTool):
             return {"type_error": 1.0}
         y_true, y_pred = y_true[:n], y_pred[:n]
         return {
-            "mae": round(mae(y_true, y_pred), 6),
-            "rmse": round(rmse(y_true, y_pred), 6),
-            "mape": round(mape(y_true, y_pred), 4),
-            "mse": round(mse(y_true, y_pred), 6),
+            "mae": round(mae(y_true, y_pred), 3),
+            "rmse": round(rmse(y_true, y_pred), 3),
+            "mape": round(mape(y_true, y_pred), 3),
+            "mse": round(mse(y_true, y_pred), 3),
         }
 
     @staticmethod
@@ -132,22 +132,51 @@ class EvaluateAgainstGTTool(ClawTool):
                 gt = json.loads(gt)
             except (json.JSONDecodeError, TypeError):
                 return {"parse_error": 1.0}
+        if isinstance(pred, dict) and "answer" in pred and isinstance(pred["answer"], dict):
+            pred = pred["answer"]
+        if isinstance(gt, dict) and "answer" in gt and isinstance(gt["answer"], dict):
+            gt = gt["answer"]
         if not isinstance(pred, dict) or not isinstance(gt, dict):
             return {"type_error": 1.0}
 
         metrics: dict[str, float] = {}
         for key in gt:
             if key in pred:
+                pred_value = pred[key]
+                gt_value = gt[key]
                 try:
-                    metrics[f"{key}_mae"] = round(
-                        abs(float(gt[key]) - float(pred[key])), 6
-                    )
+                    pred_arr = np.asarray(pred_value, dtype=np.float64).ravel()
+                    gt_arr = np.asarray(gt_value, dtype=np.float64).ravel()
                 except (ValueError, TypeError):
                     metrics[f"{key}_error"] = 1.0
+                    continue
+
+                if pred_arr.size == 0 or gt_arr.size == 0:
+                    metrics[f"{key}_error"] = 1.0
+                    continue
+
+                if pred_arr.size == 1 and gt_arr.size == 1:
+                    metrics[f"{key}_mae"] = round(abs(float(gt_arr[0]) - float(pred_arr[0])), 3)
+                    continue
+
+                n = min(len(gt_arr), len(pred_arr))
+                gt_arr = gt_arr[:n]
+                pred_arr = pred_arr[:n]
+                mask = np.isfinite(gt_arr) & np.isfinite(pred_arr)
+                gt_arr = gt_arr[mask]
+                pred_arr = pred_arr[mask]
+                if gt_arr.size == 0:
+                    metrics[f"{key}_error"] = 1.0
+                    continue
+
+                metrics[f"{key}_mae"] = round(mae(gt_arr, pred_arr), 3)
+                metrics[f"{key}_rmse"] = round(rmse(gt_arr, pred_arr), 3)
+                metrics[f"{key}_mse"] = round(mse(gt_arr, pred_arr), 3)
+                metrics[f"{key}_mape"] = round(mape(gt_arr, pred_arr), 3)
         if metrics:
-            numeric = [v for v in metrics.values() if isinstance(v, float)]
+            numeric = [v for k, v in metrics.items() if k.endswith("_mae") and isinstance(v, float)]
             if numeric:
-                metrics["avg_mae"] = round(sum(numeric) / len(numeric), 6)
+                metrics["avg_mae"] = round(sum(numeric) / len(numeric), 3)
         return metrics
 
     @staticmethod

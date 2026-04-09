@@ -14,14 +14,9 @@ CANONICAL_SCOPES = {
     "weather_aligned_short_forecast",
     "weather_aligned_short_trend",
     "weather_aligned_short_trend_past",
-    "weather_aligned_short_indicator",
     "weather_aligned_long_forecast",
     "weather_aligned_long_trend",
     "weather_aligned_long_trend_past",
-    "weather_aligned_long_indicator",
-    "weather_qa_short_mcqa",
-    "weather_qa_long_forecast",
-    "weather_qa_long_mcqa",
     "finance_aligned_short_forecast",
     "finance_aligned_short_trend",
     "finance_aligned_short_indicator_macd",
@@ -46,7 +41,7 @@ def test_scope_keys_cover_active_registry_tasks():
     assert active_scopes <= CANONICAL_SCOPES
     assert "weather_aligned_short_trend_past" in active_scopes
     assert "weather_aligned_long_trend_past" in active_scopes
-    assert len(active_scopes) == 23
+    assert len(active_scopes) == 18
 
 
 def test_expand_dataset_tasks_splits_finance_indicator_scopes():
@@ -61,7 +56,7 @@ def test_expand_dataset_tasks_splits_finance_indicator_scopes():
 
 
 @pytest.mark.asyncio
-async def test_record_writes_one_daily_note_per_scope_key(tmp_path, monkeypatch):
+async def test_record_writes_one_note_per_scope_key(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(hm, "SOUL_FILE", tmp_path / "missing_SOUL.md")
 
@@ -82,7 +77,7 @@ async def test_record_writes_one_daily_note_per_scope_key(tmp_path, monkeypatch)
         tool_chain=["compute_macd", "compute_bollinger"],
     )
 
-    notes = memory.daily.get_recent_notes(10)
+    notes = memory.notes.get_recent_notes(10)
     assert len(notes) == 2
     assert any("[finance_aligned_short_indicator_macd] OK" in note for note in notes)
     assert any("[finance_aligned_short_indicator_upper_bb] OK" in note for note in notes)
@@ -94,7 +89,14 @@ def test_update_scope_counts_and_tool_prompt_respect_canonical_scope(tmp_path, m
     monkeypatch.setattr(hm, "SOUL_FILE", tmp_path / "missing_SOUL.md")
 
     memory = hm.HierarchicalMemory(enabled=True)
-    memory.tools.update({"compute_macd": "Use for MACD.", "compute_bollinger": "Use for Bollinger Band."})
+    memory.tools.update(
+        "finance_aligned_short_indicator_macd",
+        {"compute_macd": "Use for MACD."},
+    )
+    memory.tools.update(
+        "finance_aligned_short_indicator_upper_bb",
+        {"compute_bollinger": "Use for Bollinger Band."},
+    )
 
     notes = [
         "[finance_aligned_short_indicator_macd] OK | Tools: compute_macd | Pred: 1.0",
@@ -118,7 +120,7 @@ def test_update_scope_counts_and_tool_prompt_respect_canonical_scope(tmp_path, m
 
 
 def test_daily_note_filters_framework_tools_from_visible_tool_chain():
-    note = hm.DailyNotes()._build_note(
+    note = hm.Notes()._build_note(
         {
             "scope_key": "weather_aligned_short_forecast",
             "domain": "weather",
@@ -127,7 +129,7 @@ def test_daily_note_filters_framework_tools_from_visible_tool_chain():
             "predicted": "[1, 2, 3]",
             "tool_chain": [
                 "spawn_subagent",
-                "chronos_forecast",
+                "chronos2_forecast",
                 "evaluate_batch_against_gt",
                 "evaluate_against_gt",
             ],
@@ -135,33 +137,108 @@ def test_daily_note_filters_framework_tools_from_visible_tool_chain():
         }
     )
 
-    assert "Winner Tool:\n- chronos_forecast" in note
+    assert "Winner Tools:\n- chronos2_forecast" in note
     assert "spawn_subagent" not in note
     assert "evaluate_batch_against_gt" not in note
     assert "evaluate_against_gt" not in note
-    assert hm.DistillationAgent._extract_tools_from_note(note) == ["chronos_forecast"]
+    assert hm.DistillationAgent._extract_tools_from_note(note) == ["chronos2_forecast"]
+
+
+@pytest.mark.asyncio
+async def test_train_run_updates_scope_tool_usage_immediately(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hm, "SOUL_FILE", tmp_path / "missing_SOUL.md")
+
+    from timeclaw.pipeline.runner import PipelineRunner
+
+    runner = PipelineRunner()
+
+    async def fake_ensure_tools():
+        return None
+
+    async def fake_preprocess(_envelope, _data, _text_data, _images):
+        return {
+            "fingerprint": {"length": 3},
+            "modalities": ["timeseries"],
+            "profiling_results": {},
+        }
+
+    class _Executor:
+        evidence_log = type("E", (), {"summary": staticmethod(lambda: "ok")})()
+
+        async def run(self, _envelope):
+            return {
+                "result": {
+                    "answer": [1.0, 2.0],
+                    "answer_type": "forecast",
+                    "confidence": 0.8,
+                    "reasoning": "Reason: x. Action: y.",
+                    "execution_log": [
+                        {
+                            "tool": "spawn_subagent",
+                            "success": True,
+                            "output": [
+                                {
+                                    "success": True,
+                                    "result": {
+                                        "execution_log": [
+                                            {"tool": "chronos2_forecast", "success": True},
+                                            {"tool": "evaluate_against_gt", "success": True},
+                                        ]
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+
+    monkeypatch.setattr(runner, "_ensure_tools", fake_ensure_tools)
+    monkeypatch.setattr(runner, "_preprocess", fake_preprocess)
+    monkeypatch.setattr(runner, "_create_executor", lambda: _Executor())
+    monkeypatch.setattr(
+        runner._quality_gate,
+        "check",
+        lambda prediction, evidence, constraints: type(
+            "Q", (), {"accepted": True, "rejections": []}
+        )(),
+    )
+
+    await runner.run(
+        data=[1.0, 2.0, 3.0],
+        task_type="forecast",
+        description="forecast sample",
+        domain="weather",
+        scope_keys=["weather_aligned_short_forecast"],
+        mode="train",
+        ground_truth=[1.0, 2.0],
+    )
+
+    counts = runner.memory.tools.get_scope_usage("weather_aligned_short_forecast")
+    assert counts["chronos2_forecast"] == 1
+    assert "evaluate_against_gt" not in counts
 
 
 def test_daily_note_includes_candidate_summary_and_sample_stats():
-    note = hm.DailyNotes()._build_note(
+    note = hm.Notes()._build_note(
         {
             "scope_key": "weather_aligned_short_forecast",
             "domain": "weather",
             "task": "forecast",
             "description": "forecast sample",
             "predicted": "[1, 2, 3]",
-            "tool_chain": ["chronos_forecast"],
+            "tool_chain": ["chronos2_forecast"],
             "metrics": {"mae": 1.0},
             "data_fingerprint": "horizon=24; length=168; mean=12.3",
             "candidate_traces": [
                 {
-                    "name": "chronos_forecast",
+                    "name": "chronos2_forecast",
                     "metrics": {"mae": 1.0},
-                    "tool_chain": ["chronos_forecast"],
+                    "tool_chain": ["chronos2_forecast"],
                     "steps": [
                         {
-                            "tool": "chronos_forecast",
-                            "thought": "Reason: daily cycle is stable. Action: run chronos_forecast.",
+                            "tool": "chronos2_forecast",
+                            "thought": "Reason: daily cycle is stable. Action: run chronos2_forecast.",
                             "observation": '{"forecast":[1,2,3]}',
                         }
                     ],
@@ -171,28 +248,72 @@ def test_daily_note_includes_candidate_summary_and_sample_stats():
         }
     )
 
-    assert "Winner Tool:\n- chronos_forecast" in note
+    assert "Winner Tools:\n- chronos2_forecast" in note
     assert "Fingerprint:\nhorizon=24; length=168; mean=12.3" in note
     assert "Candidates:" in note
-    assert "- Candidate: chronos_forecast (mae=1.00)" in note
-    assert "Tool chain: chronos_forecast" in note
-    assert "- Candidate: ets_forecast (mae=2.50)" in note
+    assert "- Candidate: chronos2_forecast (mae=1.000)" in note
+    assert "Tools: chronos2_forecast" in note
+    assert "Reasoning: Daily cycle is stable." in note
+    assert "- Candidate: ets_forecast (mae=2.500)" in note
+
+
+def test_daily_note_source_section_is_parser_compatible():
+    note = hm.Notes()._build_note(
+        {
+            "scope_key": "weather_aligned_short_forecast",
+            "domain": "weather",
+            "task": "forecast",
+            "trace_id": "trace-note-123",
+            "source_metadata": {
+                "dataset_name": "weather_aligned_short",
+                "sample_ref": "weather_aligned_short:file.json:2:forecast",
+                "source_file": "file.json",
+                "sample_idx": 2,
+                "task_name": "forecast",
+            },
+            "description": "forecast sample",
+            "predicted": "[1, 2, 3]",
+            "tool_chain": ["chronos2_forecast"],
+            "metrics": {"mae": 1.0},
+        }
+    )
+
+    parsed = hm.DistillationAgent._parse_note_sections(note)
+    assert "Source" in parsed["sections"]
+    assert "Sample Ref: weather_aligned_short:file.json:2:forecast" in parsed["sections"]["Source"]
+    assert "Trace Path: .timeclaw/traces/trace-note-123.jsonl" in parsed["sections"]["Source"]
+
+
+def test_max_conflict_support_uses_memory_store_without_self():
+    entries_by_id = {
+        "rule_a": {"rule_id": "rule_a", "evidence": {"sample_refs": ["n1", "n2", "n3"]}},
+        "rule_b": {"rule_id": "rule_b", "evidence": {"sample_refs": ["n4"]}},
+        "rule_c": {"rule_id": "rule_c", "evidence": {"sample_refs": ["n5", "n6", "n7", "n8", "n9"]}},
+    }
+
+    support = hm.DistillationAgent._max_conflict_support(
+        "rule_b",
+        [["rule_a", "rule_b", "rule_c"]],
+        entries_by_id,
+    )
+
+    assert support == 5
 
 
 def test_daily_note_approaches_use_candidate_trace_names_not_approach_ids():
-    note = hm.DailyNotes()._build_note(
+    note = hm.Notes()._build_note(
         {
             "scope_key": "weather_aligned_short_forecast",
             "domain": "weather",
             "task": "forecast",
             "description": "forecast sample",
             "predicted": "[1, 2, 3]",
-            "tool_chain": ["chronos_forecast"],
+            "tool_chain": ["chronos2_forecast"],
             "metrics": {"mae": 1.0},
             "candidate_traces": [
                 {
                     "name": "approach_0",
-                    "tool_chain": ["chronos_forecast"],
+                    "tool_chain": ["chronos2_forecast"],
                     "metrics": {"mae": 1.0},
                 },
                 {
@@ -204,7 +325,7 @@ def test_daily_note_approaches_use_candidate_trace_names_not_approach_ids():
         }
     )
 
-    assert "Approaches:\n- chronos_forecast(mae=1.00)\n- ets_forecast(mae=2.50)" in note
+    assert "Approaches:\n- chronos2_forecast(mae=1.000)\n- ets_forecast(mae=2.500)" in note
     assert "approach_0" not in note
     assert "approach_1" not in note
 
@@ -214,20 +335,20 @@ def test_daily_note_analysis_keeps_full_pipeline_summary():
         "Reason: " + "A" * 700 + "\n"
         "Action: " + "B" * 700
     )
-    note = hm.DailyNotes()._build_note(
+    note = hm.Notes()._build_note(
         {
             "scope_key": "weather_aligned_short_forecast",
             "domain": "weather",
             "task": "forecast",
             "description": "forecast sample",
             "predicted": "[1, 2, 3]",
-            "tool_chain": ["chronos_forecast"],
+            "tool_chain": ["chronos2_forecast"],
             "metrics": {"mae": 1.0},
             "pipeline_summary": analysis,
         }
     )
 
-    assert "Analysis:\n" + analysis in note
+    assert "Analysis:\n[ANALYSIS_BEGIN]\n" + analysis in note
 
 
 @pytest.mark.asyncio
@@ -272,10 +393,10 @@ async def test_force_distill_all_discovers_canonical_scope_headers(tmp_path, mon
         seen_skill_scopes.append(scope)
         return False
 
-    async def fake_memory_to_cross_domain() -> bool:
+    async def fake_memory_to_cross_domain(bucket: str) -> bool:
         return False
 
-    async def fake_notes_to_tools() -> bool:
+    async def fake_notes_to_tools(scope: str) -> bool:
         return False
 
     monkeypatch.setattr(memory.distiller, "maybe_distill_notes_to_memory", fake_notes_to_memory)

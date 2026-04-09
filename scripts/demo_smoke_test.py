@@ -157,13 +157,13 @@ async def main():
         mem_summary = pipeline2.memory_summary()
         logger.info(f"  Memory after training: {json.dumps(mem_summary, default=str)}")
 
-        dn = mem_summary.get("daily_notes", 0)
+        dn = mem_summary.get("notes", 0)
         dn_count = dn.get("total", 0) if isinstance(dn, dict) else dn
         if dn_count > 0:
-            logger.info("  OK: Learning outcome saved to Daily Notes")
+            logger.info("  OK: Learning outcome saved to Notes")
         else:
-            errors.append("Training did not save to Daily Notes")
-            logger.error("  FAIL: No Daily Notes recorded")
+            errors.append("Training did not save to Notes")
+            logger.error("  FAIL: No Notes recorded")
 
         await pipeline2.shutdown()
     except Exception as e:

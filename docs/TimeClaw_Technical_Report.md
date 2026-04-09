@@ -243,7 +243,7 @@ TokenCast 通过 4 种量化策略（uniform/quantile/kmeans/adaptive）将连�
          L1 (会话日志) → L2 (行为偏好) → L3 (人格特质)
 
      TimeClaw 记忆蒸馏:
-         L1 (Daily Notes: 工具链+评估指标)
+         L1 (Notes: 工具链+评估指标)
              → L2 (MEMORY: "当数据 Hurst 指数 > 0.7 时，Chronos 优于 ARIMA")
              → L2 (TOOLS: "sentiment 工具对教育性文章易误判为 neutral")
              → L3 (PRINCIPLES: "先诊断后预测；多工具交叉验证")
@@ -319,7 +319,7 @@ TokenCast 通过 4 种量化策略（uniform/quantile/kmeans/adaptive）将连�
 ║  ║  │                                                           ║    ║
 ║  ║  T+1 Memory Injection ───────────────── 记忆注入              ║    ║
 ║  ║  │  SOUL + PRINCIPLES + MEMORY                               ║    ║
-║  ║  │  + Daily Notes + TOOLS + PLAYBOOKS                        ║    ║
+║  ║  │  + Notes + TOOLS + PLAYBOOKS                              ║    ║
 ║  ║  │                                                           ║    ║
 ║  ║  T+2~T+3 Execute ───────────────────── Agent ReAct 循环     ║    ║
 ║  ║  │  ExecutorAgent (Mini-ReAct, 最多 10 步)                   ║    ║
@@ -377,7 +377,7 @@ TokenCast 通过 4 种量化策略（uniform/quantile/kmeans/adaptive）将连�
                  │                                             │
                  │  Step 1: 思考 → 调用 detect_trend           │    ┌──────────┐
                  │  Step 2: 观察趋势 → 调用 stl_decompose      │←──→│ ClawHub  │
-                 │  Step 3: 分解结果 → 调用 chronos_forecast   │    │ 62 工具   │
+                 │  Step 3: 分解结果 → 调用 chronos2_forecast   │    │ 62 工具   │
                  │  Step 4: 预测结果 → 调用 arima_forecast     │    └──────────┘
                  │  Step 5: 比较两者 → 调用 ensemble           │         ↕
                  │  Step 6: 综合 → done, answer={forecast:[]}  │    ┌──────────┐
@@ -533,7 +533,7 @@ TimeClaw 的核心推理采用 **Mini-ReAct**（Reasoning + Acting）范式，�
                     │  ┌──────────────────────────┐  │
          step 3 →   │  │ Think: 残差较平稳，       │  │
                     │  │   用 Chronos 零样本预测    │  │
-                    │  │ Act: chronos_forecast(h=24)│  │
+                    │  │ Act: chronos2_forecast(h=24)│  │
                     │  │ Observe: [15.1, 14.8, ...] │  │
                     │  └──────────────────────────┘  │
                     │              ↓                  │
@@ -593,7 +593,7 @@ ClawHub 包含 **62 个原子工具**，覆盖时序分析全链路：
 ╠═════════════════╬════╬══════════════════════════════════════════╣
 ║ prediction      ║~10 ║ arima_forecast, ets_forecast,            ║
 ║ (预测)          ║    ║ prophet_forecast, ensemble_forecast,     ║
-║                 ║    ║ chronos/moirai/timesfm/timer_forecast    ║
+║                 ║    ║ chronos/moirai/timesfm/sundial_base_128m_forecast  ║
 ╠═════════════════╬════╬══════════════════════════════════════════╣
 ║ validation      ║  5 ║ bound_check, consistency_check,          ║
 ║ (验证)          ║    ║ uncertainty_quantify, fol_check,         ║
@@ -701,9 +701,9 @@ TimeClaw 在 OpenClaw 三层记忆的基础上，扩展为**六层文件制自�
   │  Layer 0: SOUL.md (人工编写，固定不变)                          │
   │  "你是 TimeClaw，数据驱动、先诊断后预测、诚实不确定性..."         │
   ├─────────────────────────────────────────────────────────────────┤
-  │  Layer 1: Daily Notes (自动记录，追加式)                        │
+  │  Layer 1: Notes (自动记录，追加式)                              │
   │  每次 pipeline run 的自然语言摘要 + 工具链 + 评估指标            │
-  │  存储: daily/YYYY-MM-DD.md  索引: SQLite 向量存储               │
+  │  存储: notes/<scope>.md  索引: SQLite 向量存储                  │
   ├─────────────────────────────────────────────────────────────────┤
   │  Layer 2: MEMORY.md (LLM 蒸馏，按 domain_task 分区)            │
   │  因果洞察: "当 Hurst>0.7 时，Chronos 优于 ARIMA，因为..."       │
@@ -723,7 +723,7 @@ TimeClaw 在 OpenClaw 三层记忆的基础上，扩展为**六层文件制自�
   └─────────────────────────────────────────────────────────────────┘
 
   蒸馏链:
-      Daily Notes ──→ MEMORY.md ──→ PRINCIPLES.md
+      Notes ──→ MEMORY.md ──→ PRINCIPLES.md
                   └──→ TOOLS.md       └──→ PLAYBOOKS/
 ```
 

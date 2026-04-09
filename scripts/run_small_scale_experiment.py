@@ -79,6 +79,8 @@ def freeze_test_indices(
     path: Path,
     n: int,
     datasets: list[str] | None,
+    *,
+    config: Any | None = None,
 ) -> dict[str, list[int]]:
     path = Path(path)
     if path.exists():
@@ -88,14 +90,16 @@ def freeze_test_indices(
 
     from timeclaw.benchmark.dataset_split import load_split
     from timeclaw.benchmark.mtbench_adapter import DATASET_REGISTRY
+    from timeclaw.core.config import TimeClawConfig
 
+    cfg = config or TimeClawConfig.load()
     names = datasets if datasets else list(DATASET_REGISTRY.keys())
     out: dict[str, list[int]] = {}
     for ds in names:
         if ds not in DATASET_REGISTRY:
             continue
         try:
-            samples = load_split(ds, "test")
+            samples = load_split(ds, "test", config=cfg)
         except FileNotFoundError:
             logger.warning(f"[SmallScale] 无 test split: {ds}")
             continue
@@ -125,6 +129,7 @@ async def phase_baseline_indexed(
     )
     from timeclaw.benchmark.dataset_split import load_split
     from timeclaw.benchmark.mtbench_adapter import DATASET_REGISTRY
+    from timeclaw.benchmark.mtbench_support import expand_dataset_tasks
     from timeclaw.core.config import TimeClawConfig
     from timeclaw.llm.router import ModelRouter
 
@@ -139,14 +144,14 @@ async def phase_baseline_indexed(
         if not info:
             continue
         try:
-            full = load_split(ds_name, "test")
+            full = load_split(ds_name, "test", config=cfg)
         except FileNotFoundError:
             logger.warning(f"[SmallScale:Baseline] 无数据 {ds_name}")
             continue
         samples = _subset_by_indices(full, index_map[ds_name])
         if not samples:
             continue
-        tasks = info["tasks"]
+        tasks = expand_dataset_tasks(ds_name, list(info["tasks"]))
         if task_filter:
             tasks = [t for t in tasks if t == task_filter]
         if not tasks:
@@ -195,9 +200,11 @@ async def phase_pipeline_indexed(
     per_task_concurrency: int | None,
     indicator_concurrency: int | None,
     config: Any,
+    merge_checkpoint: bool = True,
 ) -> dict[str, Any]:
     from timeclaw.benchmark.dataset_split import load_split
     from timeclaw.benchmark.mtbench_adapter import DATASET_REGISTRY
+    from timeclaw.benchmark.mtbench_support import expand_dataset_tasks
     from timeclaw.benchmark import pipeline_eval as pe
     from timeclaw.core.config import TimeClawConfig
     from timeclaw.core import trace_logger as trace
@@ -243,7 +250,7 @@ async def phase_pipeline_indexed(
                 return task_sems[key]
             limit = (
                 indicator_concurrency
-                if task_name == "indicator" and indicator_concurrency is not None
+                if task_name.startswith("indicator") and indicator_concurrency is not None
                 else per_task_concurrency
             )
             if limit is None:
@@ -256,41 +263,53 @@ async def phase_pipeline_indexed(
             if not info:
                 continue
             try:
-                full = load_split(ds_name, "test")
+                full = load_split(ds_name, "test", config=cfg)
             except FileNotFoundError:
                 logger.warning(f"[SmallScale:Pipeline] 无数据 {ds_name}")
                 continue
             samples = _subset_by_indices(full, index_map[ds_name])
             if not samples:
                 continue
-            supported = info["tasks"]
+            supported = expand_dataset_tasks(ds_name, list(info["tasks"]))
             if task_filter:
                 supported = [t for t in supported if t == task_filter]
             if not supported:
                 continue
 
+            existing = pe._load_eval_checkpoint(ds_name, label) if merge_checkpoint else []
+            done = pe._eval_done_keys(existing)
+            work_specs = [
+                (idx, sample, task)
+                for idx, sample in enumerate(samples)
+                for task in supported
+                if not merge_checkpoint or (idx, task) not in done
+            ]
+
             logger.info(
                 f"[SmallScale:Pipeline:{label}] {ds_name}: {len(samples)} 样本 "
-                f"× {len(supported)} tasks, concurrency={concurrency}, "
+                f"× {len(supported)} tasks ({len(work_specs)} pending), concurrency={concurrency}, "
                 f"per_task_concurrency={per_task_concurrency}, "
                 f"indicator_concurrency={indicator_concurrency}"
             )
             t0 = time.time()
-            coros = [
-                pe._eval_one_task(
-                    ds_name, idx, sample, task, pipeline, verbose, sem,
-                    _get_task_sem(ds_name, task),
-                )
-                for idx, sample in enumerate(samples)
-                for task in supported
-            ]
-            flat = await asyncio.gather(*coros, return_exceptions=True)
-            ds_results: list[dict[str, Any]] = []
-            for r in flat:
-                if isinstance(r, Exception):
-                    logger.error(f"[SmallScale:Pipeline] {ds_name}: {r}")
-                    continue
-                ds_results.append(r)
+            if work_specs:
+                coros = [
+                    pe._eval_one_task(
+                        ds_name, idx, sample, task, pipeline, verbose, sem,
+                        _get_task_sem(ds_name, task),
+                    )
+                    for idx, sample, task in work_specs
+                ]
+                flat = await asyncio.gather(*coros, return_exceptions=True)
+                new_rows: list[dict[str, Any]] = []
+                for r in flat:
+                    if isinstance(r, Exception):
+                        logger.error(f"[SmallScale:Pipeline] {ds_name}: {r}")
+                        continue
+                    new_rows.append(r)
+                ds_results = pe._merge_eval_rows(existing, new_rows)
+            else:
+                ds_results = list(existing)
             elapsed = time.time() - t0
             pe._save_results(ds_results, ds_name, label)
             summary = pe._summarize(ds_results)
@@ -407,7 +426,13 @@ async def async_main() -> None:
         action="store_true",
         help="即使已有 baseline 文件，也强制重跑 baseline",
     )
+    parser.add_argument(
+        "--no-merge-checkpoint",
+        action="store_true",
+        help="训练/测试阶段不合并已有 checkpoint，从头写（训练仍会跳过已有 train_*.json 若未传此标志时的旧逻辑见 merge_checkpoint=False）",
+    )
     args = parser.parse_args()
+    merge_ckpt = not args.no_merge_checkpoint
 
     phases = (
         {"freeze", "baseline", "train", "distill", "test", "compare"}
@@ -415,17 +440,18 @@ async def async_main() -> None:
         else {args.phase}
     )
 
+    from timeclaw.core.config import TimeClawConfig
+
+    cfg = TimeClawConfig.load()
     index_map: dict[str, list[int]] = {}
     if phases & {"freeze", "baseline", "test"}:
-        index_map = freeze_test_indices(args.indices_path, args.test_n, None)
+        index_map = freeze_test_indices(
+            args.indices_path, args.test_n, None, config=cfg,
+        )
     elif "compare" in phases:
         ip = Path(args.indices_path)
         if ip.exists():
             index_map = json.loads(ip.read_text())
-
-    from timeclaw.core.config import TimeClawConfig
-
-    cfg = TimeClawConfig.load()
 
     if "baseline" in phases:
         if args.force_baseline or not has_existing_baseline(index_map):
@@ -451,6 +477,7 @@ async def async_main() -> None:
             concurrency=args.train_concurrency,
             per_task_concurrency=args.per_task_concurrency,
             indicator_concurrency=args.indicator_concurrency,
+            merge_checkpoint=merge_ckpt,
         )
 
     if "distill" in phases:
@@ -468,6 +495,7 @@ async def async_main() -> None:
             per_task_concurrency=args.per_task_concurrency,
             indicator_concurrency=args.indicator_concurrency,
             config=cfg,
+            merge_checkpoint=merge_ckpt,
         )
 
     if "compare" in phases and index_map:

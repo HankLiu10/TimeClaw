@@ -32,10 +32,6 @@ class _BaseLLMReasoningTool(ClawTool):
                 "type": "string",
                 "description": "What to predict or analyze.",
             },
-            "output_schema": {
-                "oneOf": [{"type": "string"}, {"type": "object"}],
-                "description": "Expected JSON output schema.",
-            },
             "context": {
                 "type": "string",
                 "description": "Additional task context to include in the prompt.",
@@ -48,6 +44,13 @@ class _BaseLLMReasoningTool(ClawTool):
         "required": ["question"],
     }
     is_stub: bool = False
+
+    output_contract: str = '{"answer": "..."}'
+
+    def _normalise_payload(self, payload: Any) -> dict[str, Any]:
+        if isinstance(payload, dict) and "answer" in payload:
+            return payload
+        return {"answer": payload}
 
     async def _run(self, ts_data: Any = None, **params: Any) -> Any:
         llm = self.resolve_llm(params.get("llm"), "heavy")
@@ -63,9 +66,6 @@ class _BaseLLMReasoningTool(ClawTool):
                 raise ValueError(f"LLM backend is required for {self.name}")
 
         question = params.get("question", "Analyze this data.")
-        output_schema = params.get("output_schema", '{"answer": "..."}')
-        if isinstance(output_schema, dict):
-            output_schema = json.dumps(output_schema, ensure_ascii=False)
         context = params.get("context", "")
         domain = params.get("domain", "")
 
@@ -82,15 +82,15 @@ class _BaseLLMReasoningTool(ClawTool):
         if text:
             if isinstance(text, list):
                 texts = [self.extract_text_content(t) for t in text[:10]]
-                text_section = "Contextual information:\n" + "\n".join(texts[:10000]) + "\n\n"
+                text_section = "Contextual information:\n" + "\n".join(texts) + "\n\n"
             else:
-                text_section = f"Contextual information:\n{str(text)[:10000]}\n\n"
+                text_section = f"Contextual information:\n{str(text)}\n\n"
 
         system_prompt = (
             f"You are a specialist for {self.task_boundary}. "
             "Analyze the provided data and contextual information carefully.\n"
             "Return ONLY a JSON object matching this schema: "
-            f"{output_schema}"
+            f"{self.output_contract}"
         )
         user_prompt = f"{domain_section}{ts_section}{text_section}{context}\n\nQuestion: {question}"
 
@@ -102,12 +102,12 @@ class _BaseLLMReasoningTool(ClawTool):
         resp = await llm.complete(messages, response_format="json")
 
         if resp.parsed:
-            return resp.parsed
+            return self._normalise_payload(resp.parsed)
         if resp.text:
             try:
-                return json.loads(resp.text)
+                return self._normalise_payload(json.loads(resp.text))
             except (json.JSONDecodeError, TypeError):
-                return {"raw_response": resp.text}
+                raise ValueError("LLM returned non-JSON response")
         raise ValueError("LLM returned empty response")
 
 
@@ -117,8 +117,26 @@ class LLMReasoningForecastTool(_BaseLLMReasoningTool):
     description = (
         "Multimodal LLM reasoning wrapper specialized for forecast tasks. "
         "Use when the goal is to predict future numeric values from time-series "
-        "data, optionally using text or image context."
+        "data, optionally using text or image context. "
+        "Returns a fixed payload: {\"answer\": [numbers]}."
     )
+    output_contract = '{"answer": [number, number, ...]}'
+
+    def _normalise_payload(self, payload: Any) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            if "answer" in payload:
+                answer = payload["answer"]
+            else:
+                answer = None
+                for key in ("forecast", "point_forecast", "prediction", "values", "temperatures", "predictions", "data"):
+                    if key in payload:
+                        answer = payload[key]
+                        break
+                if answer is None:
+                    answer = payload
+        else:
+            answer = payload
+        return {"answer": answer}
 
 
 class LLMReasoningIndicatorTool(_BaseLLMReasoningTool):
@@ -127,8 +145,17 @@ class LLMReasoningIndicatorTool(_BaseLLMReasoningTool):
     description = (
         "Multimodal LLM reasoning wrapper specialized for indicator tasks. "
         "Use when the goal is to extract numeric indicators such as max, min, "
-        "diff, MACD, or Bollinger-related values."
+        "diff, MACD, or Bollinger-related values. "
+        "Returns a fixed payload: {\"answer\": {indicator_name: values}}."
     )
+    output_contract = '{"answer": {"indicator_name": [number, ...]}}'
+
+    def _normalise_payload(self, payload: Any) -> dict[str, Any]:
+        if isinstance(payload, dict) and "answer" in payload:
+            answer = payload["answer"]
+        else:
+            answer = payload
+        return {"answer": answer}
 
 
 class LLMReasoningClassificationTool(_BaseLLMReasoningTool):
@@ -136,8 +163,26 @@ class LLMReasoningClassificationTool(_BaseLLMReasoningTool):
     task_boundary = "classification and trend labeling"
     description = (
         "Multimodal LLM reasoning wrapper specialized for classification tasks. "
-        "Use when the output is a trend label, class label, or structured label object."
+        "Use when the output is a trend label, class label, or structured label object. "
+        "Returns a fixed payload: {\"answer\": \"label\"}."
     )
+    output_contract = '{"answer": "label"}'
+
+    def _normalise_payload(self, payload: Any) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            if "answer" in payload:
+                answer = payload["answer"]
+            else:
+                answer = None
+                for key in ("trend", "label", "prediction"):
+                    if key in payload:
+                        answer = payload[key]
+                        break
+                if answer is None:
+                    answer = payload
+        else:
+            answer = payload
+        return {"answer": answer}
 
 
 class LLMReasoningQATool(_BaseLLMReasoningTool):
@@ -145,8 +190,10 @@ class LLMReasoningQATool(_BaseLLMReasoningTool):
     task_boundary = "question answering"
     description = (
         "Multimodal LLM reasoning wrapper specialized for QA tasks. "
-        "Use when the task asks a question over time-series plus optional context."
+        "Use when the task asks a question over time-series plus optional context. "
+        "Returns a fixed payload: {\"answer\": \"text\"}."
     )
+    output_contract = '{"answer": "text"}'
 
 
 class LLMReasoningCorrelationTool(_BaseLLMReasoningTool):
@@ -154,8 +201,20 @@ class LLMReasoningCorrelationTool(_BaseLLMReasoningTool):
     task_boundary = "correlation classification"
     description = (
         "Multimodal LLM reasoning wrapper specialized for correlation tasks. "
-        "Use when the output is a correlation label or correlation judgment."
+        "Use when the output is a correlation label or correlation judgment. "
+        "Returns a fixed payload: {\"answer\": \"label\"}."
     )
+    output_contract = '{"answer": "label"}'
+
+    def _normalise_payload(self, payload: Any) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            if "answer" in payload:
+                answer = payload["answer"]
+            else:
+                answer = payload.get("correlation", payload)
+        else:
+            answer = payload
+        return {"answer": answer}
 
 
 tool_forecast = LLMReasoningForecastTool()

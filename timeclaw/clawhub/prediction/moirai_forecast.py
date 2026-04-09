@@ -1,4 +1,4 @@
-"""Moirai forecast tool — Salesforce's universal forecasting foundation model."""
+"""Moirai 1.1 R-base forecast tool — Salesforce universal forecasting model."""
 
 from __future__ import annotations
 
@@ -13,18 +13,8 @@ from timeclaw.clawhub.tool_base import ClawTool, ToolCategory, ToolIOType
 _load_lock = threading.Lock()
 
 
-def _statistical_fallback(ts_data: Any, horizon: int) -> dict[str, Any]:
-    arr = np.asarray(ts_data, dtype=np.float32).ravel()
-    if len(arr) < 2:
-        forecast = np.full(horizon, arr[-1] if len(arr) > 0 else 0.0)
-    else:
-        trend = (arr[-1] - arr[-min(10, len(arr))]) / min(10, len(arr))
-        forecast = arr[-1] + trend * np.arange(1, horizon + 1)
-    return {"model": "moirai_fallback", "horizon": horizon, "point_forecast": forecast.tolist()}
-
-
 def _run_moirai(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, Any]:
-    from timeclaw.sbm.registry import get_global_registry
+    from timeclaw.sbm.registry import configured_default_config, get_global_registry
     from timeclaw.sbm.moirai_adapter import (
         MoiraiAdapter,
         MOIRAI_DEFAULT_CONFIG,
@@ -32,19 +22,21 @@ def _run_moirai(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, 
     )
 
     registry = get_global_registry()
-    if "moirai" not in registry.list_available():
+    if "moirai1_1_r_base" not in registry.list_available():
         try:
             _ensure_moirai_imports()
-            registry.register("moirai", MoiraiAdapter, MOIRAI_DEFAULT_CONFIG)
+            registry.register(
+                "moirai1_1_r_base",
+                MoiraiAdapter,
+                configured_default_config("moirai1_1_r_base", MOIRAI_DEFAULT_CONFIG),
+            )
         except ImportError as e:
-            logger.warning(f"[moirai_forecast] import unavailable: {e}")
-            return _statistical_fallback(ts_data, horizon)
+            raise RuntimeError(f"moirai import unavailable: {e}") from e
 
     try:
-        adapter = registry.get("moirai")
+        adapter = registry.get("moirai1_1_r_base")
     except KeyError:
-        logger.warning("[moirai_forecast] adapter not available")
-        return _statistical_fallback(ts_data, horizon)
+        raise RuntimeError("moirai1_1_r_base adapter not available")
 
     context = np.asarray(ts_data, dtype=np.float32)
     if context.ndim == 0:
@@ -55,25 +47,23 @@ def _run_moirai(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, 
             if not adapter.is_loaded:
                 try:
                     adapter.load()
-                    logger.info("[moirai_forecast] model loaded")
+                    logger.info("[moirai1_1_r_base_forecast] model loaded")
                 except Exception as e:
-                    logger.warning(f"[moirai_forecast] first load failed: {e}")
+                    logger.warning(f"[moirai1_1_r_base_forecast] first load failed: {e}")
                     # Some runs showed transient false-negative import errors
                     # under concurrent startup. Re-check imports and retry once.
                     try:
                         _ensure_moirai_imports()
                         adapter.load()
-                        logger.info("[moirai_forecast] model loaded on retry")
+                        logger.info("[moirai1_1_r_base_forecast] model loaded on retry")
                     except Exception as retry_e:
-                        logger.error(f"[moirai_forecast] load failed: {retry_e}")
-                        result = _statistical_fallback(ts_data, horizon)
-                        result["model_error"] = f"load failed: {retry_e}"
-                        return result
+                        logger.error(f"[moirai1_1_r_base_forecast] load failed: {retry_e}")
+                        raise RuntimeError(f"moirai load failed: {retry_e}") from retry_e
 
     try:
         output = adapter.forecast(context, prediction_length=horizon, num_samples=num_samples)
         result: dict[str, Any] = {
-            "model": "moirai",
+            "model": "Salesforce/moirai-1.1-R-base",
             "horizon": horizon,
             "point_forecast": output.point_forecast.tolist() if output.point_forecast is not None else None,
         }
@@ -81,10 +71,8 @@ def _run_moirai(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, 
             result["quantiles"] = {str(q): v.tolist() for q, v in output.quantile_forecast.items()}
         return result
     except Exception as e:
-        logger.error(f"[moirai_forecast] inference failed: {e}")
-        result = _statistical_fallback(ts_data, horizon)
-        result["model_error"] = str(e)
-        return result
+        logger.error(f"[moirai1_1_r_base_forecast] inference failed: {e}")
+        raise RuntimeError(f"moirai inference failed: {e}") from e
 
 
 _PARAM_SCHEMA: dict[str, Any] = {
@@ -97,16 +85,17 @@ _PARAM_SCHEMA: dict[str, Any] = {
 
 
 class MoiraiForecastTool(ClawTool):
-    name: str = "moirai_forecast"
+    name: str = "moirai1_1_r_base_forecast"
     category: ToolCategory = ToolCategory.PREDICTION
     description: str = (
-        "Forecast a univariate time series using Salesforce Moirai, a masked encoder-based universal forecasting model "
+        "Forecast a univariate time series using Salesforce Moirai 1.1 R-base, "
+        "a masked encoder-based universal forecasting model "
         "trained on 27 billion observations across 9 domains with any-variate attention. "
         "Input: 1-D numeric array. "
         "Output: dict with 'point_forecast' (array), 'horizon', 'model', and optional 'quantiles' for uncertainty. "
         "Strengths: strong at multi-step forecasting, adapts to varying frequencies without fine-tuning; "
         "best for medium to long series (100+ points). Runs on GPU. "
-        "Falls back to a linear-trend statistical forecast if the model server is unavailable. "
+        "Fails explicitly if Moirai 1.1 R-base is unavailable. "
         "Key params: 'horizon' (steps ahead, default 96)."
     )
     io_type: ToolIOType = ToolIOType.X_TO_X

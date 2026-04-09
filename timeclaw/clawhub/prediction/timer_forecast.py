@@ -1,4 +1,4 @@
-"""Timer forecast tool — generative pre-trained transformer for time series."""
+"""Sundial Base 128M forecast tool — generative forecasting transformer for time series."""
 
 from __future__ import annotations
 
@@ -13,33 +13,25 @@ from timeclaw.clawhub.tool_base import ClawTool, ToolCategory, ToolIOType
 _load_lock = threading.Lock()
 
 
-def _statistical_fallback(ts_data: Any, horizon: int) -> dict[str, Any]:
-    arr = np.asarray(ts_data, dtype=np.float32).ravel()
-    if len(arr) < 2:
-        forecast = np.full(horizon, arr[-1] if len(arr) > 0 else 0.0)
-    else:
-        trend = (arr[-1] - arr[-min(10, len(arr))]) / min(10, len(arr))
-        forecast = arr[-1] + trend * np.arange(1, horizon + 1)
-    return {"model": "timer_fallback", "horizon": horizon, "point_forecast": forecast.tolist()}
-
-
 def _run_timer(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, Any]:
-    from timeclaw.sbm.registry import get_global_registry, auto_register
+    from timeclaw.sbm.registry import configured_default_config, get_global_registry
 
     registry = get_global_registry()
-    if "timer" not in registry.list_available():
+    if "sundial_base_128m" not in registry.list_available():
         try:
             from timeclaw.sbm.timer_adapter import TimerAdapter, TIMER_DEFAULT_CONFIG
-            registry.register("timer", TimerAdapter, TIMER_DEFAULT_CONFIG)
+            registry.register(
+                "sundial_base_128m",
+                TimerAdapter,
+                configured_default_config("sundial_base_128m", TIMER_DEFAULT_CONFIG),
+            )
         except ImportError:
-            logger.warning("[timer_forecast] timer not installed")
-            return _statistical_fallback(ts_data, horizon)
+            raise RuntimeError("sundial_base_128m not installed")
 
     try:
-        adapter = registry.get("timer")
+        adapter = registry.get("sundial_base_128m")
     except KeyError:
-        logger.warning("[timer_forecast] adapter not available")
-        return _statistical_fallback(ts_data, horizon)
+        raise RuntimeError("sundial_base_128m adapter not available")
 
     context = np.asarray(ts_data, dtype=np.float32)
     if context.ndim == 0:
@@ -50,17 +42,15 @@ def _run_timer(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, A
             if not adapter.is_loaded:
                 try:
                     adapter.load()
-                    logger.info("[timer_forecast] model loaded")
+                    logger.info("[sundial_base_128m_forecast] model loaded")
                 except Exception as e:
-                    logger.error(f"[timer_forecast] load failed: {e}")
-                    result = _statistical_fallback(ts_data, horizon)
-                    result["model_error"] = f"load failed: {e}"
-                    return result
+                    logger.error(f"[sundial_base_128m_forecast] load failed: {e}")
+                    raise RuntimeError(f"timer load failed: {e}") from e
 
     try:
         output = adapter.forecast(context, prediction_length=horizon, num_samples=num_samples)
         result: dict[str, Any] = {
-            "model": "timer",
+            "model": "thuml/sundial-base-128m",
             "horizon": horizon,
             "point_forecast": output.point_forecast.tolist() if output.point_forecast is not None else None,
         }
@@ -68,10 +58,8 @@ def _run_timer(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, A
             result["quantiles"] = {str(q): v.tolist() for q, v in output.quantile_forecast.items()}
         return result
     except Exception as e:
-        logger.error(f"[timer_forecast] inference failed: {e}")
-        result = _statistical_fallback(ts_data, horizon)
-        result["model_error"] = str(e)
-        return result
+        logger.error(f"[sundial_base_128m_forecast] inference failed: {e}")
+        raise RuntimeError(f"timer inference failed: {e}") from e
 
 
 _PARAM_SCHEMA: dict[str, Any] = {
@@ -84,16 +72,16 @@ _PARAM_SCHEMA: dict[str, Any] = {
 
 
 class TimerForecastTool(ClawTool):
-    name: str = "timer_forecast"
+    name: str = "sundial_base_128m_forecast"
     category: ToolCategory = ToolCategory.PREDICTION
     description: str = (
-        "Forecast a univariate time series using Timer, a generative pre-trained transformer "
-        "that uses next-token prediction on continuous values with autoregressive decoding. "
+        "Forecast a univariate time series using THU Sundial Base 128M, a newer generative forecasting model "
+        "from the THU Timer/Sundial line. "
         "Input: 1-D numeric array. "
         "Output: dict with 'point_forecast' (array), 'horizon', 'model', and optional 'quantiles' for uncertainty. "
         "Strengths: captures local temporal dynamics and abrupt changes well; "
         "suitable for short to medium series (50-300 points). Runs on GPU. "
-        "Falls back to a linear-trend statistical forecast if the model server is unavailable. "
+        "Fails explicitly if Sundial is unavailable or the input length is incompatible. "
         "Key params: 'horizon' (steps ahead, default 96)."
     )
     io_type: ToolIOType = ToolIOType.X_TO_X

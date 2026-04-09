@@ -27,3 +27,12 @@ pipeline:
 
 log_level: "INFO"
 workspace_dir: ".timeclaw"
+
+# MTBench: processed data + train/test file lists (same layout as scripts/download_mtbench.py)
+benchmark:
+  repo_root: "."
+  splits_dir: "data/splits"
+
+sbm:
+  device: "cuda"
+  devices: {}

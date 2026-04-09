@@ -120,7 +120,7 @@ class ContextManager:
                     "Keep it under 500 words. Output plain text, not JSON."
                 ),
             },
-            {"role": "user", "content": summary[:100000]},
+            {"role": "user", "content": summary},
         ]
 
         try:

@@ -1,301 +1,565 @@
-"""Official MTBench prompt templates — aligned with the paper (Appendix C/D).
+"""MTBench prompt bridge.
 
-Each function returns (system_prompt, user_prompt) ready for LLM.complete().
-All prompts use TS+Text setting (the primary evaluation mode).
+New definition:
+    This module no longer maintains a small set of rewritten prompt
+    templates. It dispatches to dataset/task-specific prompt builders that
+    mirror the official MTBench repository implementation as closely as
+    possible, including some quirks in the upstream scripts.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import datetime
+import importlib.util
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-
-def _fmt_ts(values: np.ndarray | list, max_points: int = 0) -> str:
-    arr = np.asarray(values, dtype=np.float64).ravel()
-    if max_points > 0 and len(arr) > max_points:
-        arr = arr[:max_points]
-    return ", ".join(f"{v:.2f}" for v in arr)
+if TYPE_CHECKING:
+    from timeclaw.benchmark.mtbench_adapter import MTBenchSample
 
 
-def _fmt_timestamps(timestamps: list, max_points: int = 0) -> str:
-    ts = timestamps[:max_points] if max_points > 0 else timestamps
-    if not ts:
-        return ""
-    return f"{ts[0]} to {ts[-1]}"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# WEATHER TASKS
-# ═══════════════════════════════════════════════════════════════════════
+def _load_module(rel_path: str, module_name: str) -> Any:
+    path = _REPO_ROOT / rel_path
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load MTBench module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-def weather_forecast(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-    horizon_days: int = 1,
-) -> tuple[str, str]:
-    input_days = len(ts_data) // 24
-    sys = "You are a weather forecasting AI."
-    user = (
-        f"The input time-series represents temperature readings. "
-        f"This data is from a location in the United States, where summers are hot and winters are cold. "
-        f"Weather conditions can also be affected by storms, heavy rain, and cold fronts. "
-        f"The daytime is usually warmer than the nighttime. "
-        f"Every 24 temperature readings represent a full day from 00:00 to 23:00.\n\n"
-        f"Temperature time series (past {input_days} days, hourly):\n[{_fmt_ts(ts_data)}]\n\n"
+
+_WEATHER_META = _load_module(
+    "mtbench_official/evaluation/weather/meta_prompt.py",
+    "timeclaw_mtbench_weather_meta_prompt",
+)
+_FINANCE_META = _load_module(
+    "mtbench_official/evaluation/finance/meta_prompt.py",
+    "timeclaw_mtbench_finance_meta_prompt",
+)
+_EVAL_UTILS = _load_module(
+    "mtbench_official/evaluation/utils.py",
+    "timeclaw_mtbench_eval_utils",
+)
+
+
+def _weather_ts_string(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _finance_ts_object(epoch: float) -> datetime:
+    # Official finance scripts use datetime.fromtimestamp(...) directly.
+    return datetime.fromtimestamp(epoch)
+
+
+def _finance_ts_string(epoch: float) -> str:
+    return _finance_ts_object(epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _input_prices(sample: "MTBenchSample") -> list[float]:
+    return np.asarray(sample.input_window, dtype=np.float64).ravel().tolist()
+
+
+def _output_prices(sample: "MTBenchSample") -> list[float]:
+    if sample.output_window is None:
+        return []
+    return np.asarray(sample.output_window, dtype=np.float64).ravel().tolist()
+
+
+def _indicator_series(sample: "MTBenchSample", key: str) -> list[float]:
+    raw = sample.labels.get(key)
+    if raw is None:
+        return []
+    return np.asarray(raw, dtype=np.float64).ravel().tolist()
+
+
+def _output_ts_string(sample: "MTBenchSample") -> str:
+    output_timestamps = sample.metadata.get("output_timestamps") or []
+    if output_timestamps:
+        return _finance_ts_string(float(output_timestamps[-1]))
+    output_window = _output_prices(sample)
+    return str(output_window[-1]) if output_window else ""
+
+
+def _finance_granularity(sample: "MTBenchSample") -> str:
+    if len(sample.timestamps) < 2:
+        return "unknown"
+    arr = np.asarray(sample.timestamps, dtype=np.float64).ravel()
+    diffs = np.diff(arr)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return "unknown"
+    return _EVAL_UTILS.format_time_difference(float(np.median(diffs)))
+
+
+def _prompt(raw_prompt: str) -> tuple[str, str]:
+    return "", raw_prompt
+
+
+def weather_aligned_short_forecast_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.temperature_forecast_metaprompt_generation(
+            text=sample.text,
+            temperatures=_input_prices(sample),
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            granularity="hourly",
+            prediction_length=len(_output_prices(sample)),
+            mode="combined",
+        )
     )
-    if text:
-        user += f"Weather report:\n{text}\n\n"
-    user += (
-        f"Your task is to predict the next {horizon_days} day(s) of hourly temperature readings "
-        f"({horizon_days * 24} values).\n"
-        f"Return ONLY a JSON array of {horizon_days * 24} numbers, nothing else."
-    )
-    return sys, user
 
 
-def weather_trend_future(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-) -> tuple[str, str]:
-    sys = "You are a weather forecasting AI."
-    user = (
-        f"The input time-series represents temperature readings from a US location. "
-        f"Every 24 readings represent a full day from 00:00 to 23:00.\n\n"
-        f"Temperature time series (past 7 days, hourly):\n[{_fmt_ts(ts_data)}]\n\n"
+def weather_aligned_long_forecast_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.temperature_forecast_metaprompt_generation(
+            text=sample.text,
+            temperatures=_input_prices(sample),
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            granularity="hourly",
+            prediction_length=len(_output_prices(sample)),
+            mode="combined",
+            next_days=3,
+        )
     )
-    if text:
-        user += f"Weather report:\n{text}\n\n"
-    user += (
-        "Based on the given information, predict the temperature trend for the next 1 day. "
-        "Calculate the mean temperature of the last 24-hour period (i.e., the most recent day in the input) "
-        "and compare it with the mean temperature of the first predicted day. "
-        "If the difference is greater or equal than 0.5, classify the trend as 'increasing'. "
-        "If the difference is less or equal than -0.5, classify the trend as 'decreasing'. "
-        "Otherwise, classify it as 'stable'.\n\n"
-        'Return ONLY a JSON object: {"trend": "increasing" or "decreasing" or "stable"}'
-    )
-    return sys, user
 
 
-def weather_trend_past(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-) -> tuple[str, str]:
-    """Official-style MTBench weather past-trend prompt."""
-    input_days = max(1, len(ts_data) // 24)
-    sys = "You are a weather forecasting AI."
-    user = (
-        f"Your task is to analyze the past {input_days} days's of temperature trend. "
-        f"The input time series represents temperature readings from "
-        f"{timestamps[0] if timestamps else 'unknown'} to {timestamps[-1] if timestamps else 'unknown'}, "
-        f"with a granularity of hourly. "
-        f"This data is from a location in the United States, where summers are hot and winters are cold. "
-        f"Weather conditions can also be affected by storms, heavy rain, and cold fronts."
-        f"The daytime is usually warmer than the nighttime."
-        f"Every 24 temperature readings represent a full day from 00:00 to 23:00."
+def weather_aligned_short_trend_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.temperature_trend_metaprompt_generation(
+            text=sample.text,
+            past_temperatures=_input_prices(sample),
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            granularity="hourly",
+            past_days=7,
+            next_days=1,
+            mode="combined",
+            past_future="future",
+        )
     )
-    user += (
-        f"\n\nYou will use both the historical temperature data and the news article to make your prediction. "
-        f"The input temperature readings are: {list(np.asarray(ts_data, dtype=np.float64).ravel())}. "
-    )
-    if text:
-        user += f"The news article states: {text}. "
-    user += (
-        "\n\nCompute the daily mean temperature and fit a linear trend, "
-        "if the slope is greater or equal to 0.25, then it is classified as increasing, "
-        "if the slope is less or equal than -0.25, it is classified as decrease, "
-        "if the slope is between 0.25 to -0.25, it is classified as stable."
-        f"\n\nBased on the trend, predict the temperature trend for the past {input_days} days. "
-        "Return one word in increasing, decreasing, or stable. Do not return reasoning text and extra words."
-    )
-    return sys, user
 
 
-def weather_indicator(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-) -> tuple[str, str]:
-    sys = "You are a weather forecasting AI."
-    user = (
-        f"The input time-series represents temperature readings. "
-        f"This data is from a location in the United States, where summers are hot and winters are cold. "
-        f"Weather conditions can also be affected by storms, heavy rain, and cold fronts. "
-        f"The daytime is usually warmer than the nighttime. "
-        f"Every 24 temperature readings represent a full day from 00:00 to 23:00.\n\n"
-        f"Temperature time series (past 7 days, hourly):\n[{_fmt_ts(ts_data)}]\n\n"
+def weather_aligned_long_trend_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.temperature_trend_metaprompt_generation(
+            text=sample.text,
+            past_temperatures=_input_prices(sample),
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            granularity="hourly",
+            past_days=14,
+            next_days=3,
+            mode="combined",
+            past_future="future",
+        )
     )
-    if text:
-        user += f"Weather report:\n{text}\n\n"
-    user += (
-        "Your task is to analyze the past 7 days' temperature trend and predict "
-        "the next 1 day's highest temperature and lowest temperature "
-        "as well as the temperature difference between the highest and lowest temperature.\n\n"
-        'Return ONLY a JSON object: {"max": number, "min": number, "diff": number}'
-    )
-    return sys, user
 
 
-def weather_mcqa(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-    question: str,
-) -> tuple[str, str]:
-    sys = "You are a weather analysis expert."
-    user = (
-        f"Temperature time series (hourly):\n[{_fmt_ts(ts_data)}]\n\n"
+def weather_aligned_short_trend_past_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.temperature_trend_metaprompt_generation(
+            text=sample.text,
+            past_temperatures=_input_prices(sample),
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            granularity="hourly",
+            past_days=7,
+            next_days=1,
+            mode="combined",
+            past_future="past",
+        )
     )
-    if text:
-        user += f"Weather report:\n{text}\n\n"
-    user += (
-        f"Question: {question}\n\n"
-        "Return your answer ONLY as a single letter (A, B, C, or D) in JSON: "
-        '{"answer": "X"}'
-    )
-    return sys, user
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# FINANCE TASKS
-# ═══════════════════════════════════════════════════════════════════════
-
-def stock_forecast(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-    horizon_points: int,
-    input_desc: str = "7 days at 5-minute intervals",
-    output_desc: str = "next 1 day",
-) -> tuple[str, str]:
-    sys = (
-        "You are a financial prediction expert with knowledge of advanced "
-        "machine learning models and time-series analysis."
+def weather_aligned_long_trend_past_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.temperature_trend_metaprompt_generation(
+            text=sample.text,
+            past_temperatures=_input_prices(sample),
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            granularity="hourly",
+            past_days=14,
+            next_days=3,
+            mode="combined",
+            past_future="past",
+        )
     )
-    user = (
-        f"Time Series Stock Price Data: This data includes stock prices recorded at "
-        f"{input_desc}.\n"
-        f"Data: [{_fmt_ts(ts_data)}]\n\n"
-    )
-    if text:
-        user += f"News Data:\n{text[:10000]}\n\n"
-    user += (
-        f"Your task is to predict the stock prices for the {output_desc} "
-        f"({horizon_points} values).\n"
-        f"Return ONLY a JSON array of {horizon_points} numbers, nothing else."
-    )
-    return sys, user
 
 
-def stock_trend_5way(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-    input_desc: str = "1-hour intervals over the last week",
-) -> tuple[str, str]:
-    sys = (
-        "You are a financial prediction expert with knowledge of advanced "
-        "machine learning models and time-series analysis."
+def weather_aligned_short_indicator_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.temperature_indicator_metaprompt_generation(
+            text=sample.text,
+            past_temperatures=_input_prices(sample),
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            granularity="hourly",
+            past_days=7,
+            mode="combined",
+        )
     )
-    user = (
-        f"Time Series Stock Price Data: This data includes stock prices recorded at "
-        f"{input_desc}.\n"
-        f"Data: [{_fmt_ts(ts_data)}]\n\n"
-    )
-    if text:
-        user += f"News Data:\n{text[:10000]}\n\n"
-    user += (
-        "Output: Provide a prediction for the stock trend and categorize it into "
-        'one of the following labels: "<-4%", "-2% ~ -4%", "-2% ~ +2%", "+2% ~ +4%", ">+4%".\n\n'
-        "Task: Please think step-by-step. Analyze the provided time-series data and news "
-        "to identify future trends of the stock performance.\n"
-        'Return ONLY a JSON object: {"trend": "<label>"}'
-    )
-    return sys, user
 
 
-def stock_indicator_macd(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-    input_desc: str = "7 days",
-) -> tuple[str, str]:
-    sys = "You are a financial technical analysis expert."
-    user = (
-        f"Stock price data ({input_desc}):\n[{_fmt_ts(ts_data)}]\n\n"
+def weather_aligned_long_indicator_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.temperature_indicator_metaprompt_generation(
+            text=sample.text,
+            past_temperatures=_input_prices(sample),
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            granularity="hourly",
+            past_days=14,
+            mode="combined",
+        )
     )
-    if text:
-        user += f"News:\n{text[:10000]}\n\n"
-    user += (
-        "MACD (Moving Average Convergence Divergence) is calculated as the difference "
-        "between the 12-period and 26-period exponential moving averages.\n"
-        "Predict the average MACD value for the forecast period.\n"
-        'Return ONLY a JSON object: {"macd": number}'
-    )
-    return sys, user
 
 
-def stock_indicator_bb(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-    input_desc: str = "7 days",
-) -> tuple[str, str]:
-    sys = "You are a financial technical analysis expert."
-    user = (
-        f"Stock price data ({input_desc}):\n[{_fmt_ts(ts_data)}]\n\n"
+def weather_qa_short_mcqa_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.weather_mcqa_metaprompt_generation(
+            past_days=7,
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            past_temperatures=_input_prices(sample),
+            news=sample.text,
+            question=sample.question or "",
+        )
     )
-    if text:
-        user += f"News:\n{text[:10000]}\n\n"
-    user += (
-        "Bollinger Bands: Upper Band = SMA + 2*sigma. "
-        "Predict the average Upper Bollinger Band value for the forecast period.\n"
-        'Return ONLY a JSON object: {"upper_bb": number}'
-    )
-    return sys, user
 
 
-def stock_correlation_5way(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-) -> tuple[str, str]:
-    sys = "You are an expert in finance and stock market analysis."
-    user = (
-        f"Historical stock price time-series:\n[{_fmt_ts(ts_data)}]\n\n"
-        f"Financial analysis published at the last timestamp:\n{text[:10000]}\n\n"
-        "Your task is to predict the correlation between the stock's price fluctuations "
-        "in the next 7 days and the analysis sentiment. "
-        "Positive correlation indicates that positive analysis leads to price increase "
-        "and negative analysis leads to price decrease.\n"
-        "Take into account external factors or market conditions that might affect stock price movement.\n\n"
-        "Choose one of: "
-        '"Strong Positive Correlation", "Moderate Positive Correlation", "No Correlation", '
-        '"Moderate Negative Correlation", "Strong Negative Correlation".\n'
-        'Return ONLY a JSON object: {"correlation": "<label>"}'
+def weather_qa_long_forecast_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.temperature_forecast_metaprompt_generation(
+            text=sample.text,
+            temperatures=_input_prices(sample),
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            granularity="hourly",
+            prediction_length=len(_output_prices(sample)),
+            mode="combined",
+            next_days=3,
+        )
     )
-    return sys, user
 
 
-def stock_mcqa(
-    ts_data: np.ndarray,
-    timestamps: list,
-    text: str,
-    question: str,
-) -> tuple[str, str]:
-    sys = "You are an expert in finance and stock market analysis."
-    user = (
-        f"Historical stock price time-series:\n[{_fmt_ts(ts_data)}]\n\n"
+def weather_qa_long_mcqa_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _WEATHER_META.weather_mcqa_metaprompt_generation(
+            past_days=14,
+            start_datetime=_weather_ts_string(sample.timestamps[0]),
+            end_datetime=_weather_ts_string(sample.timestamps[-1]),
+            past_temperatures=_input_prices(sample),
+            news=sample.text,
+            question=sample.question or "",
+        )
     )
-    if text:
-        user += f"Financial analysis:\n{text[:10000]}\n\n"
-    user += (
-        f"Question: {question}\n\n"
-        "Return your answer ONLY as a single letter (A, B, C, or D) in JSON: "
-        '{"answer": "X"}'
+
+
+def finance_aligned_short_forecast_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _FINANCE_META.finance_mse_metaprompt_generation(
+            text=sample.text,
+            prices=_input_prices(sample),
+            start_datetime=_finance_ts_string(sample.timestamps[0]),
+            end_datetime=_finance_ts_string(sample.timestamps[-1]),
+            pred_end_datetime=_output_ts_string(sample),
+            granularity=_finance_granularity(sample),
+            prediction_length=len(_output_prices(sample)),
+            mode="combined",
+        )
     )
-    return sys, user
+
+
+def finance_aligned_long_forecast_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _FINANCE_META.finance_mse_metaprompt_generation(
+            text=sample.text,
+            prices=_input_prices(sample),
+            start_datetime=_finance_ts_string(sample.timestamps[0]),
+            end_datetime=_finance_ts_string(sample.timestamps[-1]),
+            pred_end_datetime=_output_ts_string(sample),
+            granularity=_finance_granularity(sample),
+            prediction_length=len(_output_prices(sample)),
+            mode="combined",
+        )
+    )
+
+
+def finance_aligned_short_trend_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    timestamp_strings = [_finance_ts_string(ts) for ts in sample.timestamps]
+    prompt = _FINANCE_META.finance_classification_metaprompt_generation(
+        text=sample.text,
+        timestamps=timestamp_strings,
+        prices=_input_prices(sample),
+        mode="combined",
+    )
+    prompt = prompt.replace(
+        "1-hour intervals over the last month",
+        "5-minute intervals over the last week",
+    )
+    return _prompt(prompt)
+
+
+def finance_aligned_long_trend_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    timestamp_strings = [_finance_ts_string(ts) for ts in sample.timestamps]
+    return _prompt(
+        _FINANCE_META.finance_classification_metaprompt_generation(
+            text=sample.text,
+            timestamps=timestamp_strings,
+            prices=_input_prices(sample),
+            mode="combined",
+        )
+    )
+
+
+def finance_aligned_short_indicator_macd_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    out_macd = _indicator_series(sample, "out_macd")
+    return _prompt(
+        _FINANCE_META.finance_macd_metaprompt_generation(
+            text=sample.text,
+            prices=_input_prices(sample),
+            start_datetime=_finance_ts_string(sample.timestamps[0]),
+            end_datetime=_finance_ts_string(sample.timestamps[-1]),
+            pred_end_datetime=_output_ts_string(sample),
+            granularity=_finance_granularity(sample),
+            prediction_length=len(out_macd),
+            mode="combined",
+        )
+    )
+
+
+def finance_aligned_short_indicator_upper_bb_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    out_bb = _indicator_series(sample, "out_upper_bb")
+    return _prompt(
+        _FINANCE_META.finance_bb_metaprompt_generation(
+            text=sample.text,
+            prices=_input_prices(sample),
+            start_datetime=_finance_ts_string(sample.timestamps[0]),
+            end_datetime=_finance_ts_string(sample.timestamps[-1]),
+            pred_end_datetime=_output_ts_string(sample),
+            granularity=_finance_granularity(sample),
+            prediction_length=len(out_bb),
+            mode="combined",
+        )
+    )
+
+
+def finance_aligned_long_indicator_macd_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    out_macd = _indicator_series(sample, "out_macd")
+    return _prompt(
+        _FINANCE_META.finance_macd_metaprompt_generation(
+            text=sample.text,
+            prices=_input_prices(sample),
+            start_datetime=_finance_ts_string(sample.timestamps[0]),
+            end_datetime=_finance_ts_string(sample.timestamps[-1]),
+            pred_end_datetime=_output_ts_string(sample),
+            granularity=_finance_granularity(sample),
+            prediction_length=len(out_macd),
+            mode="combined",
+        )
+    )
+
+
+def finance_aligned_long_indicator_upper_bb_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    out_bb = _indicator_series(sample, "out_upper_bb")
+    return _prompt(
+        _FINANCE_META.finance_bb_metaprompt_generation(
+            text=sample.text,
+            prices=_input_prices(sample),
+            start_datetime=_finance_ts_string(sample.timestamps[0]),
+            end_datetime=_finance_ts_string(sample.timestamps[-1]),
+            pred_end_datetime=_output_ts_string(sample),
+            granularity=_finance_granularity(sample),
+            prediction_length=len(out_bb),
+            mode="combined",
+        )
+    )
+
+
+def finance_qa_short_mcqa_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _FINANCE_META.finance_mcqa_metaprompt_generation(
+            setting="short",
+            sticker=str(sample.metadata.get("sticker", "")),
+            time1=_finance_ts_object(sample.timestamps[0]),
+            time2=_finance_ts_object(sample.timestamps[-1]),
+            in_price=_input_prices(sample),
+            news=sample.text,
+            time_news=sample.metadata.get("published_utc"),
+            question=sample.question or "",
+        )
+    )
+
+
+def finance_qa_long_mcqa_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _FINANCE_META.finance_mcqa_metaprompt_generation(
+            setting="long",
+            sticker=str(sample.metadata.get("sticker", "")),
+            time1=_finance_ts_object(sample.timestamps[0]),
+            time2=_finance_ts_object(sample.timestamps[-1]),
+            in_price=_input_prices(sample),
+            news=sample.text,
+            time_news=sample.metadata.get("published_utc"),
+            question=sample.question or "",
+        )
+    )
+
+
+def finance_qa_short_correlation_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _FINANCE_META.finance_correlation_metaprompt_generation(
+            setting="short",
+            sticker=str(sample.metadata.get("sticker", "")),
+            time1=_finance_ts_object(sample.timestamps[0]),
+            time2=_finance_ts_object(sample.timestamps[-1]),
+            in_price=_input_prices(sample),
+            news=sample.text,
+            time_news=sample.metadata.get("published_utc"),
+        )
+    )
+
+
+def finance_qa_long_correlation_prompt(sample: "MTBenchSample") -> tuple[str, str]:
+    return _prompt(
+        _FINANCE_META.finance_correlation_metaprompt_generation(
+            setting="long",
+            sticker=str(sample.metadata.get("sticker", "")),
+            time1=_finance_ts_object(sample.timestamps[0]),
+            time2=_finance_ts_object(sample.timestamps[-1]),
+            in_price=_input_prices(sample),
+            news=sample.text,
+            time_news=sample.metadata.get("published_utc"),
+        )
+    )
+
+
+_PROMPT_BUILDERS: dict[tuple[str, str], Any] = {
+    ("weather_aligned_short", "forecast"): weather_aligned_short_forecast_prompt,
+    ("weather_aligned_long", "forecast"): weather_aligned_long_forecast_prompt,
+    ("weather_aligned_short", "trend"): weather_aligned_short_trend_prompt,
+    ("weather_aligned_long", "trend"): weather_aligned_long_trend_prompt,
+    ("weather_aligned_short", "trend_past"): weather_aligned_short_trend_past_prompt,
+    ("weather_aligned_long", "trend_past"): weather_aligned_long_trend_past_prompt,
+    ("weather_aligned_short", "indicator"): weather_aligned_short_indicator_prompt,
+    ("weather_aligned_long", "indicator"): weather_aligned_long_indicator_prompt,
+    ("weather_qa_short", "mcqa"): weather_qa_short_mcqa_prompt,
+    ("weather_qa_long", "forecast"): weather_qa_long_forecast_prompt,
+    ("weather_qa_long", "mcqa"): weather_qa_long_mcqa_prompt,
+    ("finance_aligned_short", "forecast"): finance_aligned_short_forecast_prompt,
+    ("finance_aligned_long", "forecast"): finance_aligned_long_forecast_prompt,
+    ("finance_aligned_short", "trend"): finance_aligned_short_trend_prompt,
+    ("finance_aligned_long", "trend"): finance_aligned_long_trend_prompt,
+    ("finance_aligned_short", "indicator_macd"): finance_aligned_short_indicator_macd_prompt,
+    ("finance_aligned_short", "indicator_upper_bb"): finance_aligned_short_indicator_upper_bb_prompt,
+    ("finance_aligned_long", "indicator_macd"): finance_aligned_long_indicator_macd_prompt,
+    ("finance_aligned_long", "indicator_upper_bb"): finance_aligned_long_indicator_upper_bb_prompt,
+    ("finance_qa_short", "mcqa"): finance_qa_short_mcqa_prompt,
+    ("finance_qa_long", "mcqa"): finance_qa_long_mcqa_prompt,
+    ("finance_qa_short", "correlation"): finance_qa_short_correlation_prompt,
+    ("finance_qa_long", "correlation"): finance_qa_long_correlation_prompt,
+}
+
+
+def build_prompt(sample: "MTBenchSample", task: str) -> tuple[str, str]:
+    if sample.domain == "finance" and task == "indicator":
+        parts: list[str] = []
+        if sample.labels.get("out_macd") is not None:
+            parts.append(build_prompt(sample, "indicator_macd")[1])
+        if sample.labels.get("out_upper_bb") is not None:
+            parts.append(build_prompt(sample, "indicator_upper_bb")[1])
+        if parts:
+            return "", "\n\n---\n\n".join(parts)
+
+    builder = _PROMPT_BUILDERS.get((sample.dataset, task))
+    if builder is None:
+        raise KeyError(f"Unsupported MTBench prompt mapping: dataset={sample.dataset}, task={task}")
+    return builder(sample)
+
+
+def append_tool_analysis(user_prompt: str, analysis: str) -> str:
+    if not analysis.strip():
+        return user_prompt
+    return (
+        f"{user_prompt}\n\n"
+        "Additional TimeClaw tool analysis (not part of the original MTBench prompt):\n"
+        f"{analysis}\n\n"
+        "Follow the original MTBench task instructions and output format exactly."
+    )
+
+
+def prompt_messages(system_prompt: str, user_prompt: str) -> list[dict[str, str]]:
+    if system_prompt.strip():
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+    return [{"role": "user", "content": user_prompt}]
+
+
+def parse_weather_forecast_output(text: str) -> list[float] | None:
+    try:
+        return list(_WEATHER_META.decode_temperature_forecast(text))
+    except Exception:
+        return None
+
+
+def parse_weather_trend_output(text: str) -> str | None:
+    try:
+        return str(_WEATHER_META.decode_temperature_trend_prediction(text))
+    except Exception:
+        return None
+
+
+def parse_weather_indicator_output(text: str) -> dict[str, float] | None:
+    try:
+        max_temp, min_temp, diff_temp = _WEATHER_META.decode_temperature_indicator(text)
+    except Exception:
+        return None
+    return {"max": float(max_temp), "min": float(min_temp), "diff": float(diff_temp)}
+
+
+def parse_finance_value_output(text: str) -> list[float] | None:
+    try:
+        values = _FINANCE_META.parse_val_prediction_response(text)
+    except Exception:
+        return None
+    return list(values) if values is not None else None
+
+
+def parse_finance_trend_output(text: str) -> str | None:
+    try:
+        return str(_FINANCE_META.parse_cls_response(text))
+    except Exception:
+        return None
+
+
+def extract_mcqa_letter(text: str) -> str:
+    stripped = text.strip()
+    if stripped[:1].upper() in {"A", "B", "C", "D"}:
+        return stripped[:1].upper()
+    match = re.search(r"\b([A-D])\b", stripped, re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
+def weather_indicator_horizon_hours(output_window: np.ndarray | list[float]) -> int:
+    arr = np.asarray(output_window, dtype=np.float64).ravel()
+    if arr.size == 0:
+        return 0
+    return min(arr.size, 24)
+
+
+def weather_indicator_ground_truth(output_window: np.ndarray | list[float]) -> dict[str, float]:
+    arr = np.asarray(output_window, dtype=np.float64).ravel()
+    horizon = weather_indicator_horizon_hours(arr)
+    if horizon <= 0:
+        return {"max": 0.0, "min": 0.0, "diff": 0.0}
+    return _EVAL_UTILS.get_temperature_diff_max_min(arr[:horizon].tolist())

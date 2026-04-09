@@ -23,9 +23,10 @@ class ModelRouter:
             return self._backends[role]
 
         model = self._resolve_model(role)
+        effective_fallback = self.config.fallback if self.config.allow_fallback else None
         backend = LLMBackend(
             default_model=model,
-            fallback_model=self.config.fallback,
+            fallback_model=effective_fallback,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
             max_retries=self.config.max_retries,
@@ -37,7 +38,10 @@ class ModelRouter:
             azure_api_version=self.config.azure_api_version,
         )
         self._backends[role] = backend
-        logger.info(f"Router: {role} -> {model} (fallback: {self.config.fallback})")
+        logger.info(
+            f"Router: {role} -> {model} "
+            f"(fallback: {effective_fallback if effective_fallback else '(disabled)'})"
+        )
         return backend
 
     def get_text_backends(self) -> dict[str, LLMBackend] | None:
@@ -74,6 +78,7 @@ class ModelRouter:
             "executor": models.executor,
             "reasoner": models.reasoner,
             "fallback": self.config.fallback or "(none)",
+            "fallback_enabled": "true" if self.config.allow_fallback else "false",
         }
         if models.text_light:
             assignments["text_light"] = models.text_light

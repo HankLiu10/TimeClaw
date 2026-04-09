@@ -1,4 +1,4 @@
-"""Evidence iteration reasoning engine for fallback tool execution."""
+"""Evidence iteration reasoning engine for explicit tool execution."""
 
 from __future__ import annotations
 
@@ -126,36 +126,36 @@ class EvidenceIterator:
             {"role": "user", "content": sections["user"]},
         ]
         response = await self.llm.complete(messages, response_format="json")
-        return response.parsed or {"done": True}
+        parsed = response.parsed if isinstance(response.parsed, dict) else None
+        if parsed is None:
+            raise ValueError("Evidence iterator LLM returned invalid JSON")
+        return parsed
 
     async def _act(
         self, tool_name: str, tool_args: dict[str, Any], context: dict[str, Any]
     ) -> Any:
         """Execute a tool and return the observation, passing multimodal data."""
         if not tool_name:
-            return None
+            raise ValueError("Evidence iterator did not select a tool")
         tool = self.tools.get(tool_name)
         if tool is None:
-            logger.warning(f"Tool '{tool_name}' not found, returning None")
-            return None
-        try:
-            ts_data = context.get("data")
-            text_data = context.get("text_data")
-            images = context.get("images")
-            safe_args = {
-                k: v for k, v in tool_args.items()
-                if k not in ("text", "images", "llm", "ts_data")
-            }
-            result = await tool.execute(
-                ts_data, text=text_data, images=images, llm=self.llm, **safe_args
-            )
-            status = "PASS" if result.success else f"FAIL | {result.error}"
-            logger.info(f"[Reasoning] {tool_name}: {status}")
-            trace.tool_exec("reasoning", tool_name, tool_args, result)
-            return result
-        except Exception as e:
-            logger.error(f"[Reasoning] Tool '{tool_name}' failed: {e}")
-            return {"error": str(e)}
+            raise KeyError(f"Tool '{tool_name}' not found")
+        ts_data = context.get("data")
+        text_data = context.get("text_data")
+        images = context.get("images")
+        safe_args = {
+            k: v for k, v in tool_args.items()
+            if k not in ("text", "images", "llm", "ts_data")
+        }
+        result = await tool.execute(
+            ts_data, text=text_data, images=images, llm=self.llm, **safe_args
+        )
+        status = "PASS" if result.success else f"FAIL | {result.error}"
+        logger.info(f"[Reasoning] {tool_name}: {status}")
+        trace.tool_exec("reasoning", tool_name, tool_args, result)
+        if not result.success:
+            raise RuntimeError(f"Tool '{tool_name}' failed: {result.error}")
+        return result.data
 
     async def _critic(
         self,
@@ -189,5 +189,4 @@ class EvidenceIterator:
         ]
         response = await self.llm.complete(messages)
         return response.text or ""
-
 

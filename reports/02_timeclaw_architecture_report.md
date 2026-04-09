@@ -254,10 +254,10 @@ ToolResult 包含 success, data, metadata, error。
 | ensemble_forecast | 集成预测 |
 | checkpoint_forecast | 领域特定检查点预测 |
 | llm_indicator | LLM 推理型指标/预测工具 |
-| timesfm_forecast | TimesFM 基础模型预测 |
-| chronos_forecast | Chronos 基础模型预测 |
-| timer_forecast | Timer 基础模型预测 |
-| moirai_forecast | Moirai 基础模型预测 |
+| timesfm2_forecast | TimesFM 基础模型预测 |
+| chronos2_forecast | Chronos 基础模型预测 |
+| sundial_base_128m_forecast | Sundial 基础模型预测 |
+| moirai1_1_r_base_forecast | Moirai 基础模型预测 |
 
 #### 验证 (Validation) - 5 个
 

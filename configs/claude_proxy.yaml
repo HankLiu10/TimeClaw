@@ -64,7 +64,7 @@ benchmark:
 sbm:
   device: "cuda:2"
   devices:
-    chronos: "cuda:2"
-    timesfm: "cuda:2"
-    moirai: "cuda:3"
-    timer: "cuda:3"
+    chronos2: "cuda:2"
+    timesfm2: "cuda:2"
+    moirai1_1_r_base: "cuda:3"
+    sundial_base_128m: "cuda:3"

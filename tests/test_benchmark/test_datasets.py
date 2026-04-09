@@ -37,6 +37,6 @@ def test_load_qa(loader):
     assert len(ds["questions"]) > 0
 
 
-def test_load_standard_fallback(loader):
-    ds = loader.load("nonexistent_dataset")
-    assert ds["source"] == "synthetic"
+def test_load_standard_missing_dataset_raises(loader):
+    with pytest.raises(FileNotFoundError):
+        loader.load("nonexistent_dataset")

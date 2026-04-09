@@ -336,7 +336,15 @@ class ReasonerAgent(AgentBase):
                 },
             ]
             response = await self.llm.complete(messages, response_format="json")
-            parsed = response.parsed or {}
+            parsed = response.parsed if isinstance(response.parsed, dict) else {}
+            if not parsed:
+                return {
+                    "name": "cross_modal_consistency",
+                    "passed": False,
+                    "details": "cross-modal checker returned invalid JSON",
+                    "reasoning": "",
+                    "event_assessment": [],
+                }
             consistent = parsed.get("consistent", True)
             conflicts = parsed.get("conflicts", [])
 
@@ -354,8 +362,8 @@ class ReasonerAgent(AgentBase):
             self._last_event_assessment = []
             return {
                 "name": "cross_modal_consistency",
-                "passed": True,
-                "details": f"check skipped: {e}",
+                "passed": False,
+                "details": f"check failed: {e}",
             }
 
     # ── Re-analysis Decision ──
@@ -400,7 +408,15 @@ class ReasonerAgent(AgentBase):
                 },
             ]
             response = await self.llm.complete(messages, response_format="json")
-            return response.parsed or {"should_reanalyze": False, "reasoning": "parse failed"}
+            parsed = response.parsed if isinstance(response.parsed, dict) else None
+            if parsed is None:
+                return {
+                    "should_reanalyze": False,
+                    "modalities_to_reanalyze": [],
+                    "suggested_tools": [],
+                    "reasoning": "re-analysis decision returned invalid JSON",
+                }
+            return parsed
         except Exception as e:
             logger.warning(f"[Reasoner] Re-analysis decision failed: {e}")
             return {"should_reanalyze": False, "reasoning": f"decision failed: {e}"}
@@ -457,7 +473,7 @@ class ReasonerAgent(AgentBase):
             for td in text_data[:10]:
                 content = td.get("content", td.get("text", ""))
                 source = td.get("source", "unknown")
-                text_context += f"\n[{source}]: {str(content)[:10000]}\n"
+                text_context += f"\n[{source}]: {str(content)}\n"
 
         assessment_block = ""
         if self._last_event_assessment:
@@ -687,14 +703,20 @@ class ReasonerAgent(AgentBase):
                         f"Task: {envelope.task.task_type}\n"
                         f"Prediction: {pred_str}\n"
                         f"{hist_summary}\n"
-                        f"Check results: {str(checks)[:10000]}\n"
+                        f"Check results: {str(checks)}\n"
                         f"Constraints: {str(envelope.task.constraints)}\n\n"
                         "Is this prediction acceptable? Return JSON with 'accepted' (bool) and 'reasoning'."
                     ),
                 },
             ]
             response = await self.llm.complete(messages, response_format="json")
-            return response.parsed or {"accepted": True, "reasoning": "LLM review passed"}
+            parsed = response.parsed if isinstance(response.parsed, dict) else None
+            if parsed is None or "accepted" not in parsed:
+                return {"accepted": False, "reasoning": "LLM verify returned invalid JSON"}
+            return {
+                "accepted": bool(parsed.get("accepted")),
+                "reasoning": str(parsed.get("reasoning", "")),
+            }
         except Exception as e:
             logger.warning(f"[Reasoner] LLM verify failed: {e}")
-            return {"accepted": True, "reasoning": f"LLM verify skipped: {e}"}
+            return {"accepted": False, "reasoning": f"LLM verify failed: {e}"}

@@ -41,7 +41,7 @@ Each turn, you see the results of all previous steps. You then decide:
 
 ## CRITICAL — Task-specific requirements
 - **forecast**: You MUST call at least one *_forecast tool (arima_forecast, ets_forecast,
-  chronos_forecast, moirai_forecast, timesfm_forecast, timer_forecast, prophet_forecast, ensemble_forecast) to produce a numeric prediction.
+  chronos2_forecast, moirai1_1_r_base_forecast, timesfm2_forecast, sundial_base_128m_forecast, prophet_forecast, ensemble_forecast) to produce a numeric prediction.
   Decomposition and detection tools alone are NOT sufficient — they are preprocessing
   steps that should INFORM your choice of forecast tool. Do NOT declare done until
   you have a forecast result.
@@ -80,7 +80,7 @@ When done:
 
 ## 关键——任务特定要求
 - **forecast(预测)**：你必须至少调用一个 *_forecast 工具（arima_forecast、ets_forecast、
-  chronos_forecast、moirai_forecast、timesfm_forecast、timer_forecast、prophet_forecast、ensemble_forecast）来生成数值预测。
+  chronos2_forecast、moirai1_1_r_base_forecast、timesfm2_forecast、sundial_base_128m_forecast、prophet_forecast、ensemble_forecast）来生成数值预测。
   仅使用分解和检测工具是不够的——它们是预处理步骤，用来为你选择预测工具提供信息。
   获得预测结果之前不要声明 done。
 - **anomaly(异常)**：你必须至少调用一个检测工具（detect_anomaly、detect_changepoint 等）。

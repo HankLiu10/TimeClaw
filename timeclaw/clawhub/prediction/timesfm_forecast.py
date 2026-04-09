@@ -1,4 +1,4 @@
-"""TimesFM forecast tool — Google's decoder-only transformer foundation model."""
+"""TimesFM 2.0 forecast tool — Google's decoder-only transformer foundation model."""
 
 from __future__ import annotations
 
@@ -13,33 +13,25 @@ from timeclaw.clawhub.tool_base import ClawTool, ToolCategory, ToolIOType
 _load_lock = threading.Lock()
 
 
-def _statistical_fallback(ts_data: Any, horizon: int) -> dict[str, Any]:
-    arr = np.asarray(ts_data, dtype=np.float32).ravel()
-    if len(arr) < 2:
-        forecast = np.full(horizon, arr[-1] if len(arr) > 0 else 0.0)
-    else:
-        trend = (arr[-1] - arr[-min(10, len(arr))]) / min(10, len(arr))
-        forecast = arr[-1] + trend * np.arange(1, horizon + 1)
-    return {"model": "timesfm_fallback", "horizon": horizon, "point_forecast": forecast.tolist()}
-
-
 def _run_timesfm(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str, Any]:
-    from timeclaw.sbm.registry import get_global_registry, auto_register
+    from timeclaw.sbm.registry import configured_default_config, get_global_registry
 
     registry = get_global_registry()
-    if "timesfm" not in registry.list_available():
+    if "timesfm2" not in registry.list_available():
         try:
             from timeclaw.sbm.timesfm_adapter import TimesFMAdapter, TIMESFM_DEFAULT_CONFIG
-            registry.register("timesfm", TimesFMAdapter, TIMESFM_DEFAULT_CONFIG)
+            registry.register(
+                "timesfm2",
+                TimesFMAdapter,
+                configured_default_config("timesfm2", TIMESFM_DEFAULT_CONFIG),
+            )
         except ImportError:
-            logger.warning("[timesfm_forecast] timesfm not installed")
-            return _statistical_fallback(ts_data, horizon)
+            raise RuntimeError("timesfm2 not installed")
 
     try:
-        adapter = registry.get("timesfm")
+        adapter = registry.get("timesfm2")
     except KeyError:
-        logger.warning("[timesfm_forecast] adapter not available")
-        return _statistical_fallback(ts_data, horizon)
+        raise RuntimeError("timesfm2 adapter not available")
 
     context = np.asarray(ts_data, dtype=np.float32)
     if context.ndim == 0:
@@ -50,17 +42,15 @@ def _run_timesfm(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str,
             if not adapter.is_loaded:
                 try:
                     adapter.load()
-                    logger.info("[timesfm_forecast] model loaded")
+                    logger.info("[timesfm2_forecast] model loaded")
                 except Exception as e:
-                    logger.error(f"[timesfm_forecast] load failed: {e}")
-                    result = _statistical_fallback(ts_data, horizon)
-                    result["model_error"] = f"load failed: {e}"
-                    return result
+                    logger.error(f"[timesfm2_forecast] load failed: {e}")
+                    raise RuntimeError(f"timesfm load failed: {e}") from e
 
     try:
         output = adapter.forecast(context, prediction_length=horizon, num_samples=num_samples)
         result: dict[str, Any] = {
-            "model": "timesfm",
+            "model": "timesfm-2.0-500m-pytorch",
             "horizon": horizon,
             "point_forecast": output.point_forecast.tolist() if output.point_forecast is not None else None,
         }
@@ -68,10 +58,8 @@ def _run_timesfm(ts_data: Any, horizon: int, num_samples: int = 20) -> dict[str,
             result["quantiles"] = {str(q): v.tolist() for q, v in output.quantile_forecast.items()}
         return result
     except Exception as e:
-        logger.error(f"[timesfm_forecast] inference failed: {e}")
-        result = _statistical_fallback(ts_data, horizon)
-        result["model_error"] = str(e)
-        return result
+        logger.error(f"[timesfm2_forecast] inference failed: {e}")
+        raise RuntimeError(f"timesfm inference failed: {e}") from e
 
 
 _PARAM_SCHEMA: dict[str, Any] = {
@@ -84,16 +72,16 @@ _PARAM_SCHEMA: dict[str, Any] = {
 
 
 class TimesFMForecastTool(ClawTool):
-    name: str = "timesfm_forecast"
+    name: str = "timesfm2_forecast"
     category: ToolCategory = ToolCategory.PREDICTION
     description: str = (
-        "Forecast a univariate time series using Google TimesFM, a decoder-only transformer foundation model "
-        "pre-trained on 100 billion real-world time points. "
+        "Forecast a univariate time series using Google TimesFM 2.0 "
+        "(`google/timesfm-2.0-500m-pytorch`). "
         "Input: 1-D numeric array. "
         "Output: dict with 'point_forecast' (array), 'horizon', 'model', and optional 'quantiles' for uncertainty. "
         "Strengths: captures long-range dependencies and multi-scale patterns without fine-tuning; "
         "best for medium to long series (200+ points). Runs on GPU. "
-        "Falls back to a linear-trend statistical forecast if the model server is unavailable. "
+        "Fails explicitly if TimesFM 2.0 is unavailable. "
         "Key params: 'horizon' (steps ahead, default 96)."
     )
     io_type: ToolIOType = ToolIOType.X_TO_X

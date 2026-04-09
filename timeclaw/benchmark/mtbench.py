@@ -149,7 +149,7 @@ class MTBenchRunner:
             lines.append(sep)
 
             for r in task_results:
-                vals = [f"{r.metrics.get(m, '-'):.4f}" if isinstance(r.metrics.get(m), float) else str(r.metrics.get(m, "-")) for m in metric_cols]
+                vals = [f"{r.metrics.get(m, '-'):.3f}" if isinstance(r.metrics.get(m), float) else str(r.metrics.get(m, "-")) for m in metric_cols]
                 lines.append(f"| {r.model_name} | " + " | ".join(vals) + " |")
 
             lines.append("")
@@ -185,7 +185,7 @@ class MTBenchRunner:
 
             for r in task_results:
                 vals = [
-                    f"{r.metrics.get(m, 0):.4f}" if isinstance(r.metrics.get(m), float) else str(r.metrics.get(m, "-"))
+                    f"{r.metrics.get(m, 0):.3f}" if isinstance(r.metrics.get(m), float) else str(r.metrics.get(m, "-"))
                     for m in metric_cols
                 ]
                 lines.append(f"{r.model_name} & " + " & ".join(vals) + " \\\\")

@@ -17,7 +17,9 @@ class AutocorrelationTool(ClawTool):
         "at specified lags. Useful for identifying temporal dependencies and model order selection. "
         "Returns a dict with lag values and correlation coefficients (keys: acf, acf_lags, pacf, pacf_lags). "
         "Use to identify AR/MA order for ARIMA modeling or to detect periodicity in the series. "
-        "Key parameters: max_lag (int, default 20), mode ('acf', 'pacf', or 'both', default 'both')."
+        "Key parameters: max_lag (int, default 20), mode ('acf', 'pacf', or 'both', default 'both'). "
+        "CRITICAL: when PACF is requested, valid lag is more restrictive on short series; keep max_lag "
+        "well below half the available series length, and prefer smaller values such as 5 or 10 on short windows."
     )
     io_type = ToolIOType.X_TO_R
     parameters_schema = {
@@ -42,6 +44,10 @@ class AutocorrelationTool(ClawTool):
         arr = arr[~np.isnan(arr)]
         n = len(arr)
         max_lag = min(max_lag, n - 1)
+        if mode in ("pacf", "both"):
+            # statsmodels PACF requires nlags < floor(n / 2) on short series.
+            pacf_cap = max(0, (n // 2) - 1)
+            max_lag = min(max_lag, pacf_cap)
 
         result: dict[str, Any] = {}
 

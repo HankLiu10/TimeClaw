@@ -40,6 +40,37 @@ class StationarityTool(ClawTool):
         arr = np.asarray(ts_data, dtype=float).flatten()
         arr = arr[~np.isnan(arr)]
 
+        if arr.size == 0:
+            raise ValueError("stationarity_test requires at least one non-NaN value")
+
+        if np.allclose(arr, arr[0]):
+            constant_result = {
+                "is_constant": True,
+                "constant_value": float(arr[0]),
+                "n_obs": int(arr.size),
+                "conclusion": "constant_stationary",
+            }
+            if test in ("adf", "both"):
+                constant_result["adf"] = {
+                    "statistic": None,
+                    "p_value": None,
+                    "used_lag": 0,
+                    "n_obs": int(arr.size),
+                    "critical_values": {},
+                    "is_stationary": True,
+                    "note": "ADF is undefined for a constant series.",
+                }
+            if test in ("kpss", "both"):
+                constant_result["kpss"] = {
+                    "statistic": None,
+                    "p_value": None,
+                    "used_lag": 0,
+                    "critical_values": {},
+                    "is_stationary": True,
+                    "note": "KPSS is undefined for a constant series.",
+                }
+            return constant_result
+
         result: dict[str, Any] = {}
 
         if test in ("adf", "both"):

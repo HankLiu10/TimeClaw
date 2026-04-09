@@ -1,12 +1,12 @@
 """SBM Model Server: serves all time-series foundation models via HTTP.
 
-Loads Chronos, Moirai, TimesFM, Timer onto GPU at startup.
+Loads Chronos-2, Moirai 1.1 R-base, TimesFM 2.0, Sundial Base 128M, and optionally Aurora onto GPU at startup.
 Exposes /forecast endpoint for high-throughput concurrent access.
 
 Usage:
     python -m timeclaw.sbm.server                  # default port 8100
     python -m timeclaw.sbm.server --port 8100 --gpu 0
-    python -m timeclaw.sbm.server --models chronos,timer
+    python -m timeclaw.sbm.server --models chronos2,sundial_base_128m
 """
 
 from __future__ import annotations
@@ -28,21 +28,25 @@ from timeclaw.sbm.base import SBMConfig
 from timeclaw.sbm.registry import SBMRegistry
 
 MODEL_CONFIGS: dict[str, dict[str, Any]] = {
-    "chronos": {
+    "chronos2": {
         "cls": "timeclaw.sbm.chronos_adapter.ChronosAdapter",
         "default_cfg": "timeclaw.sbm.chronos_adapter.CHRONOS_DEFAULT_CONFIG",
     },
-    "moirai": {
+    "moirai1_1_r_base": {
         "cls": "timeclaw.sbm.moirai_adapter.MoiraiAdapter",
         "default_cfg": "timeclaw.sbm.moirai_adapter.MOIRAI_DEFAULT_CONFIG",
     },
-    "timesfm": {
+    "timesfm2": {
         "cls": "timeclaw.sbm.timesfm_adapter.TimesFMAdapter",
         "default_cfg": "timeclaw.sbm.timesfm_adapter.TIMESFM_DEFAULT_CONFIG",
     },
-    "timer": {
+    "sundial_base_128m": {
         "cls": "timeclaw.sbm.timer_adapter.TimerAdapter",
         "default_cfg": "timeclaw.sbm.timer_adapter.TIMER_DEFAULT_CONFIG",
+    },
+    "aurora": {
+        "cls": "timeclaw.sbm.aurora_adapter.AuroraAdapter",
+        "default_cfg": "timeclaw.sbm.aurora_adapter.AURORA_DEFAULT_CONFIG",
     },
 }
 
@@ -117,7 +121,7 @@ def create_app(model_names: list[str], device: str = "cuda") -> FastAPI:
 
     app = FastAPI(
         title="TimeClaw SBM Model Server",
-        description="Serves time-series foundation models (Chronos, Moirai, TimesFM, Timer)",
+        description="Serves time-series foundation models (Chronos-2, Moirai 1.1 R-base, TimesFM 2.0, Sundial Base 128M, Aurora)",
         lifespan=lifespan,
     )
 
@@ -136,7 +140,7 @@ def create_app(model_names: list[str], device: str = "cuda") -> FastAPI:
             loaded = registry.list_loaded()
             if not loaded:
                 raise HTTPException(500, "No models loaded")
-            for pref in ["chronos", "moirai", "timesfm", "timer"]:
+            for pref in ["chronos2", "moirai1_1_r_base", "timesfm2", "sundial_base_128m"]:
                 if pref in loaded:
                     model_name = pref
                     break
@@ -205,7 +209,7 @@ def main():
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--gpu", type=int, default=0, help="GPU device index")
-    parser.add_argument("--models", type=str, default="chronos,moirai,timesfm,timer",
+    parser.add_argument("--models", type=str, default="chronos2,moirai1_1_r_base,timesfm2,sundial_base_128m",
                         help="Comma-separated model names to load")
     parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
