@@ -352,10 +352,6 @@ class LLMBackend:
             "temperature": kwargs.get("temperature", self.temperature),
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
         }
-        if "tool_choice" in kwargs:
-            oai_kwargs["tool_choice"] = kwargs["tool_choice"]
-        if "parallel_tool_calls" in kwargs:
-            oai_kwargs["parallel_tool_calls"] = kwargs["parallel_tool_calls"]
 
         for attempt in range(_MAX_RETRIES):
             try:
