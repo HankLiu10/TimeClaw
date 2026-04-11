@@ -33,3 +33,26 @@ def select_samples_by_index(
         if 0 <= idx < len(samples):
             selected.append(samples[idx])
     return selected
+
+
+def select_samples_with_original_indices(
+    samples: list[Any],
+    dataset_name: str,
+    sample_indices: dict[str, list[int]] | None,
+) -> list[tuple[int, Any]]:
+    """Apply index-based sample selection while preserving original indices.
+
+    New definition:
+        - The returned integer is always the index in the original
+          ``load_split`` output, not the position inside the filtered subset.
+        - This is required when checkpoints key results by original
+          ``(sample_idx, task)`` pairs.
+    """
+    if not sample_indices or dataset_name not in sample_indices:
+        return list(enumerate(samples))
+
+    selected: list[tuple[int, Any]] = []
+    for idx in sample_indices[dataset_name]:
+        if 0 <= idx < len(samples):
+            selected.append((idx, samples[idx]))
+    return selected

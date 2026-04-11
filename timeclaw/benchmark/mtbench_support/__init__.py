@@ -11,6 +11,7 @@ from timeclaw.benchmark.mtbench_support.learning_analysis import (
 from timeclaw.benchmark.mtbench_support.sample_selection import (
     load_sample_indices,
     select_samples_by_index,
+    select_samples_with_original_indices,
 )
 from timeclaw.benchmark.mtbench_support.scope_keys import (
     expand_dataset_tasks,
@@ -26,4 +27,5 @@ __all__ = [
     "render_learning_analysis_text",
     "scope_keys_for_dataset_task",
     "select_samples_by_index",
+    "select_samples_with_original_indices",
 ]

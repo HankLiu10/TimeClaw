@@ -1,7 +1,9 @@
-from timeclaw.pipeline.runner import PipelineRunner
-from timeclaw.memory.hierarchical import Notes
-from timeclaw.agents.executor import ExecutorAgent
 import pytest
+import numpy as np
+
+from timeclaw.agents.executor import ExecutorAgent
+from timeclaw.memory.hierarchical import Notes
+from timeclaw.pipeline.runner import PipelineRunner
 
 
 def test_learning_outcome_correct_uses_explicit_boolean_for_labels():
@@ -211,6 +213,93 @@ async def test_save_learning_outcome_records_winner_prediction_not_learning_summ
 
     assert runner.memory.kwargs is not None
     assert runner.memory.kwargs["predicted"] == "[1.0, 2.0]"
+
+
+@pytest.mark.asyncio
+async def test_save_learning_outcome_prefers_explicit_reasoned_winner_over_best_metrics():
+    runner = PipelineRunner(disable_memory=True)
+
+    class _MemoryStub:
+        def __init__(self):
+            self.kwargs = None
+
+        async def record(self, **kwargs):
+            self.kwargs = kwargs
+
+    runner.memory = _MemoryStub()
+
+    raw_answer = {
+        "insight": (
+            "Across the explored candidates, the Prophet forecast-led branch was the best "
+            "candidate because it matched the positive regime best."
+        ),
+        "recommendation": (
+            "Prefer the Prophet-led conversion over the summarize and Aurora paths when "
+            "the winning branch stays positive from the start."
+        ),
+        "reasoning": (
+            "1. The summarize path was evaluated and rejected because it stayed negative.\n"
+            "2. Aurora improved shape realism but remained too negative early.\n"
+            "3. The Prophet path stayed positive from the start and was selected as the branch winner."
+        ),
+    }
+
+    await runner._save_learning_outcome(
+        answer_type="learning_summary",
+        raw_answer=raw_answer,
+        prediction=raw_answer,
+        execution_log=[
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": {"macd": [-0.1, -0.05]},
+                            "execution_log": [{"tool": "summarize"}, {"tool": "llm_reasoning_indicator"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": {"macd": [-0.02, 0.03]},
+                            "execution_log": [{"tool": "aurora_forecast"}, {"tool": "llm_reasoning_indicator"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": {"macd": [0.02, 0.06]},
+                            "execution_log": [{"tool": "prophet_forecast"}, {"tool": "llm_reasoning_indicator"}],
+                        },
+                    },
+                ],
+            },
+            {
+                "tool": "evaluate_against_gt",
+                "args": {"prediction": {"macd": [-0.1, -0.05]}},
+                "observation": {"metrics": {"avg_mae": 0.071}},
+            },
+        ],
+        task_type="indicator",
+        description="indicator sample",
+        domain="finance",
+        scope_keys=["finance_aligned_short_indicator_macd"],
+        reasoning=raw_answer["reasoning"],
+        fingerprint={},
+        profiling_results={},
+        horizon=None,
+        source_metadata={},
+        trace_id="trace-indicator-explicit-winner",
+    )
+
+    assert runner.memory.kwargs is not None
+    assert runner.memory.kwargs["tool_chain"] == ["prophet_forecast", "llm_reasoning_indicator"]
+    assert runner.memory.kwargs["predicted"] == "{'macd': [0.02, 0.06]}"
+    assert runner.memory.kwargs["metrics"] == {}
+    assert runner.memory.kwargs["correct"] is None
+    assert runner.memory.kwargs["pipeline_summary"]
+    assert "prophet" in runner.memory.kwargs["pipeline_summary"].lower()
 
 
 def test_extract_candidate_traces_prefers_real_names_over_approach_ids():
@@ -439,6 +528,207 @@ def test_normalize_learning_summary_answer_rewrites_conflicting_free_text_to_gt_
     assert "Moderate Positive Correlation instead of No Correlation" not in normalized["recommendation"]
     assert normalized["recommendation"].startswith("Failure pattern:")
     assert "do not trust" in normalized["recommendation"]
+
+
+def test_normalize_learning_summary_answer_uses_failure_first_insight_for_incorrect_best_candidate():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "stable",
+                        "reasoning": "The segmented daily path flattened noisy hourly variation and looked trend-neutral.",
+                        "execution_log": [{"tool": "segment"}, {"tool": "llm_reasoning_classification"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "decreasing",
+                        "reasoning": "The direct classification path emphasized the visibly cooler tail of the series.",
+                        "execution_log": [{"tool": "llm_reasoning_classification"}],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_against_gt",
+            "args": {"prediction": "stable"},
+            "observation": {"metrics": {"accuracy": 0.0, "correct": False}},
+        },
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "insight": "Both explored paths looked reasonable, but GT showed they were wrong.",
+            "recommendation": "Treat this as a failure pattern rather than a reusable win.",
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_candidate"] == "segment"
+    assert normalized["winner_prediction"] == "stable"
+    assert normalized["winner_metrics"] == {"accuracy": 0.0, "correct": False}
+    assert normalized["insight"].startswith("No correct winner on this run.")
+    assert "Winner for this run:" not in normalized["insight"]
+    assert "Why it still looked plausible:" in normalized["insight"]
+    assert normalized["recommendation"].startswith("Failure pattern:")
+
+
+def test_normalize_learning_summary_answer_prefers_explicit_reasoned_winner_over_best_metrics():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": {"macd": [-0.1, -0.05]},
+                        "execution_log": [{"tool": "summarize"}, {"tool": "llm_reasoning_indicator"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": {"macd": [-0.02, 0.03]},
+                        "execution_log": [{"tool": "aurora_forecast"}, {"tool": "llm_reasoning_indicator"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": {"macd": [0.02, 0.06]},
+                        "execution_log": [{"tool": "prophet_forecast"}, {"tool": "llm_reasoning_indicator"}],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_against_gt",
+            "args": {"prediction": {"macd": [-0.1, -0.05]}},
+            "observation": {"metrics": {"avg_mae": 0.071}},
+        },
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "insight": (
+                "Across three explored candidates, the Prophet forecast-led path was the best "
+                "candidate because it matched the positive regime best."
+            ),
+            "recommendation": (
+                "Prefer the Prophet-led conversion over the sentiment-only and Aurora paths "
+                "when the winning branch stays positive from the start."
+            ),
+            "reasoning": (
+                "1. The summarize path was evaluated and rejected because it stayed negative.\n"
+                "2. Aurora improved shape realism but remained too negative early.\n"
+                "3. The Prophet path stayed positive from the start and was selected as the branch winner."
+            ),
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_candidate"] == "prophet_forecast"
+    assert normalized["winner_prediction"] == {"macd": [0.02, 0.06]}
+    assert normalized["winner_tool_chain"] == ["prophet_forecast", "llm_reasoning_indicator"]
+    assert normalized["winner_metrics"] == {}
+    assert "Prophet forecast-led path was the best candidate" in normalized["insight"]
+
+
+def test_normalize_learning_summary_answer_matches_winner_prediction_without_broadcast_error():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": np.arange(72, dtype=float),
+                        "execution_log": [{"tool": "slice"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": [13.7, 13.5, 13.3, 13.1],
+                        "execution_log": [{"tool": "llm_reasoning_forecast"}],
+                    },
+                },
+            ],
+        }
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "insight": "The llm_reasoning_forecast candidate won.",
+            "recommendation": "Prefer the text-aware branch here.",
+            "winner_prediction": [13.7, 13.5, 13.3, 13.1],
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_candidate"] == "llm_reasoning_forecast"
+    assert normalized["winner_prediction"] == [13.7, 13.5, 13.3, 13.1]
+
+
+def test_normalize_learning_summary_answer_keeps_specific_branch_name_when_batch_eval_name_conflicts():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": [1.0, 2.0],
+                        "execution_log": [{"tool": "aurora_forecast"}],
+                        "tools_hint": ["aurora_forecast", "llm_reasoning_forecast"],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": [3.0, 4.0],
+                        "execution_log": [{"tool": "moirai1_1_r_base_forecast"}],
+                        "tools_hint": ["moirai1_1_r_base_forecast", "llm_reasoning_forecast"],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "observation": {
+                "results": [
+                    {
+                        "name": "top_level::ets_forecast",
+                        "metrics": {"mae": 0.2},
+                        "prediction": [1.0, 2.0],
+                    },
+                    {
+                        "name": "top_level::arima_forecast",
+                        "metrics": {"mae": 0.8},
+                        "prediction": [3.0, 4.0],
+                    },
+                ],
+            },
+        },
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "insight": "free text",
+            "recommendation": "free text",
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_candidate"] == "aurora_forecast"
+    assert normalized["winner_tool_chain"] == ["aurora_forecast"]
+    assert "Winner for this run: aurora_forecast" in normalized["insight"]
+    assert "using `ets_forecast`" not in normalized["insight"]
+    assert "`aurora_forecast`" in normalized["recommendation"]
 
 
 def test_normalize_learning_summary_answer_uses_candidate_reasoning_without_gt_phrasing():

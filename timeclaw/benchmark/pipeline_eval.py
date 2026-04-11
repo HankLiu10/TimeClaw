@@ -36,7 +36,7 @@ from timeclaw.benchmark.mtbench_support import (
     generate_learning_analysis,
     load_sample_indices,
     scope_keys_for_dataset_task,
-    select_samples_by_index,
+    select_samples_with_original_indices,
 )
 from timeclaw.benchmark.baseline_eval import (
     _forecast_metrics,
@@ -1292,9 +1292,9 @@ async def run_pipeline_eval(
                 logger.warning(f"[PipelineEval] No data for {ds_name}")
                 continue
 
-            samples = select_samples_by_index(samples, ds_name, sample_indices_map)
+            selected_samples = select_samples_with_original_indices(samples, ds_name, sample_indices_map)
             if max_samples:
-                samples = samples[:max_samples]
+                selected_samples = selected_samples[:max_samples]
 
             supported_tasks = expand_dataset_tasks(ds_name, list(info["tasks"]))
             if task_filter:
@@ -1306,17 +1306,17 @@ async def run_pipeline_eval(
             done_eval = _eval_done_keys(existing_eval)
 
             work_specs: list[tuple[int, MTBenchSample, str]] = []
-            for idx, sample in enumerate(samples):
+            for idx, sample in selected_samples:
                 for task in supported_tasks:
                     if merge_checkpoint and (idx, task) in done_eval:
                         continue
                     work_specs.append((idx, sample, task))
 
-            total_tasks = len(samples) * len(supported_tasks)
+            total_tasks = len(selected_samples) * len(supported_tasks)
             ptc_str = f", per_task_concurrency={per_task_concurrency}" if per_task_concurrency else ""
             ic_str = f", indicator_concurrency={indicator_concurrency}" if indicator_concurrency else ""
             logger.info(
-                f"[PipelineEval:{label}] {ds_name}: {len(samples)} samples "
+                f"[PipelineEval:{label}] {ds_name}: {len(selected_samples)} samples "
                 f"× {len(supported_tasks)} tasks = {total_tasks} evals "
                 f"({len(work_specs)} pending, {len(done_eval)} in checkpoint), "
                 f"concurrency={concurrency}{ptc_str}{ic_str}"

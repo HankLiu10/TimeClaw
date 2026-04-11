@@ -24,6 +24,31 @@ def _mock_llm_response(*args, **kwargs):
     )
 
 
+def test_pipeline_runner_uses_loaded_config_when_none_provided(monkeypatch):
+    loaded = TimeClawConfig(
+        llm=LLMConfig(
+            models=LLMModelConfig(
+                manager="loaded-manager",
+                analyzer="loaded-analyzer",
+                executor="loaded-executor",
+                reasoner="loaded-reasoner",
+                text_light="loaded-light",
+                text_heavy="loaded-heavy",
+            ),
+            fallback=None,
+        ),
+        workspace_dir="/tmp/timeclaw_loaded_cfg",
+    )
+
+    monkeypatch.setattr(TimeClawConfig, "load", classmethod(lambda cls: loaded))
+
+    runner = PipelineRunner(disable_memory=True)
+
+    assert runner.config is loaded
+    assert runner.router.get_backend("executor").default_model == "loaded-executor"
+    assert runner.router.get_backend("text_light").default_model == "loaded-light"
+
+
 @pytest.mark.asyncio
 async def test_pipeline_end_to_end():
     """Test the full 6-step pipeline with mocked LLM calls."""

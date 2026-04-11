@@ -976,7 +976,9 @@ class Notes:
         )
         if any(marker in lower for marker in banned_markers):
             return ""
-        if len(cleaned) < 12:
+        # Keep short but meaningful tool intentions such as "run ets" instead
+        # of dropping them purely due to length.
+        if len(cleaned) < 4:
             return ""
         return cleaned
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -42,7 +43,7 @@ from timeclaw.benchmark.mtbench_support import (
     expand_dataset_tasks,
     load_sample_indices,
     scope_keys_for_dataset_task,
-    select_samples_by_index,
+    select_samples_with_original_indices,
 )
 from timeclaw.core.config import TimeClawConfig
 from timeclaw.core import trace_logger as trace
@@ -247,6 +248,289 @@ def _extract_train_result_tool_chain(result: dict[str, Any]) -> list[str]:
     return []
 
 
+def _build_train_result_evidence_preview(
+    result: dict[str, Any],
+    substantive_tool_chain: list[str],
+) -> str:
+    """Build a winner-aligned evidence preview for train_results rows.
+
+    New definition:
+        ``train_results.evidence_summary_preview`` should summarize the actual
+        candidate chain that produced the recorded learning outcome, not the
+        top-level executor evidence log. This keeps the reported step count
+        aligned with ``tool_chain`` and avoids mixing framework orchestration
+        steps with the winner branch preview.
+    """
+    raw_summary = result.get("evidence_summary", "")
+    execution_log = result.get("execution_log", [])
+    raw_answer = result.get("raw_answer")
+
+    if not isinstance(execution_log, list) or not execution_log:
+        trace_preview = _build_train_result_evidence_preview_from_trace(
+            trace_id=str(result.get("trace_id") or "").strip(),
+            substantive_tool_chain=substantive_tool_chain,
+        )
+        if trace_preview:
+            return trace_preview
+        return _sanitize_learning_artifact_preview(raw_summary, limit=400)
+
+    candidate_traces = PipelineRunner._extract_candidate_traces(execution_log)
+    if not candidate_traces:
+        return _sanitize_learning_artifact_preview(raw_summary, limit=400)
+
+    exact_match = _select_train_result_preview_trace_by_chain(
+        candidate_traces,
+        substantive_tool_chain,
+    )
+    if exact_match is not None:
+        preview = _format_train_result_evidence_preview_from_steps(exact_match.get("steps"))
+        if _preview_has_substantive_step_detail(preview):
+            return preview
+        trace_preview = _build_train_result_evidence_preview_from_trace(
+            trace_id=str(result.get("trace_id") or "").strip(),
+            substantive_tool_chain=substantive_tool_chain,
+        )
+        if trace_preview:
+            return trace_preview
+        return preview
+
+    evaluated_metrics = [
+        trace.get("metrics")
+        for trace in candidate_traces
+        if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
+    ]
+    best_metrics = PipelineRunner._select_best_metrics(evaluated_metrics)
+    winner_trace, _winner_source = PipelineRunner._resolve_learning_summary_winner_trace(
+        raw_answer if isinstance(raw_answer, dict) else {},
+        candidate_traces,
+        best_metrics,
+    )
+
+    if winner_trace is None:
+        for trace in candidate_traces:
+            if not isinstance(trace, dict):
+                continue
+            trace_chain = _filter_train_result_tool_chain(trace.get("tool_chain"))
+            if trace_chain:
+                winner_trace = trace
+                break
+
+    if winner_trace is None:
+        return _sanitize_learning_artifact_preview(raw_summary, limit=400)
+
+    preview = _format_train_result_evidence_preview_from_steps(winner_trace.get("steps"))
+    if _preview_has_substantive_step_detail(preview):
+        return preview
+    trace_preview = _build_train_result_evidence_preview_from_trace(
+        trace_id=str(result.get("trace_id") or "").strip(),
+        substantive_tool_chain=substantive_tool_chain,
+    )
+    if trace_preview:
+        return trace_preview
+    return preview
+
+
+def _select_train_result_preview_trace_by_chain(
+    candidate_traces: list[dict[str, Any]],
+    substantive_tool_chain: list[str],
+) -> dict[str, Any] | None:
+    if not substantive_tool_chain:
+        return None
+    exact_matches: list[dict[str, Any]] = []
+    for trace in candidate_traces:
+        if not isinstance(trace, dict):
+            continue
+        trace_chain = _filter_train_result_tool_chain(trace.get("tool_chain"))
+        if trace_chain == substantive_tool_chain:
+            exact_matches.append(trace)
+    if not exact_matches:
+        return None
+    return max(
+        exact_matches,
+        key=lambda item: (
+            len(item.get("steps") or []),
+            len(_filter_train_result_tool_chain(item.get("tool_chain"))),
+        ),
+    )
+
+
+def _format_train_result_evidence_preview_from_steps(steps: Any) -> str:
+    step_list = steps if isinstance(steps, list) else []
+    formatted_lines = [f"Evidence Log ({len(step_list)} steps):"]
+    successful_steps = 0
+    for idx, step in enumerate(step_list):
+        if not isinstance(step, dict):
+            continue
+        tool = str(step.get("tool") or "").strip() or "unknown_tool"
+        thought = str(step.get("thought") or "").strip()
+        observation = str(step.get("observation") or "").strip()
+        detail = thought or observation or "no detail recorded"
+        status = "OK" if observation else "FAIL"
+        if observation:
+            successful_steps += 1
+        formatted_lines.append(f"  [{status}] Step {idx}: {tool} -> {detail[:500]}")
+    if step_list:
+        formatted_lines.append(f"  Successful steps: {successful_steps}/{len(step_list)}")
+    return _sanitize_learning_artifact_preview("\n".join(formatted_lines), limit=400)
+
+
+def _preview_has_substantive_step_detail(preview: str) -> bool:
+    text = str(preview or "").strip()
+    if not text:
+        return False
+    if "no detail recorded" in text:
+        return False
+    return bool(re.search(r"\bStep\s+\d+:", text))
+
+
+def _build_train_result_evidence_preview_from_trace(
+    *,
+    trace_id: str,
+    substantive_tool_chain: list[str],
+) -> str:
+    """Rebuild preview from the persisted sample trace when row-local logs are absent.
+
+    New definition:
+        ``train_results`` rows are intentionally lightweight and may omit the
+        full ``execution_log``. In that case, we recover the candidate step
+        summary from ``.timeclaw/traces/<trace_id>.jsonl`` so historical rows
+        can still be backfilled without rerunning the sample.
+    """
+    if not trace_id or not substantive_tool_chain:
+        return ""
+    trace_path = Path(".timeclaw/traces") / f"{trace_id}.jsonl"
+    if not trace_path.exists():
+        return ""
+
+    top_level_steps: list[dict[str, str]] = []
+    subagent_steps: dict[int, list[dict[str, str]]] = defaultdict(list)
+    candidate_traces: list[dict[str, Any]] = []
+    final_tool = str(substantive_tool_chain[-1] if substantive_tool_chain else "").strip()
+
+    try:
+        for raw_line in trace_path.read_text().splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            record = json.loads(raw_line)
+            if record.get("event") != "agent_step":
+                continue
+            payload = record.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            summary = payload.get("summary") or {}
+            if not isinstance(summary, dict):
+                continue
+            phase = str(payload.get("phase") or "").strip()
+
+            if phase == "subagent_start":
+                try:
+                    sub_idx = int(summary.get("sub_agent_idx"))
+                except (TypeError, ValueError):
+                    continue
+                subagent_steps[sub_idx] = []
+                continue
+
+            if phase.startswith("react_step_"):
+                tool = str(summary.get("tool") or "").strip()
+                if not tool or tool in _TRAIN_RESULT_FRAMEWORK_TOOLS:
+                    continue
+                step_payload = {
+                    "tool": tool,
+                    "thought": str(summary.get("thought") or "").strip(),
+                    "observation": str(summary.get("observation_preview") or "").strip(),
+                }
+                top_level_steps.append(step_payload)
+                candidate_traces.append({
+                    "tool_chain": _filter_train_result_tool_chain([tool]),
+                    "steps": [dict(step_payload)],
+                })
+                if step_payload["observation"] and final_tool and tool == final_tool:
+                    candidate_traces.append({
+                        "tool_chain": _filter_train_result_tool_chain(
+                            [step.get("tool") for step in top_level_steps if isinstance(step, dict)]
+                        ),
+                        "steps": list(top_level_steps),
+                    })
+                continue
+
+            if phase == "subagent_tool_result":
+                try:
+                    sub_idx = int(summary.get("sub_agent_idx"))
+                except (TypeError, ValueError):
+                    continue
+                tool = str(summary.get("tool") or "").strip()
+                if not tool or tool in _TRAIN_RESULT_FRAMEWORK_TOOLS:
+                    continue
+                subagent_steps[sub_idx].append({
+                    "tool": tool,
+                    "observation": _trace_preview_text(summary.get("observation")),
+                })
+                continue
+
+            if phase != "subagent_complete":
+                continue
+
+            try:
+                sub_idx = int(summary.get("sub_agent_idx"))
+            except (TypeError, ValueError):
+                continue
+
+            preview_chain = _filter_train_result_tool_chain(
+                _trace_summary_preview_list(summary.get("tool_chain"))
+            )
+            observed_chain = _filter_train_result_tool_chain(
+                [step.get("tool") for step in subagent_steps.get(sub_idx, []) if isinstance(step, dict)]
+            )
+            tool_chain = preview_chain
+            if observed_chain and (
+                not tool_chain
+                or len(observed_chain) > len(tool_chain)
+                or (final_tool and observed_chain[-1] == final_tool and tool_chain[-1:] != [final_tool])
+            ):
+                tool_chain = observed_chain
+            candidate_traces.append({
+                "tool_chain": tool_chain,
+                "steps": list(subagent_steps.get(sub_idx, [])),
+            })
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+    trace_match = _select_train_result_preview_trace_by_chain(
+        candidate_traces,
+        substantive_tool_chain,
+    )
+    if trace_match is None:
+        return ""
+    return _format_train_result_evidence_preview_from_steps(trace_match.get("steps"))
+
+
+def _trace_summary_preview_list(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        preview = value.get("preview")
+        if isinstance(preview, list):
+            return [str(item).strip() for item in preview if str(item).strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _trace_preview_text(value: Any) -> str:
+    if isinstance(value, dict):
+        preview = value.get("preview")
+        if isinstance(preview, str):
+            return preview.strip()
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except TypeError:
+            return str(value)
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    return str(value)
+
+
 def _build_train_result_row(
     *,
     ds_name: str,
@@ -289,7 +573,10 @@ def _build_train_result_row(
         "raw_answer_preview": _sanitize_learning_artifact_preview(raw_answer, limit=500),
         "learning_insight": learning_summary.get("insight"),
         "learning_recommendation": learning_summary.get("recommendation"),
-        "evidence_summary_preview": _sanitize_learning_artifact_preview(result.get("evidence_summary", ""), limit=400),
+        "evidence_summary_preview": _build_train_result_evidence_preview(
+            result,
+            substantive_tool_chain,
+        ),
     }
 
 
@@ -700,11 +987,11 @@ async def run_train_loop(
             logger.warning(f"[TrainLoop] No split for {ds_name}, skipping")
             continue
 
-        samples = select_samples_by_index(samples, ds_name, sample_indices_map)
+        selected_samples = select_samples_with_original_indices(samples, ds_name, sample_indices_map)
         if max_samples:
-            samples = samples[:max_samples]
+            selected_samples = selected_samples[:max_samples]
         if resume_from > 0:
-            samples = samples[resume_from:]
+            selected_samples = selected_samples[resume_from:]
 
         supported_tasks = expand_dataset_tasks(ds_name, list(info["tasks"]))
         if task_filter:
@@ -712,8 +999,8 @@ async def run_train_loop(
         if not supported_tasks:
             continue
 
-        total = len(samples)
-        dataset_samples[ds_name] = samples
+        total = len(selected_samples)
+        dataset_samples[ds_name] = [sample for _, sample in selected_samples]
         dataset_tasks[ds_name] = supported_tasks
 
         ptc_str = f", per_task_concurrency={per_task_concurrency}" if per_task_concurrency else ""
@@ -721,8 +1008,7 @@ async def run_train_loop(
         pending_all = merge_checkpoint or per_task_concurrency is not None or indicator_concurrency is not None
 
         if pending_all:
-            for idx, sample in enumerate(samples):
-                abs_idx = resume_from + idx
+            for abs_idx, sample in selected_samples:
                 for task in supported_tasks:
                     if merge_checkpoint and (abs_idx, task) in done_keys:
                         continue
@@ -730,8 +1016,8 @@ async def run_train_loop(
                         continue
                     dataset_work_items.append((ds_name, abs_idx, sample, task))
         else:
-            for idx, sample in enumerate(samples):
-                dataset_work_items.append((ds_name, resume_from + idx, sample, "__all__"))
+            for abs_idx, sample in selected_samples:
+                dataset_work_items.append((ds_name, abs_idx, sample, "__all__"))
 
         n_pending = sum(1 for x in dataset_work_items if x[0] == ds_name)
         logger.info(

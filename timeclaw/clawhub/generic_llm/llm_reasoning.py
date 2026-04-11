@@ -8,6 +8,7 @@ single generic tool name.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import numpy as np
@@ -146,16 +147,57 @@ class LLMReasoningIndicatorTool(_BaseLLMReasoningTool):
         "Multimodal LLM reasoning wrapper specialized for indicator tasks. "
         "Use when the goal is to extract numeric indicators such as max, min, "
         "diff, MACD, or Bollinger-related values. "
-        "Returns a fixed payload: {\"answer\": {indicator_name: values}}."
+        "Returns a fixed payload: {\"answer\": {requested_indicator_key: values}}."
     )
-    output_contract = '{"answer": {"indicator_name": [number, ...]}}'
+    output_contract = '{"answer": {"requested_indicator_key": [number, ...]}}'
+
+    @staticmethod
+    def _infer_indicator_key(question: str, context: str) -> str | None:
+        text = f"{question}\n{context}".lower()
+        if "upper_bb" in text or "upper bollinger band" in text:
+            return "upper_bb"
+        if re.search(r"\bmacd\b", text) or "moving average convergence divergence" in text:
+            return "macd"
+        return None
 
     def _normalise_payload(self, payload: Any) -> dict[str, Any]:
         if isinstance(payload, dict) and "answer" in payload:
             answer = payload["answer"]
         else:
             answer = payload
+        if isinstance(answer, dict) and len(answer) == 1:
+            key, value = next(iter(answer.items()))
+            normalized_key = str(key).strip().lower()
+            alias_map = {
+                "indicator_name": self._infer_indicator_key(
+                    str(payload.get("question", "")) if isinstance(payload, dict) else "",
+                    str(payload.get("context", "")) if isinstance(payload, dict) else "",
+                ),
+                "upper_bollinger_band": "upper_bb",
+                "upper_bollinger_bands": "upper_bb",
+                "bollinger_upper": "upper_bb",
+                "bb_upper": "upper_bb",
+                "macd_values": "macd",
+                "macd_forecast": "macd",
+            }
+            canonical_key = alias_map.get(normalized_key)
+            if canonical_key:
+                answer = {canonical_key: value}
         return {"answer": answer}
+
+    async def _run(self, ts_data: Any = None, **params: Any) -> Any:
+        result = await super()._run(ts_data=ts_data, **params)
+        answer = result.get("answer")
+        if isinstance(answer, dict) and len(answer) == 1:
+            key, value = next(iter(answer.items()))
+            normalized_key = str(key).strip().lower()
+            inferred_key = self._infer_indicator_key(
+                str(params.get("question", "")),
+                str(params.get("context", "")),
+            )
+            if normalized_key == "indicator_name" and inferred_key:
+                result["answer"] = {inferred_key: value}
+        return result
 
 
 class LLMReasoningClassificationTool(_BaseLLMReasoningTool):

@@ -522,7 +522,8 @@ def llm_call(
         if resp_tool_calls:
             decision = _smart_trunc(resp_tool_calls, 2000)
         else:
-            decision = _extract_llm_decision(resp_parsed)
+            decision_source = resp_parsed if resp_parsed is not None else resp_text
+            decision = _extract_llm_decision(decision_source)
         logger.info(
             f"[{caller}] LLM 返回 (tokens: {tokens_in} in / {tokens_out} out):\n"
             f"    {decision}"

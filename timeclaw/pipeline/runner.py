@@ -90,7 +90,7 @@ class PipelineRunner:
     """
 
     def __init__(self, config: TimeClawConfig | None = None, disable_memory: bool = False):
-        self.config = config or TimeClawConfig()
+        self.config = config or TimeClawConfig.load()
         self._disable_memory = disable_memory
         trace.configure(self.config.pipeline.verbose)
         self.router = ModelRouter(self.config.llm)
@@ -321,6 +321,8 @@ class PipelineRunner:
                 prediction_source = self._select_winner_prediction_from_execution_log(
                     execution_log,
                     raw_answer,
+                    raw_answer=raw_answer,
+                    allow_missing_metrics=True,
                 )
             elif mode == "train" and defer_learning_record:
                 prediction_source = self._select_winner_prediction_from_execution_log(
@@ -745,8 +747,6 @@ class PipelineRunner:
                 "training finished without GT evaluation metrics"
             )
             return
-        correct = self._learning_outcome_correctness(best_metrics)
-
         analysis = ""
         if answer_type == "learning_summary" and isinstance(raw_answer, dict):
             insight = raw_answer.get("insight", "")
@@ -758,7 +758,12 @@ class PipelineRunner:
             analysis = f"{insight}\n{rec}".strip()
 
         sample_stats = self._build_sample_stats(fingerprint, profiling_results, horizon)
-        winner_tool_chain = self._select_winner_tool_chain(candidate_traces, best_metrics)
+        winner_trace, _winner_source = self._resolve_learning_summary_winner_trace(
+            raw_answer if answer_type == "learning_summary" else None,
+            candidate_traces,
+            best_metrics,
+        )
+        winner_tool_chain = list(winner_trace.get("tool_chain") or []) if winner_trace else self._select_winner_tool_chain(candidate_traces, best_metrics)
         fallback_summary = analysis or reasoning or str(raw_answer)[:3000]
         structured_analysis, summary = await generate_learning_analysis(
             scope_key=(scope_keys[0] if scope_keys else f"{domain}_{task_type}"),
@@ -768,11 +773,15 @@ class PipelineRunner:
             sample_fingerprint=sample_stats,
             candidate_traces=candidate_traces,
             best_metrics=best_metrics,
-            winner_correct=correct,
+            selected_winner_trace=winner_trace,
+            winner_correct=(
+                self._learning_outcome_correctness(dict(winner_trace.get("metrics") or {}))
+                if winner_trace and isinstance(winner_trace.get("metrics"), dict) and winner_trace.get("metrics")
+                else None
+            ),
             fallback_summary=fallback_summary,
         )
 
-        winner_trace = self._select_winner_trace(candidate_traces, best_metrics)
         recorded_prediction = None
         if winner_trace is not None:
             recorded_prediction = winner_trace.get("prediction")
@@ -780,6 +789,9 @@ class PipelineRunner:
             recorded_prediction = prediction
         if recorded_prediction is None:
             recorded_prediction = raw_answer
+
+        recorded_metrics = dict(winner_trace.get("metrics") or {}) if winner_trace else {}
+        recorded_correct = self._learning_outcome_correctness(recorded_metrics)
 
         await self.memory.record(
             domain=domain,
@@ -790,8 +802,8 @@ class PipelineRunner:
             pipeline_summary=summary,
             data_fingerprint=sample_stats,
             predicted=str(recorded_prediction) if recorded_prediction is not None else "",
-            metrics=best_metrics,
-            correct=correct,
+            metrics=recorded_metrics,
+            correct=recorded_correct,
             description=description,
             all_eval_metrics=all_evals,
             candidate_traces=candidate_traces,
@@ -830,7 +842,7 @@ class PipelineRunner:
         batch_results: list[dict[str, Any]] = []
         single_results: list[dict[str, Any]] = []
         top_level_traces: list[dict[str, Any]] = []
-        for entry in execution_log:
+        for entry_idx, entry in enumerate(execution_log):
             tool_name = str(entry.get("tool") or "").strip()
             if tool_name == "spawn_subagent":
                 output = entry.get("output") or []
@@ -877,6 +889,7 @@ class PipelineRunner:
                         "prediction": result.get("answer", result.get("prediction")),
                         "reasoning": str(result.get("reasoning") or "").strip(),
                         "steps": steps,
+                        "entry_index": entry_idx,
                     })
                 continue
             if tool_name in {"evaluate_batch_against_gt", "batch_evaluate_against_gt"}:
@@ -892,6 +905,7 @@ class PipelineRunner:
                         {
                             "metrics": obs.get("metrics", {}),
                             "prediction": args.get("prediction"),
+                            "entry_index": entry_idx,
                         }
                     )
                 continue
@@ -911,6 +925,7 @@ class PipelineRunner:
                 "tool_chain": [tool_name],
                 "prediction": PipelineRunner._prediction_from_observation(entry.get("observation")),
                 "steps": steps,
+                "entry_index": entry_idx,
             })
 
         if not traces and top_level_traces:
@@ -939,7 +954,12 @@ class PipelineRunner:
                 # task-typed payload. Prefer that normalized payload over the
                 # raw sub-agent answer, which may still be a JSON string.
                 matched["prediction"] = res.get("prediction")
-            if res_name and not res_name.startswith("approach_"):
+            existing_name = str(matched.get("name") or matched.get("candidate_key") or "").strip()
+            if (
+                res_name
+                and not res_name.startswith("approach_")
+                and PipelineRunner._trace_name_is_generic(existing_name)
+            ):
                 matched["name"] = PipelineRunner._normalise_candidate_key(
                     res_name, matched.get("tool_chain", []), idx,
                 )
@@ -950,13 +970,28 @@ class PipelineRunner:
         for res in single_results:
             matched = None
             res_prediction = res.get("prediction")
+            eval_entry_index = res.get("entry_index")
             if res_prediction is not None:
                 for trace in unmatched_traces:
                     if trace.get("metrics") is not None:
                         continue
-                    if trace.get("prediction") == res_prediction:
+                    if PipelineRunner._predictions_match(trace.get("prediction"), res_prediction):
                         matched = trace
                         break
+            if matched is None:
+                prior_candidates = [
+                    trace
+                    for trace in unmatched_traces
+                    if trace.get("metrics") is None
+                    and trace.get("prediction") is not None
+                    and isinstance(trace.get("entry_index"), int)
+                    and (
+                        not isinstance(eval_entry_index, int)
+                        or int(trace["entry_index"]) < int(eval_entry_index)
+                    )
+                ]
+                if prior_candidates:
+                    matched = max(prior_candidates, key=lambda trace: int(trace.get("entry_index", -1)))
             if matched is None:
                 for trace in unmatched_traces:
                     if trace.get("metrics") is None:
@@ -966,6 +1001,32 @@ class PipelineRunner:
                 continue
             matched["metrics"] = res.get("metrics", {})
         return traces
+
+    @staticmethod
+    def _predictions_match(left: Any, right: Any) -> bool:
+        left = PipelineRunner._parse_json_like_payload(left)
+        right = PipelineRunner._parse_json_like_payload(right)
+
+        if isinstance(left, dict) and isinstance(right, dict):
+            if set(left.keys()) != set(right.keys()):
+                return False
+            return all(PipelineRunner._predictions_match(left[key], right[key]) for key in left.keys())
+
+        if isinstance(left, (list, tuple, np.ndarray)) and isinstance(right, (list, tuple, np.ndarray)):
+            try:
+                left_arr = np.asarray(left, dtype=float)
+                right_arr = np.asarray(right, dtype=float)
+            except (TypeError, ValueError):
+                return list(left) == list(right)
+            if left_arr.shape != right_arr.shape:
+                return False
+            return bool(np.allclose(left_arr, right_arr, atol=1e-3, rtol=1e-6))
+
+        try:
+            return bool(left == right)
+        except (TypeError, ValueError):
+            return False
+
 
     @staticmethod
     def _prediction_from_observation(observation: Any) -> Any:
@@ -1094,6 +1155,15 @@ class PipelineRunner:
         if raw_name:
             return raw_name
         return fallback
+
+    @staticmethod
+    def _trace_name_is_generic(name: Any) -> bool:
+        text = str(name or "").strip().lower()
+        if not text:
+            return True
+        return bool(re.fullmatch(r"(slot|candidate|approach|top_level)_\d+", text)) or bool(
+            re.fullmatch(r"(slot|candidate|approach|top_level)::\d+", text)
+        ) or text in {"candidate", "top_level"}
 
     @staticmethod
     def _tool_name_from_hint(text: Any) -> str:
@@ -1351,6 +1421,13 @@ class PipelineRunner:
         winner_trace: dict[str, Any] | None,
         candidate_traces: list[dict[str, Any]],
     ) -> tuple[str, str]:
+        """Build a grounded single-sample learning summary.
+
+        New definition:
+            If GT-backed metrics show the selected best explored candidate is
+            still incorrect overall, the summary must be failure-first rather
+            than presenting that candidate as a successful "winner".
+        """
         if not winner_trace:
             return "", ""
 
@@ -1370,20 +1447,34 @@ class PipelineRunner:
             if not comparison:
                 continue
             compared_bits.append(comparison)
-        insight = f"Winner for this run: {winner_name}"
-        if winner_chain and winner_chain != winner_name:
-            insight += f" using `{winner_chain}`"
-        if metric_text:
-            insight += f" with {metric_text}"
-        if prediction_text:
-            insight += f". Winner output: {prediction_text}"
-        if winner_reason:
-            insight += f". Why it won: {winner_reason}"
-        if compared_bits:
-            insight += " Alternatives: " + " | ".join(compared_bits[:2])
-        insight = insight.strip() + "."
-
         correct = cls._learning_outcome_correctness(dict(winner_trace.get("metrics") or {}))
+        if correct is False:
+            insight = f"No correct winner on this run. Best explored candidate: {winner_name}"
+            if winner_chain and winner_chain != winner_name:
+                insight += f" using `{winner_chain}`"
+            if metric_text:
+                insight += f" with {metric_text}"
+            if prediction_text:
+                insight += f". Best explored output: {prediction_text}"
+            if winner_reason:
+                insight += f". Why it still looked plausible: {winner_reason}"
+            if compared_bits:
+                insight += " Alternatives checked: " + " | ".join(compared_bits[:2])
+            insight = insight.strip() + "."
+        else:
+            insight = f"Winner for this run: {winner_name}"
+            if winner_chain and winner_chain != winner_name:
+                insight += f" using `{winner_chain}`"
+            if metric_text:
+                insight += f" with {metric_text}"
+            if prediction_text:
+                insight += f". Winner output: {prediction_text}"
+            if winner_reason:
+                insight += f". Why it won: {winner_reason}"
+            if compared_bits:
+                insight += " Alternatives: " + " | ".join(compared_bits[:2])
+            insight = insight.strip() + "."
+
         winner_chain_text = f"`{winner_chain}`" if winner_chain else winner_name
         alt_trace = cls._best_alternative_trace(winner_trace, candidate_traces)
         alt_chain = cls._tool_chain_summary(list((alt_trace or {}).get("tool_chain") or []))
@@ -1425,6 +1516,9 @@ class PipelineRunner:
     def _select_winner_prediction_from_execution_log(
         execution_log: list[dict[str, Any]],
         fallback_prediction: Any,
+        raw_answer: Any | None = None,
+        *,
+        allow_missing_metrics: bool = False,
     ) -> Any:
         candidate_traces = PipelineRunner._extract_candidate_traces(execution_log)
         evaluated_metrics = [
@@ -1433,14 +1527,20 @@ class PipelineRunner:
             if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
         ]
         best_metrics = PipelineRunner._select_best_metrics(evaluated_metrics)
+        winner_trace, _winner_source = PipelineRunner._resolve_learning_summary_winner_trace(
+            raw_answer,
+            candidate_traces,
+            best_metrics,
+        )
+        if winner_trace and winner_trace.get("prediction") is not None:
+            return winner_trace.get("prediction")
         if not best_metrics:
+            if allow_missing_metrics:
+                return None
             raise ValueError(
                 "Deferred learning record requires evaluated candidate metrics, "
                 "but none were found in execution_log."
             )
-        winner_trace = PipelineRunner._select_winner_trace(candidate_traces, best_metrics)
-        if winner_trace and winner_trace.get("prediction") is not None:
-            return winner_trace.get("prediction")
         raise ValueError(
             "Deferred learning record could not map the winning metrics back to a candidate prediction."
         )
@@ -1466,7 +1566,11 @@ class PipelineRunner:
             if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
         ]
         best_metrics = cls._select_best_metrics(evaluated_metrics)
-        winner_trace = cls._select_winner_trace(candidate_traces, best_metrics) if best_metrics else None
+        winner_trace, winner_source = cls._resolve_learning_summary_winner_trace(
+            base,
+            candidate_traces,
+            best_metrics,
+        )
 
         compared_candidates: list[dict[str, Any]] = []
         for trace in candidate_traces:
@@ -1497,19 +1601,122 @@ class PipelineRunner:
             normalized["winner_prediction"] = winner_trace.get("prediction")
             normalized["winner_tool_chain"] = list(winner_trace.get("tool_chain") or [])
             normalized["winner_metrics"] = dict(winner_trace.get("metrics") or {})
-            grounded_insight, grounded_recommendation = cls._build_winner_aligned_learning_summary(
-                winner_trace,
-                candidate_traces,
-            )
-            if grounded_insight:
-                normalized["insight"] = grounded_insight
-            if grounded_recommendation:
-                normalized["recommendation"] = grounded_recommendation
+            if winner_source != "explicit_summary":
+                grounded_insight, grounded_recommendation = cls._build_winner_aligned_learning_summary(
+                    winner_trace,
+                    candidate_traces,
+                )
+                if grounded_insight:
+                    normalized["insight"] = grounded_insight
+                if grounded_recommendation:
+                    normalized["recommendation"] = grounded_recommendation
+        else:
+            normalized["summary_kind"] = "failure_summary"
 
         for key, value in base.items():
             if key not in normalized:
                 normalized[key] = value
         return normalized
+
+    @classmethod
+    def _resolve_learning_summary_winner_trace(
+        cls,
+        raw_answer: Any,
+        candidate_traces: list[dict[str, Any]],
+        best_metrics: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        explicit = cls._select_learning_summary_winner_trace(raw_answer, candidate_traces)
+        if explicit is not None:
+            return explicit, "explicit_summary"
+        fallback = cls._select_winner_trace(candidate_traces, best_metrics) if best_metrics else None
+        if fallback is not None:
+            return fallback, "best_metrics"
+        return None, "none"
+
+    @classmethod
+    def _select_learning_summary_winner_trace(
+        cls,
+        raw_answer: Any,
+        candidate_traces: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not isinstance(raw_answer, dict) or not candidate_traces:
+            return None
+
+        winner_candidate = str(raw_answer.get("winner_candidate") or "").strip().lower()
+        winner_tool_chain = [str(tool).strip() for tool in raw_answer.get("winner_tool_chain") or [] if str(tool).strip()]
+        winner_prediction = raw_answer.get("winner_prediction")
+
+        for trace in candidate_traces:
+            if not isinstance(trace, dict):
+                continue
+            name = str(trace.get("name") or trace.get("candidate_key") or "").strip().lower()
+            chain = [str(tool).strip() for tool in trace.get("tool_chain") or [] if str(tool).strip()]
+            if winner_candidate and winner_candidate in {name, *cls._winner_aliases(trace)}:
+                return trace
+            if winner_tool_chain and chain == winner_tool_chain:
+                return trace
+            if winner_prediction is not None and cls._predictions_match(
+                trace.get("prediction"),
+                winner_prediction,
+            ):
+                return trace
+
+        reasoning_text = str(raw_answer.get("reasoning") or "").strip()
+        if not reasoning_text:
+            return None
+        combined = "\n".join(
+            str(raw_answer.get(key) or "").strip()
+            for key in ("insight", "recommendation", "reasoning")
+        ).lower()
+        if not combined:
+            return None
+
+        positive_markers = (
+            "winner",
+            "won",
+            "winning",
+            "best candidate",
+            "best branch",
+            "selected",
+            "was selected",
+            "preferred",
+        )
+        negative_markers = (
+            "failed",
+            "rejected",
+            "underperformed",
+            "worse",
+            "less plausible",
+            "ruled out",
+        )
+
+        best_trace: dict[str, Any] | None = None
+        best_score = 0
+        second_best = 0
+        sentences = [part.strip().lower() for part in re.split(r"(?<=[.!?])\s+|\n+", combined) if part.strip()]
+        for trace in candidate_traces:
+            if not isinstance(trace, dict):
+                continue
+            aliases = cls._winner_aliases(trace)
+            score = 0
+            for sentence in sentences:
+                if not any(alias and alias in sentence for alias in aliases):
+                    continue
+                score += 1
+                if any(marker in sentence for marker in positive_markers):
+                    score += 5
+                if any(marker in sentence for marker in negative_markers):
+                    score -= 4
+            if score > best_score:
+                second_best = best_score
+                best_score = score
+                best_trace = trace
+            elif score > second_best:
+                second_best = score
+
+        if best_trace is not None and best_score > 0 and best_score > second_best:
+            return best_trace
+        return None
 
     @staticmethod
     def _learning_outcome_correctness(metrics: dict[str, Any]) -> bool | None:

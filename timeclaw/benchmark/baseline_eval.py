@@ -26,7 +26,7 @@ from timeclaw.benchmark.mtbench_adapter import (
 from timeclaw.benchmark.mtbench_support import (
     expand_dataset_tasks,
     load_sample_indices,
-    select_samples_by_index,
+    select_samples_with_original_indices,
 )
 from timeclaw.benchmark import mtbench_prompts as prompts
 from timeclaw.core.config import TimeClawConfig
@@ -535,9 +535,9 @@ async def run_baseline(
             logger.warning(f"[Baseline] No data for {ds_name}")
             continue
 
-        samples = select_samples_by_index(samples, ds_name, sample_indices_map)
+        selected_samples = select_samples_with_original_indices(samples, ds_name, sample_indices_map)
         if max_samples:
-            samples = samples[:max_samples]
+            selected_samples = selected_samples[:max_samples]
 
         tasks = expand_dataset_tasks(ds_name, list(info["tasks"]))
         if task_filter:
@@ -545,12 +545,12 @@ async def run_baseline(
         if not tasks:
             continue
 
-        logger.info(f"[Baseline] {ds_name}: {len(samples)} samples, tasks={tasks}, concurrency={concurrency}")
+        logger.info(f"[Baseline] {ds_name}: {len(selected_samples)} samples, tasks={tasks}, concurrency={concurrency}")
         t0 = time.time()
 
         coros = [
             _eval_one_sample(ds_name, idx, s, tasks, llm, sem)
-            for idx, s in enumerate(samples)
+            for idx, s in selected_samples
         ]
         batch = await asyncio.gather(*coros, return_exceptions=True)
 

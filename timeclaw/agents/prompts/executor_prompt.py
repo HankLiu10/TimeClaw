@@ -16,15 +16,42 @@ if TYPE_CHECKING:
     from timeclaw.clawhub.tool_base import ClawTool
 
 
+_AGENT_HIDDEN_TOOLS = {
+    "ensemble_forecast",
+}
+
+
+def filter_agent_available_tool_names(tool_names: list[str]) -> list[str]:
+    """Hide tools whose argument contracts do not fit the current agent loop.
+
+    New definition:
+        - These tools still exist in ClawHub and can be used by code paths that
+          prepare their full structured inputs explicitly.
+        - They are removed only from the ReAct agent's visible tool list when
+          the current loop cannot reliably construct the required arguments from
+          its artifact state.
+
+    Example:
+        `ensemble_forecast` requires a `forecasts` list assembled from multiple
+        earlier forecast outputs, but the current executor only carries forward
+        the latest working artifact rather than a structured forecast bundle.
+    """
+    return [
+        name for name in tool_names
+        if str(name).strip() and str(name).strip() not in _AGENT_HIDDEN_TOOLS
+    ]
+
+
 def get_all_tool_names(modalities: list[str] | None = None) -> list[str]:
     """Return tool names compatible with the currently available modalities."""
     from timeclaw.clawhub.tool_registry import list_tool_instances
 
     available = set(modalities or ["timeseries"])
-    return [
+    tool_names = [
         t.name for t in list_tool_instances()
         if t.required_modalities().issubset(available)
     ]
+    return filter_agent_available_tool_names(tool_names)
 
 
 def build_tool_name_text(tool_names: list[str]) -> str:
@@ -270,7 +297,7 @@ Budget alert: only {remaining_turns} turn(s) remain including this one. {budget_
 """
 
 TRAIN_COMPLETION_BUDGET_ALERT = """\
-Budget alert: only {remaining_turns} turn(s) remain including this one, and the training completion contract is already satisfied (at least 3 valid candidate paths plus GT evaluation). Do NOT start another exploration branch or extra evaluation. Finish with `done=true` and answer_type="learning_summary".
+Budget alert: only {remaining_turns} turn(s) remain including this one, and the training completion contract is already satisfied (at least 2 valid candidate paths plus GT evaluation). Do NOT start another exploration branch or extra evaluation. Finish with `done=true` and answer_type="learning_summary".
 """
 
 FINAL_STEP_MUST_FINISH = """\
@@ -295,8 +322,10 @@ def build_visible_tool_guidance(
         sections.append(
             "## Spawn Guidance\n"
             "- If you think this step would benefit from exploring multiple follow-up branches for comparison, prefer using `spawn_subagent`.\n"
-            "- In training mode, the first spawn round should create at least 3 distinct candidate branches.\n"
+            "- In training mode, the first spawn round should create at least 2 distinct candidate branches.\n"
             "- When you spawn branches, build them from the provided candidate slots / post-dropout visible tool subsets.\n"
+            "- For each spawned branch, choose a `slot_id` whose `visible_tools` fully cover every tool named in that branch's `tools_hint`.\n"
+            "- Do not assign a branch to a slot if even one hinted tool is missing from that slot's `visible_tools`.\n"
             "- Different branches should use different slot tool subsets or path suggestions, not the same path repeated.\n"
             "- Each branch should be a short candidate path, not a full plan.\n"
         )
@@ -314,7 +343,7 @@ def build_visible_tool_guidance(
             "- After evaluation, you may only finish or summarize using already-produced candidates.",
             "- Do not use evaluate outputs or any revealed ground truth as task evidence inside the solution path.",
             "- Before finishing this learning run, evaluate at least one task-valid candidate.",
-            "- If multiple reasonable candidates exist, compare at least 3 candidate paths before finishing unless tool availability makes that impossible.",
+            "- If multiple reasonable candidates exist, compare at least 2 candidate paths before finishing unless tool availability makes that impossible.",
         ]
         if defer_learning_record:
             lines.append(

@@ -363,6 +363,7 @@ async def generate_learning_analysis(
     sample_fingerprint: str,
     candidate_traces: list[dict[str, Any]],
     best_metrics: dict[str, Any],
+    selected_winner_trace: dict[str, Any] | None = None,
     winner_correct: bool | None = None,
     fallback_summary: str = "",
     llm: Any | None = None,
@@ -379,7 +380,8 @@ async def generate_learning_analysis(
         f"Text/Context Source for text_signals ONLY:\n{_short_text(text_context or '(none)', 12000)}\n\n"
         f"Sample fingerprint:\n{_short_text(sample_fingerprint, 2000)}\n\n"
         f"Candidates:\n{_candidate_prompt_block(candidate_traces)}\n\n"
-        f"Best metrics:\n{_short_text(best_metrics, 800)}\n\n"
+        f"Final accepted winner:\n{_candidate_prompt_block([selected_winner_trace] if selected_winner_trace else [])}\n\n"
+        f"Best evaluated metrics (may belong to a non-winning compared candidate):\n{_short_text(best_metrics, 800)}\n\n"
         f"Winner correctness:\n{winner_correct if winner_correct is not None else 'unknown'}\n\n"
         f"Fallback summary:\n{_short_text(fallback_summary, 3000)}"
     )

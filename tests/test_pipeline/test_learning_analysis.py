@@ -1196,6 +1196,41 @@ def test_deferred_winner_selection_raises_without_evaluated_metrics():
         )
 
 
+def test_learning_summary_winner_selection_accepts_explicit_winner_without_metrics():
+    winner = PipelineRunner._select_winner_prediction_from_execution_log(
+        [
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": {"upper_bb": [55.1, 55.2]},
+                            "execution_log": [{"tool": "llm_reasoning_indicator"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": {"upper_bb": [54.2, 54.2]},
+                            "execution_log": [{"tool": "arima_forecast"}, {"tool": "llm_reasoning_indicator"}],
+                        },
+                    },
+                ],
+            }
+        ],
+        fallback_prediction={"insight": "unused"},
+        raw_answer={
+            "winner_tool_chain": ["llm_reasoning_indicator"],
+            "insight": "direct indicator path was best",
+            "recommendation": "prefer direct indicator path",
+        },
+        allow_missing_metrics=True,
+    )
+
+    assert winner == {"upper_bb": [55.1, 55.2]}
+
+
 def test_deferred_winner_selection_prefers_normalized_batch_prediction_over_string_answer():
     winner = PipelineRunner._select_winner_prediction_from_execution_log(
         [
@@ -1240,6 +1275,40 @@ def test_deferred_winner_selection_prefers_normalized_batch_prediction_over_stri
     )
 
     assert winner == [4.0, 5.0, 6.0]
+
+
+def test_deferred_winner_selection_matches_single_eval_to_latest_prior_candidate_when_prediction_is_rounded():
+    execution_log = [
+        {
+            "tool": "handle_missing",
+            "observation": {"data": [1.0, 2.0, 3.0], "missing_count": 0},
+        },
+        {
+            "tool": "prophet_forecast",
+            "observation": {"forecast": [52.7608, 52.5310, 52.3011], "horizon": 3},
+        },
+        {
+            "tool": "sundial_base_128m_forecast",
+            "observation": {"point_forecast": [45.2699, 45.2123, 45.1505], "horizon": 3},
+        },
+        {
+            "tool": "prophet_forecast",
+            "observation": {"forecast": [47.9130, 47.8115, 47.7100], "horizon": 3},
+        },
+        {
+            "tool": "evaluate_against_gt",
+            "args": {"prediction": [47.913, 47.812, 47.71]},
+            "observation": {"metrics": {"mae": 2.078, "rmse": 2.357}},
+        },
+    ]
+
+    winner = PipelineRunner._select_winner_prediction_from_execution_log(
+        execution_log,
+        fallback_prediction={"insight": "Prophet won"},
+        raw_answer={"insight": "Prophet won", "recommendation": "Use prophet."},
+    )
+
+    assert winner == [47.9130, 47.8115, 47.7100]
 
 
 def test_pipeline_eval_forecast_extractor_rejects_free_text_number_scrape():
@@ -1539,6 +1608,79 @@ async def test_run_requires_evaluated_candidates_when_deferred(monkeypatch):
             ground_truth=[1.0, 2.0],
             defer_learning_record=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_train_learning_summary_without_metrics_is_kept_as_failure_summary(monkeypatch):
+    runner = PipelineRunner(disable_memory=True)
+
+    async def _fake_ensure_tools():
+        return None
+
+    async def _fake_preprocess(*_args, **_kwargs):
+        return {"fingerprint": {}, "modalities": ["timeseries", "text"], "profiling_results": {}}
+
+    class _Executor:
+        evidence_log = type(
+            "E",
+            (),
+            {
+                "summary": staticmethod(lambda: ""),
+                "is_sufficient": True,
+            },
+        )()
+
+        async def run(self, _envelope):
+            return {
+                "result": {
+                    "answer": {
+                        "insight": "The direct indicator path looked strongest, but GT evaluation was never completed.",
+                        "recommendation": "Create multiple task-valid branches earlier and evaluate before budget runs out.",
+                        "winner_tool_chain": ["llm_reasoning_indicator"],
+                    },
+                    "answer_type": "learning_summary",
+                    "confidence": 0.97,
+                    "reasoning": "1. Multiple candidates were explored.\n2. The run ended without GT evaluation.",
+                    "execution_log": [
+                        {
+                            "tool": "spawn_subagent",
+                            "output": [
+                                {
+                                    "success": True,
+                                    "result": {
+                                        "answer": {"upper_bb": [55.1, 55.2]},
+                                        "execution_log": [{"tool": "llm_reasoning_indicator"}],
+                                    },
+                                },
+                                {
+                                    "success": True,
+                                    "result": {
+                                        "answer": {"upper_bb": [54.2, 54.2]},
+                                        "execution_log": [{"tool": "arima_forecast"}, {"tool": "llm_reasoning_indicator"}],
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                }
+            }
+
+    monkeypatch.setattr(runner, "_ensure_tools", _fake_ensure_tools)
+    monkeypatch.setattr(runner, "_preprocess", _fake_preprocess)
+    monkeypatch.setattr(runner, "_create_executor", lambda: _Executor())
+
+    result = await runner.run(
+        data=[1.0, 2.0, 3.0],
+        task_type="indicator",
+        description="indicator sample",
+        mode="train",
+        ground_truth={"upper_bb": [55.0, 55.1]},
+        defer_learning_record=False,
+    )
+
+    assert result["answer_type"] == "learning_summary"
+    assert result["prediction"] == {"upper_bb": [55.1, 55.2]}
+    assert result["raw_answer"]["winner_tool_chain"] == ["llm_reasoning_indicator"]
 
 
 @pytest.mark.asyncio

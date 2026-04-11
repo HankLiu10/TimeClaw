@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +105,184 @@ class LLMBackend:
             and self.api_key is not None
         )
 
+    @staticmethod
+    def _content_to_responses_input_parts(content: Any) -> list[dict[str, Any]]:
+        if isinstance(content, str):
+            return [{"type": "input_text", "text": content}]
+
+        if isinstance(content, list):
+            parts: list[dict[str, Any]] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append({"type": "input_text", "text": item})
+                    continue
+                if not isinstance(item, dict):
+                    parts.append({"type": "input_text", "text": str(item)})
+                    continue
+                item_type = str(item.get("type") or "").strip()
+                if item_type == "text":
+                    parts.append({"type": "input_text", "text": str(item.get("text") or "")})
+                    continue
+                if item_type == "image_url":
+                    raw_url = item.get("image_url")
+                    if isinstance(raw_url, dict):
+                        raw_url = raw_url.get("url")
+                    if raw_url:
+                        parts.append({
+                            "type": "input_image",
+                            "image_url": str(raw_url),
+                            "detail": "auto",
+                        })
+                    continue
+                parts.append({"type": "input_text", "text": json.dumps(item, ensure_ascii=False, default=str)})
+            return parts or [{"type": "input_text", "text": ""}]
+
+        return [{"type": "input_text", "text": str(content)}]
+
+    @staticmethod
+    def _assistant_content_to_responses_output_parts(content: Any) -> list[dict[str, Any]]:
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text_parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    text_parts.append(item)
+                    continue
+                if not isinstance(item, dict):
+                    text_parts.append(str(item))
+                    continue
+                item_type = str(item.get("type") or "").strip()
+                if item_type == "text":
+                    text_parts.append(str(item.get("text") or ""))
+                    continue
+                if item_type == "image_url":
+                    raw_url = item.get("image_url")
+                    if isinstance(raw_url, dict):
+                        raw_url = raw_url.get("url")
+                    text_parts.append(f"[image] {raw_url}")
+                    continue
+                text_parts.append(json.dumps(item, ensure_ascii=False, default=str))
+            text = "\n".join(part for part in text_parts if part).strip()
+        else:
+            text = str(content)
+        return [{
+            "type": "output_text",
+            "text": text,
+            "annotations": [],
+        }]
+
+    @classmethod
+    def _messages_to_responses_input(cls, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        _instructions, input_items = cls._messages_to_responses_request(messages)
+        return input_items
+
+    @classmethod
+    def _messages_to_responses_request(
+        cls,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        instruction_blocks: list[str] = []
+        input_items: list[dict[str, Any]] = []
+        for idx, msg in enumerate(messages or []):
+            if not isinstance(msg, dict):
+                input_items.append({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": str(msg)}],
+                })
+                continue
+            role = str(msg.get("role") or "user").strip().lower() or "user"
+            content = msg.get("content", "")
+            if role in {"system", "developer", "user"}:
+                if role in {"system", "developer"}:
+                    parts = cls._content_to_responses_input_parts(content)
+                    text = "\n".join(
+                        str(part.get("text") or "")
+                        for part in parts
+                        if isinstance(part, dict) and part.get("type") == "input_text"
+                    ).strip()
+                    if text:
+                        instruction_blocks.append(text)
+                    continue
+                input_items.append({
+                    "type": "message",
+                    "role": role,
+                    "content": cls._content_to_responses_input_parts(content),
+                })
+                continue
+            if role == "assistant":
+                input_items.append({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": cls._assistant_content_to_responses_output_parts(content),
+                })
+                continue
+            input_items.append({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": str(content)}],
+            })
+        instructions = "\n\n".join(block for block in instruction_blocks if block).strip() or None
+        return instructions, input_items
+
+    @staticmethod
+    def _responses_text_config(response_format: str | None) -> dict[str, Any] | None:
+        if response_format == "json":
+            return {"format": {"type": "json_object"}}
+        return None
+
+    @staticmethod
+    def _ensure_json_keyword_in_responses_input(input_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Ensure JSON mode mentions `json` in input text for API compatibility.
+
+        New definition:
+            Some OpenAI-compatible Responses backends reject
+            ``text.format={"type":"json_object"}`` unless the request input
+            explicitly contains the word ``json``. When migrating system prompts
+            to ``instructions``, that keyword may disappear from the actual
+            ``input`` items. We fix that at the transport layer only for JSON
+            mode to preserve existing caller prompts unchanged.
+        """
+        normalized = json.dumps(input_items, ensure_ascii=False).lower()
+        if "json" in normalized:
+            return input_items
+        for item in input_items:
+            if not isinstance(item, dict) or item.get("role") != "user":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "input_text":
+                    part["text"] = f"Return valid JSON.\n\n{str(part.get('text') or '')}".strip()
+                    return input_items
+        input_items.append({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Return valid JSON."}],
+        })
+        return input_items
+
+    @staticmethod
+    def _chat_tools_to_responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted: list[dict[str, Any]] = []
+        for spec in tools or []:
+            if not isinstance(spec, dict):
+                continue
+            if spec.get("type") == "function" and isinstance(spec.get("function"), dict):
+                fn = spec["function"]
+                converted.append({
+                    "type": "function",
+                    "name": str(fn.get("name") or ""),
+                    "description": str(fn.get("description") or ""),
+                    "parameters": fn.get("parameters") or {"type": "object"},
+                    "strict": bool(fn.get("strict", False)),
+                })
+                continue
+            converted.append(spec)
+        return converted
+
     def _get_openai_client(self):
         """Lazily create a shared AsyncOpenAI client for proxy calls."""
         if not hasattr(self, "_oai_client") or self._oai_client is None:
@@ -119,12 +298,7 @@ class LLMBackend:
         self, call_kwargs: dict[str, Any], model_label: str,
         response_format: str | None, messages: list[dict[str, Any]],
     ) -> LLMResponse | None:
-        """Call via the native ``openai`` SDK for proxy compatibility.
-
-        Tries non-streaming first; if the proxy forces SSE (returns a
-        string instead of a ChatCompletion), falls back to streaming
-        and reassembles the full response.
-        """
+        """Call via the native ``openai`` SDK Responses API."""
         client = self._get_openai_client()
 
         raw_model = call_kwargs["model"]
@@ -133,20 +307,21 @@ class LLMBackend:
 
         oai_kwargs: dict[str, Any] = {
             "model": raw_model,
-            "messages": messages,
-            "temperature": call_kwargs.get("temperature", self.temperature),
-            "max_tokens": call_kwargs.get("max_tokens", self.max_tokens),
+            "max_output_tokens": call_kwargs.get("max_tokens", self.max_tokens),
         }
-        rf = call_kwargs.get("response_format")
-        if rf:
-            oai_kwargs["response_format"] = rf
+        instructions, input_items = self._messages_to_responses_request(messages)
+        if response_format == "json":
+            input_items = self._ensure_json_keyword_in_responses_input(input_items)
+        oai_kwargs["input"] = input_items
+        if instructions:
+            oai_kwargs["instructions"] = instructions
+        text_cfg = self._responses_text_config(response_format)
+        if text_cfg:
+            oai_kwargs["text"] = text_cfg
 
         for attempt in range(_MAX_RETRIES):
             try:
-                response = await client.chat.completions.create(**oai_kwargs)
-                if not hasattr(response, "choices"):
-                    response = await self._stream_to_completion(
-                        client, oai_kwargs, raw_model)
+                response = await client.responses.create(**oai_kwargs)
                 parsed = self._parse_response(response, model_label)
                 if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
                     logger.warning(
@@ -167,16 +342,6 @@ class LLMBackend:
                     )
                     await asyncio.sleep(delay)
                     continue
-                if attempt == 0 and "stream" not in str(e).lower():
-                    try:
-                        response = await self._stream_to_completion(
-                            client, oai_kwargs, raw_model)
-                        parsed = self._parse_response(response, model_label)
-                        trace.llm_call(model_label, messages, parsed,
-                                       response_format=response_format)
-                        return parsed
-                    except Exception:
-                        pass
                 raise
         return None
 
@@ -341,24 +506,26 @@ class LLMBackend:
         model: str,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Tool-calling via the native OpenAI SDK for proxy compatibility."""
+        """Tool-calling via the native OpenAI SDK Responses API."""
         client = self._get_openai_client()
         raw_model = model[len("openai/"):] if model.startswith("openai/") else model
 
         oai_kwargs: dict[str, Any] = {
             "model": raw_model,
-            "messages": messages,
-            "tools": tools,
-            "temperature": kwargs.get("temperature", self.temperature),
-            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+            "tools": self._chat_tools_to_responses_tools(tools),
+            "tool_choice": kwargs.get("tool_choice"),
+            "max_output_tokens": kwargs.get("max_tokens", self.max_tokens),
         }
+        instructions, input_items = self._messages_to_responses_request(messages)
+        oai_kwargs["input"] = input_items
+        if instructions:
+            oai_kwargs["instructions"] = instructions
+        if oai_kwargs["tool_choice"] is None:
+            oai_kwargs.pop("tool_choice")
 
         for attempt in range(_MAX_RETRIES):
             try:
-                response = await client.chat.completions.create(**oai_kwargs)
-                if not hasattr(response, "choices"):
-                    response = await self._stream_to_completion(
-                        client, oai_kwargs, raw_model)
+                response = await client.responses.create(**oai_kwargs)
                 parsed = self._parse_response(response, model)
                 self._hydrate_textual_tool_calls(parsed, tools)
                 if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
@@ -379,15 +546,6 @@ class LLMBackend:
                     )
                     await asyncio.sleep(delay)
                     continue
-                try:
-                    response = await self._stream_to_completion(
-                        client, oai_kwargs, raw_model)
-                    parsed = self._parse_response(response, model)
-                    self._hydrate_textual_tool_calls(parsed, tools)
-                    trace.llm_call(model, messages, parsed, response_format="tool_call")
-                    return parsed
-                except Exception:
-                    pass
                 logger.warning(f"Tool call to {model} failed: {e}")
                 return LLMResponse(text=None, model=model)
         return LLMResponse(text=None, model=model)
@@ -524,7 +682,7 @@ class LLMBackend:
         return None
 
     @staticmethod
-    def _usage_to_dict(usage_obj: Any) -> dict[str, Any]:
+    def _usage_to_dict(usage_obj: Any) -> dict[str, int]:
         if not usage_obj:
             return {}
         raw: Any = usage_obj
@@ -572,14 +730,94 @@ class LLMBackend:
 
         usage = _coerce(raw)
         if not isinstance(usage, dict):
-            return {"raw_usage": usage}
-        usage.setdefault("prompt_tokens", getattr(usage_obj, "prompt_tokens", 0) or 0)
-        usage.setdefault("completion_tokens", getattr(usage_obj, "completion_tokens", 0) or 0)
-        usage.setdefault("total_tokens", getattr(usage_obj, "total_tokens", 0) or 0)
-        return usage
+            return {}
+
+        def _as_int(value: Any) -> int | None:
+            if isinstance(value, bool) or value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return int(value)
+            return None
+
+        summary: dict[str, int] = {}
+        for key in ("input_tokens", "output_tokens", "total_tokens", "prompt_tokens", "completion_tokens"):
+            value = _as_int(usage.get(key))
+            if value is not None:
+                summary[key] = value
+
+        input_details = usage.get("input_tokens_details")
+        if isinstance(input_details, dict):
+            cached_tokens = _as_int(input_details.get("cached_tokens"))
+            if cached_tokens is not None:
+                summary["cached_tokens"] = cached_tokens
+
+        output_details = usage.get("output_tokens_details")
+        if isinstance(output_details, dict):
+            reasoning_tokens = _as_int(output_details.get("reasoning_tokens"))
+            if reasoning_tokens is not None:
+                summary["reasoning_tokens"] = reasoning_tokens
+
+        if "prompt_tokens" not in summary and "input_tokens" in summary:
+            summary["prompt_tokens"] = summary["input_tokens"]
+        if "completion_tokens" not in summary and "output_tokens" in summary:
+            summary["completion_tokens"] = summary["output_tokens"]
+        if "total_tokens" not in summary:
+            prompt = summary.get("prompt_tokens", 0)
+            completion = summary.get("completion_tokens", 0)
+            summary["total_tokens"] = prompt + completion
+        return summary
 
     @staticmethod
     def _parse_response(response: Any, model: str) -> LLMResponse:
+        if isinstance(response, str):
+            return LLMBackend._parse_responses_sse_string(response, model)
+
+        if not getattr(response, "choices", None) and hasattr(response, "output"):
+            output_items = getattr(response, "output", None)
+            if output_items is None:
+                logger.warning(f"Empty output from {model}: {getattr(response, 'error', None) or getattr(response, 'detail', None)}")
+                return LLMResponse(text=None, model=model, raw=response)
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for item in output_items or []:
+                item_type = getattr(item, "type", None)
+                if item_type == "message":
+                    for content in getattr(item, "content", []) or []:
+                        content_type = getattr(content, "type", None)
+                        if content_type == "output_text":
+                            text_value = getattr(content, "text", None)
+                            if text_value:
+                                text_parts.append(str(text_value))
+                    continue
+                if item_type == "function_call":
+                    args = getattr(item, "arguments", None)
+                    parsed_args: Any = args
+                    if isinstance(args, str):
+                        try:
+                            parsed_args = json.loads(args)
+                        except json.JSONDecodeError:
+                            parsed_args = args
+                    tool_calls.append({
+                        "name": getattr(item, "name", ""),
+                        "arguments": parsed_args,
+                    })
+
+            text = "\n".join(part for part in text_parts if part).strip()
+            if not text and output_items is not None and hasattr(response, "output_text"):
+                text = str(getattr(response, "output_text") or "").strip()
+            parsed = LLMBackend._extract_json(text) if text else None
+            usage = {}
+            if hasattr(response, "usage") and response.usage:
+                usage = LLMBackend._usage_to_dict(response.usage)
+            return LLMResponse(
+                text=text or None,
+                parsed=parsed,
+                tool_calls=tool_calls,
+                model=model,
+                usage=usage,
+                raw=response,
+            )
+
         if not getattr(response, "choices", None):
             logger.warning(f"Empty choices from {model}")
             return LLMResponse(text=None, model=model)
@@ -612,6 +850,82 @@ class LLMBackend:
             model=model,
             usage=usage,
             raw=response,
+        )
+
+    @staticmethod
+    def _parse_responses_sse_string(raw: str, model: str) -> LLMResponse:
+        """Parse a proxy-degraded Responses SSE transcript into LLMResponse."""
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        usage: dict[str, Any] = {}
+        completed_response: dict[str, Any] | None = None
+
+        blocks = [block.strip() for block in re.split(r"\n\s*\n", str(raw or "").strip()) if block.strip()]
+        for block in blocks:
+            event_name = ""
+            data_json = None
+            for line in block.splitlines():
+                if line.startswith("event:"):
+                    event_name = line[len("event:"):].strip()
+                elif line.startswith("data:"):
+                    payload = line[len("data:"):].strip()
+                    try:
+                        data_json = json.loads(payload)
+                    except json.JSONDecodeError:
+                        data_json = None
+            if not isinstance(data_json, dict):
+                continue
+
+            if event_name == "response.output_item.done":
+                item = data_json.get("item") or {}
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").strip()
+                if item_type == "message":
+                    for content in item.get("content") or []:
+                        if not isinstance(content, dict):
+                            continue
+                        if str(content.get("type") or "").strip() == "output_text":
+                            text_value = str(content.get("text") or "")
+                            if text_value:
+                                text_parts.append(text_value)
+                    continue
+                if item_type == "function_call":
+                    args = item.get("arguments")
+                    parsed_args: Any = args
+                    if isinstance(args, str):
+                        try:
+                            parsed_args = json.loads(args)
+                        except json.JSONDecodeError:
+                            parsed_args = args
+                    tool_calls.append({
+                        "name": str(item.get("name") or ""),
+                        "arguments": parsed_args,
+                    })
+                    continue
+
+            if event_name == "response.completed":
+                response_payload = data_json.get("response")
+                if isinstance(response_payload, dict):
+                    completed_response = response_payload
+
+        if completed_response and completed_response.get("usage"):
+            usage = LLMBackend._usage_to_dict(completed_response["usage"])
+
+        text = "\n".join(part for part in text_parts if part).strip() or None
+        parsed = LLMBackend._extract_json(text) if text else None
+        if text is None and not tool_calls:
+            logger.warning(
+                f"Empty SSE output from {model}: "
+                f"{(completed_response or {}).get('error') or (completed_response or {}).get('detail')}"
+            )
+        return LLMResponse(
+            text=text,
+            parsed=parsed,
+            tool_calls=tool_calls,
+            model=model,
+            usage=usage,
+            raw=raw,
         )
 
     # ── Multimodal helpers ──────────────────────────────────────────
