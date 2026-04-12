@@ -5215,6 +5215,16 @@ class ExecutorAgent(AgentBase):
                 return answer
         return answer
 
+    @staticmethod
+    def _unwrap_task_terminal_answer(task_type: str, answer: Any) -> Any:
+        if not isinstance(answer, dict):
+            return answer
+        inner = answer.get("answer")
+        wrapped_type = str(answer.get("answer_type") or "").strip()
+        if wrapped_type == str(task_type).strip() and inner is not None:
+            return inner
+        return answer
+
     @classmethod
     def _collect_batch_eval_predictions(
         cls,
@@ -5244,6 +5254,7 @@ class ExecutorAgent(AgentBase):
                     if not isinstance(result, dict):
                         continue
                     answer = result.get("answer", result.get("prediction"))
+                    answer = cls._unwrap_task_terminal_answer(task_type, answer)
                     if task_type == "indicator":
                         answer = cls._canonicalize_indicator_answer(
                             answer,
