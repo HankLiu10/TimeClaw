@@ -955,8 +955,39 @@ class Notes:
             r"(?i)\b(execution context|assigned(?: exploration)? path|assigned branch|branch(?: instructions?)?|training mode|learning-mode|ground truth)\b.*\b(require|requires|required|prioritiz|mandat|must|before finishing)\b",
             r"(?i)\b(required|prioritized?|mandated)\b[^.]{0,80}\bpath\b",
             r"(?i)\bmust use at least one tool\b",
+            r"(?i)\b(?:i|we)\s+must call a tool\b",
+            r"(?i)\btool call\b[^.]{0,40}\b(?:is|required|required|mandated)\b",
+            r"(?i)\b(tool call|tool)\b[^.]{0,80}\b(mandatory|required|mandated|must be called)\b[^.]{0,40}\bthis turn\b",
+            r"(?i)\btool\b[^.]{0,40}\bmust be called\b[^.]{0,20}\bnow\b",
+            r"(?i)\b(?:latest|current|developer|immediate-response)\s+instruction\b[^.]{0,100}\brequires?\b[^.]{0,40}\btool call\b",
+            r"(?i)\b(?:immediate|latest|current)\s+instruction\b[^.]{0,120}\bcalling?\s+a\s+tool\b",
+            r"(?i)\brequires?\b[^.]{0,20}\banother tool call\b",
+            r"(?i)\breserved for finishing\b",
+            r"(?i)\bmost (?:relevant|useful|efficient|direct)\b[^.]{0,100}\b(?:available tool|remaining evidence(?:-gathering)? step|next evidence step|remaining evidence)\b",
+            r"(?i)\bmost (?:relevant|useful|informative|efficient|direct)\b[^.]{0,120}\b(?:tool|path|candidate|validation|evidence(?:-producing)? step)\b",
+            r"(?i)\bremaining\b[^.]{0,80}\bevidence step\b",
+            r"(?i)\bsupport the existing (?:classification|forecast|answer)\b",
+            r"(?i)\bexisting branch answer\b",
+            r"(?i)\bbranch-valid\b",
+            r"(?i)\bfailed consistency check\b",
+            r"(?i)\bbefore finalizing\b",
+            r"(?i)\btask\b[^.]{0,80}\brequires?\b",
+            r"(?i)\bexplicitly prioritiz(?:e|es|ed|ing)\b",
+            r"(?i)\bevidence-producing step\b",
+            r"(?i)\b(?:most|next|additional|final|remaining)\b[^.]{0,120}\b(?:step|evidence|diagnostic|validation|check)\b",
+            r"(?i)\b(?:sanity check|verify|better supported)\b",
+            r"(?i)\b(?:i|we)\s+still need\b",
+            r"(?i)\b(?:independent|multiple)\s+branches?\b",
+            r"(?i)\bcan separately reason\b",
+            r"(?i)\bselected forecast\b",
         )
         if any(re.search(pattern, cleaned) for pattern in framework_patterns):
+            return ""
+        meta_output_patterns = (
+            r"(?i)\b(saved|existing|unchanged|exact)\b[^.]{0,50}\b(answer|label|payload|json)\b",
+            r"(?i)\b(return(?:ing)?|reuse(?:d|ing)?|preserv(?:e|ing)?|repair(?:ed|ing)?)\b[^.]{0,80}\b(answer|label|payload|json)\b",
+        )
+        if any(re.search(pattern, cleaned) for pattern in meta_output_patterns):
             return ""
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,:;|-")
         lower = cleaned.lower()
@@ -973,8 +1004,42 @@ class Notes:
             "ground truth",
             "training mode",
             "learning-mode",
+            "learning mode",
+            "branch comparison",
+            "task-valid",
+            "next step",
+            "next evidence step",
+            "must be called now",
+            "another tool call",
+            "immediate-response instruction",
+            "existing branch answer",
+            "tool call",
+            "call a tool",
+            "calling a tool",
+            "reserved for finishing",
+            "branch-valid",
+            "failed consistency check",
+            "in this branch",
+            "most direct next step",
+            "most efficient next step",
+            "most relevant final evidence tool",
+            "most informative next single step",
+            "task requires",
+            "explicitly prioritizes",
+            "evidence-producing step",
+            "additional step",
+            "additional evidence",
+            "remaining diagnostic",
+            "independent branches",
+            "separately reason",
+            "selected forecast",
+            "sanity check",
+            "better supported",
+            "still need",
         )
         if any(marker in lower for marker in banned_markers):
+            return ""
+        if lower.startswith("tool "):
             return ""
         # Keep short but meaningful tool intentions such as "run ets" instead
         # of dropping them purely due to length.
@@ -984,6 +1049,25 @@ class Notes:
 
     @staticmethod
     def _compact_candidate_reasoning(trace: dict[str, Any]) -> str:
+        if "public_reasoning_snippets" in trace:
+            public_snippets = trace.get("public_reasoning_snippets")
+            if not isinstance(public_snippets, list):
+                return ""
+            cleaned_public = [
+                str(item).strip()
+                for item in public_snippets
+                if str(item).strip()
+            ]
+            if cleaned_public:
+                rendered: list[str] = []
+                for snippet in cleaned_public[:2]:
+                    snippet = snippet[0].upper() + snippet[1:] if snippet else snippet
+                    if not snippet.endswith("."):
+                        snippet += "."
+                    rendered.append(snippet)
+                return " ".join(rendered)
+            return ""
+
         steps = trace.get("steps")
         if isinstance(steps, list):
             snippets: list[str] = []
@@ -993,13 +1077,16 @@ class Notes:
                 raw = str(step.get("thought") or "").strip()
                 if not raw:
                     continue
-                snippet = Notes._sanitize_candidate_reasoning(raw)
-                if not snippet:
-                    continue
-                snippet = snippet[0].upper() + snippet[1:] if snippet else snippet
-                if not snippet.endswith("."):
-                    snippet += "."
-                snippets.append(snippet)
+                for part in re.split(r"(?<=[.!?])\s+|[;\n]+", raw):
+                    snippet = Notes._sanitize_candidate_reasoning(part)
+                    if not snippet:
+                        continue
+                    snippet = snippet[0].upper() + snippet[1:] if snippet else snippet
+                    if not snippet.endswith("."):
+                        snippet += "."
+                    snippets.append(snippet)
+                    if len(snippets) >= 2:
+                        break
                 if len(snippets) >= 2:
                     break
             if snippets:
@@ -1011,6 +1098,12 @@ class Notes:
         tool_chain = [t for t in trace.get("tool_chain", []) if t and t not in _FRAMEWORK_TOOLS]
         if tool_chain == ["basic_stats"]:
             return "Relied on global summary statistics without an explicit future-path estimate."
+
+        metrics = trace.get("metrics") or {}
+        if bool(metrics.get("correct")):
+            return ""
+        if isinstance(metrics.get("accuracy"), (int, float)) and float(metrics["accuracy"]) >= 0.999:
+            return ""
 
         steps = trace.get("steps")
         if isinstance(steps, list):
@@ -1025,7 +1118,7 @@ class Notes:
                         numeric = [float(v) for v in forecast if isinstance(v, (int, float))]
                         if len(numeric) >= 3 and max(numeric) - min(numeric) < 0.5:
                             return "Forecast path was nearly flat, which can miss structured seasonality."
-        _, score_label, _ = Notes._candidate_score(trace.get("metrics") or {})
+        _, score_label, _ = Notes._candidate_score(metrics)
         if score_label:
             return f"This path recorded {score_label} on the sample."
         return ""
@@ -1081,6 +1174,9 @@ class Notes:
         name = str(trace.get("name") or "").strip()
         tool_chain = [t for t in trace.get("tool_chain", []) if t and t not in _FRAMEWORK_TOOLS]
         if name and not re.fullmatch(r"(slot|candidate|approach)_\d+", name):
+            if tool_chain and name not in tool_chain:
+                combined = " → ".join([name, *tool_chain[:2]])
+                return combined[:80]
             return name[:80]
         if tool_chain:
             return " → ".join(tool_chain[:3])[:80]
@@ -2564,10 +2660,16 @@ class DistillationAgent:
                         progressed = True
                     else:
                         break
-                elif not memory_fp and self.skills.get_skill(scope):
-                    self.skills.delete_skill(scope)
-                    await self._update_scope_state(scope, memory_to_skills_done_fingerprint="")
-                    progressed = True
+                elif not memory_fp:
+                    cleared = False
+                    if self.skills.get_skill(scope):
+                        self.skills.delete_skill(scope)
+                        cleared = True
+                    if str(state.get("memory_to_skills_done_fingerprint", "") or ""):
+                        await self._update_scope_state(scope, memory_to_skills_done_fingerprint="")
+                        cleared = True
+                    if cleared:
+                        progressed = True
 
                 state = await self._get_scope_state(scope)
                 if memory_fp and memory_fp != str(state.get("memory_to_tools_done_fingerprint", "") or ""):
@@ -2579,10 +2681,16 @@ class DistillationAgent:
                         progressed = True
                     else:
                         break
-                elif not memory_fp and self.tools.get_notes(scope):
-                    self.tools.replace(scope, {})
-                    await self._update_scope_state(scope, memory_to_tools_done_fingerprint="")
-                    progressed = True
+                elif not memory_fp:
+                    cleared = False
+                    if self.tools.get_notes(scope):
+                        self.tools.replace(scope, {})
+                        cleared = True
+                    if str(state.get("memory_to_tools_done_fingerprint", "") or ""):
+                        await self._update_scope_state(scope, memory_to_tools_done_fingerprint="")
+                        cleared = True
+                    if cleared:
+                        progressed = True
 
                 if not progressed:
                     break
@@ -2606,9 +2714,15 @@ class DistillationAgent:
                     break
                 if not memory_fp:
                     cross_scope = _cross_domain_scope_for_bucket(bucket)
+                    cleared = False
                     if self.memory.get_entries(cross_scope):
                         self.memory.replace_entries(cross_scope, [])
+                        cleared = True
+                    if str(state.get("memory_to_cross_done_fingerprint", "") or ""):
                         await self._update_bucket_state(bucket, memory_to_cross_done_fingerprint="")
+                        cleared = True
+                    if cleared:
+                        continue
                     break
                 break
         finally:

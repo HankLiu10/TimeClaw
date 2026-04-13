@@ -4,6 +4,7 @@ from timeclaw.benchmark import pipeline_eval as pipeline_eval_mod
 from timeclaw.benchmark.mtbench_support import (
     generate_learning_analysis,
     render_learning_analysis_text,
+    render_learning_summary_from_analysis,
 )
 from timeclaw.benchmark.mtbench_support import learning_analysis as learning_analysis_mod
 from timeclaw.agents.reasoner import ReasonerAgent
@@ -30,6 +31,42 @@ def test_render_learning_analysis_text_uses_four_sections():
     assert "Winner Evidence:" in text
     assert "Failure Signals:" in text
     assert "Reusable Rule:" in text
+
+
+def test_render_learning_summary_from_analysis_uses_data_characteristics_not_control_flow():
+    insight, recommendation = render_learning_summary_from_analysis(
+        {
+            "sample_conditions": [
+                "recent window is flat with low volatility",
+                "the question asks for a categorical direction label",
+            ],
+            "winner_evidence": [
+                "llm_reasoning_classification matched the flat recent window better than detect_trend",
+            ],
+            "failure_signals": [
+                "detect_trend over-read a weak uptick",
+            ],
+            "reusable_rule": [
+                "When the recent window is flat and the task asks for a direction label, consider llm_reasoning_classification before detect_trend.",
+            ],
+        },
+        winner_trace={
+            "name": "normalize",
+            "tool_chain": ["normalize", "normalize", "llm_reasoning_classification"],
+            "prediction": "stable",
+            "metrics": {"accuracy": 1.0},
+        },
+        winner_correct=True,
+    )
+
+    combined = f"{insight} {recommendation}".lower()
+    assert "recent window is flat" in combined
+    assert "task-valid" not in combined
+    assert "next step" not in combined
+    assert "llm_reasoning_classification matched the flat recent window better than detect_trend" in insight
+    assert "detect_trend over-read a weak uptick" in insight
+    assert "accepted tool chain was" not in insight.lower()
+    assert "winner for this run" not in insight.lower()
 
 
 def test_daily_note_labels_winner_tool_section():
@@ -103,6 +140,159 @@ def test_daily_note_drops_boilerplate_reasoning_fallback_when_no_real_reasoning(
 
     assert "Used the value_at path for this candidate." not in note
     assert "  Reasoning:" not in note
+
+
+def test_daily_note_reasoning_drops_next_evidence_step_wording():
+    cleaned = Notes._sanitize_candidate_reasoning(
+        "We already have time-series diagnostics showing a statistically significant downward trend, "
+        "but the task explicitly requires combining that with the news text; the most efficient next "
+        "evidence step is to classify the multimodal trend directly using the provided series and news context."
+    )
+
+    assert cleaned == ""
+
+
+def test_daily_note_reasoning_drops_malformed_tool_prefix():
+    cleaned = Notes._sanitize_candidate_reasoning(
+        "Tool while combining the observed strong downward time-series trend with the mixed but slightly supportive news context."
+    )
+
+    assert cleaned == ""
+
+
+def test_daily_note_reasoning_drops_tool_call_mandate_now_wording():
+    cleaned = Notes._sanitize_candidate_reasoning(
+        "A tool must be called now, and we need concise supporting evidence after the failed consistency "
+        "check. The most relevant single step is to quantify recent endpoint weakness directly from the "
+        "series to reinforce the existing branch answer. The latest evidence already supports a bearish "
+        "classification, but the immediate-response instruction requires another tool call."
+    )
+
+    assert cleaned == ""
+
+
+def test_daily_note_reasoning_drops_immediate_tool_call_finish_wording():
+    cleaned = Notes._sanitize_candidate_reasoning(
+        "A tool call is required immediately, and with only one later turn reserved for finishing, "
+        "the most relevant final validation is a broad bound sanity check on the existing branch-valid forecast."
+    )
+
+    assert cleaned == ""
+
+
+def test_daily_note_reasoning_drops_immediate_instruction_and_final_tool_wording():
+    cleaned = Notes._sanitize_candidate_reasoning(
+        "The immediate instruction requires calling a tool this turn, and we already have forecast candidates "
+        "plus a concise news summary."
+    )
+
+    assert cleaned == ""
+
+
+def test_daily_note_reasoning_drops_task_requires_and_path_priority_wording():
+    cleaned = Notes._sanitize_candidate_reasoning(
+        "The task requires a forecast-based candidate and explicitly prioritizes the ets_forecast path."
+    )
+
+    assert cleaned == ""
+
+
+def test_daily_note_display_candidate_name_combines_mismatched_name_and_tool():
+    name = Notes._display_candidate_name(
+        {
+            "name": "timesfm2_forecast",
+            "tool_chain": ["llm_reasoning_forecast"],
+        },
+        0,
+    )
+
+    assert name == "timesfm2_forecast → llm_reasoning_forecast"
+
+
+def test_daily_note_omits_weakness_for_perfect_accuracy_candidate():
+    note = Notes._build_note(  # type: ignore[misc]
+        Notes.__new__(Notes),
+        {
+            "scope_key": "finance_aligned_long_trend",
+            "candidate_traces": [
+                {
+                    "name": "llm_reasoning_classification",
+                    "tool_chain": ["llm_reasoning_classification"],
+                    "metrics": {"accuracy": 1.0},
+                    "prediction": "<-4%",
+                    "steps": [],
+                }
+            ],
+        },
+    )
+
+    assert "Weakness: This path recorded acc=1.000" not in note
+
+
+def test_daily_note_compact_reasoning_splits_and_drops_control_flow_sentences():
+    reasoning = Notes._compact_candidate_reasoning(
+        {
+            "steps": [
+                {
+                    "thought": (
+                        "The immediate instruction requires calling a tool this turn, and we already have "
+                        "forecast candidates plus a concise news summary. The most relevant final evidence tool "
+                        "is keyword extraction on the article to confirm the dominant bullish themes supporting "
+                        "the multimodal interpretation."
+                    )
+                }
+            ]
+        }
+    )
+
+    assert reasoning == ""
+
+
+def test_daily_note_compact_reasoning_prefers_public_snippets_over_raw_thought():
+    reasoning = Notes._compact_candidate_reasoning(
+        {
+            "public_reasoning_snippets": [
+                "recent window dropped by 7.6%, which already matches the <-4% bucket"
+            ],
+            "steps": [
+                {
+                    "thought": (
+                        "We still need recent-window quantitative evidence to support the classification."
+                    )
+                }
+            ],
+        }
+    )
+
+    assert reasoning == "Recent window dropped by 7.6%, which already matches the <-4% bucket."
+
+
+def test_daily_note_reasoning_drops_additional_step_and_remaining_diagnostic_wording():
+    cleaned = Notes._sanitize_candidate_reasoning(
+        "The most relevant additional step is a sanity check on the produced 78-step forecast against "
+        "observed historical bounds. The most relevant remaining diagnostic is uncertainty quantification "
+        "for the selected forecast using the historical series."
+    )
+
+    assert cleaned == ""
+
+
+def test_daily_note_reasoning_drops_independent_branch_comparison_wording():
+    cleaned = Notes._sanitize_candidate_reasoning(
+        "Independent branches can separately reason from trend diagnostics versus explicit forecasting "
+        "with weather-text context."
+    )
+
+    assert cleaned == ""
+
+
+def test_daily_note_reasoning_drops_still_need_evidence_wording():
+    cleaned = Notes._sanitize_candidate_reasoning(
+        "We already have global trend evidence showing a strong downtrend, but we still need recent-window "
+        "quantitative evidence on late-series weakness to support the classification."
+    )
+
+    assert cleaned == ""
 
 
 def test_normalise_candidate_key_prefers_tool_chain_over_slot_name():
@@ -322,6 +512,15 @@ def test_generate_learning_analysis_sanitizes_framework_preface_but_keeps_eviden
     assert "required hinted tool" not in cleaned.lower()
     assert cleaned.startswith("entropy returned sample_entropy 0.778")
     assert "spectral_entropy 3.599" in cleaned
+
+
+def test_generate_learning_analysis_drops_control_flow_meta_item():
+    cleaned = learning_analysis_mod._sanitize_analysis_item(
+        "The current branch state confirms that the task-valid answer is available from a real tool result and may be returned unchanged as the final classification.",
+        {},
+    )
+
+    assert cleaned == ""
 
 
 def test_daily_note_prefers_llm_text_signals_when_present():
@@ -553,8 +752,56 @@ def test_extract_candidate_traces_from_top_level_execution_log():
         ]
     )
 
-    assert [trace["name"] for trace in traces] == ["chronos2_forecast", "llm_reasoning_forecast"]
-    assert traces[1]["metrics"] == {"mae": 0.5, "rmse": 0.7}
+    assert len(traces) == 1
+    assert traces[0]["name"] == "chronos2_forecast"
+    assert traces[0]["tool_chain"] == ["chronos2_forecast", "llm_reasoning_forecast"]
+    assert traces[0]["prediction"] == [2.0, 3.0, 4.0]
+    assert traces[0]["metrics"] == {"mae": 0.5, "rmse": 0.7}
+
+
+def test_extract_candidate_traces_keeps_multi_step_top_level_path_intact_before_spawn():
+    traces = PipelineRunner._extract_candidate_traces(
+        [
+            {
+                "tool": "segment",
+                "thought": "Reason: group the hourly series into daily windows. Action: run segment.",
+                "observation": {"segments": [[1, 2], [3, 4]]},
+            },
+            {
+                "tool": "llm_reasoning_classification",
+                "thought": "Reason: apply the day-level rule. Action: classify.",
+                "observation": {"answer": "decreasing"},
+            },
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "decreasing",
+                            "execution_log": [
+                                {
+                                    "tool": "llm_reasoning_classification",
+                                    "observation": {"answer": "decreasing"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                "tool": "evaluate_against_gt",
+                "args": {"prediction": "decreasing"},
+                "observation": {"metrics": {"accuracy": 1.0, "correct": True}},
+            },
+        ]
+    )
+
+    assert len(traces) == 2
+    assert traces[0]["tool_chain"] == ["segment", "llm_reasoning_classification"]
+    assert traces[0]["candidate_key"] == "segment -> llm_reasoning_classification"
+    assert traces[0]["metrics"] == {"accuracy": 1.0, "correct": True}
+    assert traces[1]["tool_chain"] == ["llm_reasoning_classification"]
 
 
 def test_winner_trace_selection_uses_candidate_ranking_not_metrics_identity():
@@ -933,6 +1180,20 @@ def test_daily_note_keeps_full_candidate_reasoning_without_truncation():
 
     assert "because the late-sample drift is the strongest signal in this case" in note
     assert "would miss the regime break." in note
+
+
+def test_notes_compact_candidate_reasoning_respects_explicit_empty_public_snippets():
+    trace = {
+        "public_reasoning_snippets": [],
+        "steps": [
+            {
+                "tool": "llm_reasoning_classification",
+                "thought": "The most relevant next step is to classify with the multimodal tool.",
+            }
+        ],
+    }
+
+    assert Notes._compact_candidate_reasoning(trace) == ""
 
 
 def test_text_signals_rank_sentences_by_task_relevance():

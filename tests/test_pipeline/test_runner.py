@@ -12,6 +12,7 @@ import pytest
 from timeclaw.core import trace_logger as trace
 from timeclaw.core.config import LLMConfig, LLMModelConfig, TimeClawConfig
 from timeclaw.llm.base import LLMResponse
+from timeclaw.pipeline import runner as runner_mod
 from timeclaw.pipeline.runner import PipelineRunner
 
 
@@ -221,3 +222,93 @@ def test_sanitize_reasoning_clause_rewrites_i_ran_tool():
 
     assert "i ran hurst_exponent" not in cleaned.lower()
     assert cleaned == "hurst_exponent was run on the full 130-point series"
+
+
+@pytest.mark.asyncio
+async def test_rewrite_learning_summary_from_analysis_replaces_control_flow_wording(monkeypatch):
+    runner = PipelineRunner(disable_memory=True)
+
+    async def _fake_generate(**_kwargs):
+        return (
+            {
+                "sample_conditions": ["recent window is flat with low volatility"],
+                "winner_evidence": ["llm_reasoning_classification matched the flat window better than detect_trend"],
+                "failure_signals": ["detect_trend over-read a weak uptick"],
+                "reusable_rule": ["When the recent window is flat, consider llm_reasoning_classification before detect_trend."],
+            },
+            "ignored",
+        )
+
+    monkeypatch.setattr(runner_mod, "generate_learning_analysis", _fake_generate)
+
+    rewritten, structured, _summary_text = await runner._rewrite_learning_summary_from_analysis(
+        {
+            "insight": "The strongest next step is to reuse the task-valid answer.",
+            "recommendation": "Return the saved payload unchanged.",
+            "winner_candidate": "llm_reasoning_classification",
+        },
+        execution_log=[
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "stable",
+                            "execution_log": [
+                                {"tool": "llm_reasoning_classification", "observation": {"answer": "stable"}}
+                            ],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "up",
+                            "execution_log": [
+                                {"tool": "detect_trend", "observation": {"trend": "up"}}
+                            ],
+                        },
+                    },
+                ],
+            },
+            {
+                "tool": "evaluate_batch_against_gt",
+                "observation": {
+                    "results": [
+                        {"name": "llm_reasoning_classification", "metrics": {"accuracy": 1.0}},
+                        {"name": "detect_trend", "metrics": {"accuracy": 0.0}},
+                    ],
+                },
+            },
+        ],
+        task_type="classification",
+        description="trend classification task",
+        domain="finance",
+        scope_keys=["finance_aligned_short_trend"],
+        fingerprint={"length": 96, "trend": "flat"},
+        profiling_results={},
+        horizon=None,
+        reasoning="1. Saved answer already exists.",
+    )
+
+    assert structured is not None
+    combined = f"{rewritten['insight']} {rewritten['recommendation']}".lower()
+    assert "task-valid" not in combined
+    assert "saved payload" not in combined
+    assert "recent window is flat" in combined
+
+
+def test_sanitize_reasoning_clause_drops_packaging_only_language():
+    cleaned = PipelineRunner._sanitize_reasoning_clause(
+        "Returning the corrected final JSON with unchanged saved label and explicit numbered tool-by-tool reasoning."
+    )
+
+    assert cleaned == ""
+
+
+def test_sanitize_reasoning_clause_drops_execution_meta_language():
+    cleaned = PipelineRunner._sanitize_reasoning_clause(
+        "A task-valid indicator answer already exists, but the latest instruction requires an immediate tool call before yielding."
+    )
+
+    assert cleaned == ""

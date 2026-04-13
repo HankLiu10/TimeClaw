@@ -421,6 +421,226 @@ def test_extract_candidate_traces_accepts_list_tools_hint():
     assert traces[0]["steps"][0]["tool"] == "llm_reasoning_qa"
 
 
+def test_extract_candidate_traces_keeps_top_level_candidates_in_batch_eval_order():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_classification",
+            "observation": {"answer": "+2% ~ +4%"},
+        },
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "-2% ~ +2%",
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "observation": {"answer": "-2% ~ +2%"},
+                            }
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "+2% ~ +4%",
+                        "execution_log": [
+                            {"tool": "segment", "observation": {"segments": [[1.0], [2.0]]}},
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "observation": {"answer": "+2% ~ +4%"},
+                            },
+                        ],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "observation": {
+                "results": [
+                    {
+                        "name": "approach_0",
+                        "metrics": {"accuracy": 1.0, "correct": True},
+                        "prediction": "+2% ~ +4%",
+                    },
+                    {
+                        "name": "approach_1",
+                        "metrics": {"accuracy": 0.0, "correct": False},
+                        "prediction": "-2% ~ +2%",
+                    },
+                    {
+                        "name": "approach_2",
+                        "metrics": {"accuracy": 1.0, "correct": True},
+                        "prediction": "+2% ~ +4%",
+                    },
+                ],
+            },
+        },
+    ]
+
+    traces = PipelineRunner._extract_candidate_traces(execution_log)
+
+    assert len(traces) == 3
+    assert traces[0]["tool_chain"] == ["llm_reasoning_classification"]
+    assert traces[0]["prediction"] == "+2% ~ +4%"
+    assert traces[0]["metrics"]["accuracy"] == 1.0
+    assert traces[1]["tool_chain"] == ["llm_reasoning_classification"]
+    assert traces[1]["prediction"] == "-2% ~ +2%"
+    assert traces[1]["metrics"]["accuracy"] == 0.0
+    assert traces[2]["tool_chain"] == ["segment", "llm_reasoning_classification"]
+    assert traces[2]["prediction"] == "+2% ~ +4%"
+    assert traces[2]["metrics"]["accuracy"] == 1.0
+
+
+def test_extract_candidate_traces_trims_top_level_validation_tail_after_answer_step():
+    execution_log = [
+        {
+            "tool": "timesfm2_forecast",
+            "observation": {"point_forecast": [10.0, 9.8, 9.7]},
+        },
+        {
+            "tool": "llm_reasoning_forecast",
+            "observation": {"answer": [10.0, 9.9, 9.8]},
+        },
+        {
+            "tool": "uncertainty_quantify",
+            "observation": {"interval": [9.5, 10.3]},
+        },
+        {
+            "tool": "window_stats",
+            "observation": {"mean": 9.9},
+        },
+        {
+            "tool": "fol_check",
+            "observation": {"passed": True},
+        },
+        {
+            "tool": "evaluate_against_gt",
+            "args": {"prediction": [10.0, 9.9, 9.8]},
+            "observation": {"metrics": {"mae": 0.1}},
+        },
+    ]
+
+    traces = PipelineRunner._extract_candidate_traces(execution_log)
+
+    assert len(traces) == 2
+    assert traces[0]["tool_chain"] == ["timesfm2_forecast"]
+    assert traces[0]["prediction"] == [10.0, 9.8, 9.7]
+    assert traces[1]["tool_chain"] == [
+        "llm_reasoning_forecast",
+        "uncertainty_quantify",
+        "window_stats",
+        "fol_check",
+    ]
+    assert traces[1]["prediction"] == [10.0, 9.9, 9.8]
+    assert traces[1]["metrics"] == {"mae": 0.1}
+
+
+def test_extract_candidate_traces_splits_multiple_answer_steps_in_one_trace():
+    execution_log = [
+        {
+            "tool": "aurora_forecast",
+            "observation": {"point_forecast": [11.4, 11.5]},
+        },
+        {
+            "tool": "llm_reasoning_forecast",
+            "observation": {"answer": [11.45, 11.55]},
+        },
+        {
+            "tool": "uncertainty_quantify",
+            "observation": {"mean_width": 0.4},
+        },
+        {
+            "tool": "sentiment",
+            "observation": {"sentiments": [{"polarity": "positive"}]},
+        },
+        {
+            "tool": "ets_forecast",
+            "observation": {"forecast": [12.8, 12.9]},
+        },
+    ]
+
+    traces = PipelineRunner._extract_candidate_traces(execution_log)
+
+    assert len(traces) == 3
+    assert traces[0]["tool_chain"] == ["aurora_forecast"]
+    assert traces[0]["prediction"] == [11.4, 11.5]
+    assert traces[1]["tool_chain"] == [
+        "llm_reasoning_forecast",
+        "uncertainty_quantify",
+        "sentiment",
+    ]
+    assert traces[1]["prediction"] == [11.45, 11.55]
+    assert traces[2]["tool_chain"] == ["ets_forecast"]
+    assert traces[2]["prediction"] == [12.8, 12.9]
+
+
+def test_extract_candidate_traces_matches_same_display_name_batch_results_by_stable_branch_key():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 0,
+                        "answer": "stable",
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "observation": {"answer": "stable"},
+                            }
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 1,
+                        "answer": "increasing",
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "observation": {"answer": "increasing"},
+                            }
+                        ],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "observation": {
+                "results": [
+                    {
+                        "name": "slot_0",
+                        "metrics": {"accuracy": 0.0, "correct": False},
+                        "prediction": "stable",
+                    },
+                    {
+                        "name": "slot_1",
+                        "metrics": {"accuracy": 1.0, "correct": True},
+                        "prediction": "increasing",
+                    },
+                ],
+            },
+        },
+    ]
+
+    traces = PipelineRunner._extract_candidate_traces(execution_log)
+
+    assert len(traces) == 2
+    assert traces[0]["name"] == "llm_reasoning_classification"
+    assert traces[0]["prediction"] == "stable"
+    assert traces[0]["metrics"]["accuracy"] == 0.0
+    assert traces[1]["name"] == "llm_reasoning_classification"
+    assert traces[1]["prediction"] == "increasing"
+    assert traces[1]["metrics"]["accuracy"] == 1.0
+
+
 def test_normalize_learning_summary_answer_adds_winner_fields_from_execution_log():
     execution_log = [
         {
@@ -463,7 +683,7 @@ def test_normalize_learning_summary_answer_adds_winner_fields_from_execution_log
         execution_log,
     )
 
-    assert "Winner for this run: chronos2_forecast" in normalized["insight"]
+    assert "Strongest path on this sample: `chronos2_forecast`" in normalized["insight"]
     assert "mae=1.200" in normalized["insight"]
     assert "Reusable lesson:" in normalized["recommendation"]
     assert "`chronos2_forecast`" in normalized["recommendation"]
@@ -571,7 +791,7 @@ def test_normalize_learning_summary_answer_uses_failure_first_insight_for_incorr
     assert normalized["winner_candidate"] == "segment"
     assert normalized["winner_prediction"] == "stable"
     assert normalized["winner_metrics"] == {"accuracy": 0.0, "correct": False}
-    assert normalized["insight"].startswith("No correct winner on this run.")
+    assert normalized["insight"].startswith("Strongest failed path:")
     assert "Winner for this run:" not in normalized["insight"]
     assert "Why it still looked plausible:" in normalized["insight"]
     assert normalized["recommendation"].startswith("Failure pattern:")
@@ -674,6 +894,307 @@ def test_normalize_learning_summary_answer_matches_winner_prediction_without_bro
     assert normalized["winner_prediction"] == [13.7, 13.5, 13.3, 13.1]
 
 
+def test_select_learning_summary_winner_trace_disambiguates_same_tool_chain_by_prediction():
+    candidate_traces = [
+        {
+            "name": "llm_reasoning_classification",
+            "tool_chain": ["llm_reasoning_classification"],
+            "prediction": "stable",
+            "reasoning": "The direct classifier judged the daily means as flat overall.",
+        },
+        {
+            "name": "llm_reasoning_classification",
+            "tool_chain": ["llm_reasoning_classification"],
+            "prediction": "increasing",
+            "reasoning": "The same classifier found a positive daily-mean slope.",
+        },
+    ]
+
+    winner = PipelineRunner._select_learning_summary_winner_trace(
+        {
+            "winner_tool_chain": ["llm_reasoning_classification"],
+            "winner_prediction": "increasing",
+            "insight": "The classification branch that returned increasing was the winner.",
+        },
+        candidate_traces,
+    )
+
+    assert winner is not None
+    assert winner["prediction"] == "increasing"
+    assert winner["reasoning"] == "The same classifier found a positive daily-mean slope."
+
+
+def test_select_learning_summary_winner_trace_disambiguates_same_name_by_prediction():
+    candidate_traces = [
+        {
+            "name": "llm_reasoning_classification",
+            "tool_chain": ["llm_reasoning_classification"],
+            "prediction": "stable",
+            "reasoning": "The direct classifier judged the daily means as flat overall.",
+        },
+        {
+            "name": "llm_reasoning_classification",
+            "tool_chain": ["llm_reasoning_classification"],
+            "prediction": "decreasing",
+            "reasoning": "The same classifier found a clearly negative daily-mean slope.",
+        },
+    ]
+
+    winner = PipelineRunner._select_learning_summary_winner_trace(
+        {
+            "winner_candidate": "llm_reasoning_classification",
+            "winner_prediction": "decreasing",
+            "insight": "The llm_reasoning_classification branch that returned decreasing was selected.",
+        },
+        candidate_traces,
+    )
+
+    assert winner is not None
+    assert winner["prediction"] == "decreasing"
+    assert winner["reasoning"] == "The same classifier found a clearly negative daily-mean slope."
+
+
+def test_extract_candidate_traces_prefers_observed_tool_answer_over_wrapped_result_answer():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "C",
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_qa",
+                                "thought": "Pick the best answer from the article and price action.",
+                                "observation": {"answer": "B"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ]
+
+    traces = PipelineRunner._extract_candidate_traces(execution_log)
+
+    assert traces[0]["prediction"] == "B"
+    assert traces[0]["steps"][0]["tool"] == "llm_reasoning_qa"
+
+
+def test_extract_candidate_traces_attaches_public_reasoning_snippets():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_classification",
+            "thought": (
+                "We still need recent-window quantitative evidence to support the classification. "
+                "The last 24 points fall by 7.6%, which already matches the <-4% bucket."
+            ),
+            "observation": {"answer": "<-4%"},
+        }
+    ]
+
+    traces = PipelineRunner._extract_candidate_traces(execution_log)
+
+    assert traces
+    assert traces[0]["public_reasoning_snippets"] == []
+
+
+def test_extract_candidate_traces_public_reasoning_ignores_final_candidate_summary():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "stable",
+                        "reasoning": (
+                            "1. Additional evidence did not replace that answer with a new valid "
+                            "branch answer to use instead.\n"
+                            "2. The last three daily means differ by less than 0.1C, so the "
+                            "near-term class is stable.\n"
+                            "3. The final-turn instructions require no more tool calls."
+                        ),
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "thought": (
+                                    "The last three daily means differ by less than 0.1C, so the "
+                                    "near-term class is stable."
+                                ),
+                                "observation": {"answer": "stable"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ]
+
+    traces = PipelineRunner._extract_candidate_traces(execution_log)
+
+    assert traces
+    assert traces[0]["public_reasoning_snippets"] == [
+        "The last three daily means differ by less than 0.1C, so the near-term class is stable"
+    ]
+
+
+def test_extract_candidate_traces_public_reasoning_can_be_empty_when_only_final_summary_exists():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "stable",
+                        "reasoning": (
+                            "1. The task requires the final answer to exactly match a prior "
+                            "tool-produced answer in this branch.\n"
+                            "2. Return the saved label unchanged."
+                        ),
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "thought": "",
+                                "observation": {"answer": "stable"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ]
+
+    traces = PipelineRunner._extract_candidate_traces(execution_log)
+
+    assert traces
+    assert traces[0]["public_reasoning_snippets"] == []
+
+
+def test_normalize_learning_summary_answer_rewrites_explicit_summary_when_text_conflicts_with_trace():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "decreasing",
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "thought": "Classify the daily means with the task rule.",
+                                "observation": {"answer": "stable"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "winner_candidate": "llm_reasoning_classification",
+            "insight": "The llm_reasoning_classification branch returned the task-valid answer decreasing.",
+            "recommendation": "Reuse decreasing in similar samples.",
+            "reasoning": "1. The selected branch returned decreasing.",
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_candidate"] == "llm_reasoning_classification"
+    assert normalized["winner_prediction"] == "stable"
+    assert "stable" in normalized["insight"]
+    assert "decreasing" not in normalized["insight"]
+
+
+def test_normalize_learning_summary_answer_rewrites_meta_finalization_summary():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "decreasing",
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "thought": "Classify the daily means with the task rule.",
+                                "observation": {"answer": "decreasing"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "winner_candidate": "llm_reasoning_classification",
+            "insight": "Winner for this run: llm_reasoning_classification. Why it won: Returning the corrected final JSON with unchanged saved label.",
+            "recommendation": "Reuse the exact saved answer unchanged next time.",
+            "reasoning": "1. Preserved the existing payload.\n2. Returned the corrected final JSON.",
+        },
+        execution_log,
+    )
+
+    assert "corrected final json" not in normalized["insight"].lower()
+    assert "saved label" not in normalized["insight"].lower()
+    assert "reuse the exact saved answer" not in normalized["recommendation"].lower()
+    assert "decreasing" in normalized["insight"]
+
+
+def test_normalize_learning_summary_answer_rewrites_meta_execution_summary():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "decreasing",
+                        "execution_log": [
+                            {
+                                "tool": "segment",
+                                "thought": "Split the hourly readings into daily windows.",
+                                "observation": {"segments": [[1, 2], [3, 4]]},
+                            },
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "thought": "Classify the daily means with the task rule.",
+                                "observation": {"answer": "decreasing"},
+                            },
+                        ],
+                    },
+                }
+            ],
+        }
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "winner_candidate": "segment",
+            "winner_tool_chain": ["segment", "llm_reasoning_classification"],
+            "insight": "Winner for this run: llm_reasoning_classification. Why it won: Branch comparison is genuinely useful here because the latest instruction requires an immediate tool call before yielding the task-valid answer.",
+            "recommendation": "Reusable lesson: prefer this path because learning mode encourages spawning independent branches before any learning-summary completion.",
+            "reasoning": "1. A task-valid label already exists.\n2. Spawning independent branches is justified.",
+        },
+        execution_log,
+    )
+
+    combined = f"{normalized['insight']} {normalized['recommendation']}".lower()
+    assert "branch comparison" not in combined
+    assert "latest instruction requires" not in combined
+    assert "task-valid" not in combined
+    assert "learning mode" not in combined
+    assert "decreasing" in normalized["insight"].lower()
+
+
 def test_normalize_learning_summary_answer_keeps_specific_branch_name_when_batch_eval_name_conflicts():
     execution_log = [
         {
@@ -726,7 +1247,7 @@ def test_normalize_learning_summary_answer_keeps_specific_branch_name_when_batch
 
     assert normalized["winner_candidate"] == "aurora_forecast"
     assert normalized["winner_tool_chain"] == ["aurora_forecast"]
-    assert "Winner for this run: aurora_forecast" in normalized["insight"]
+    assert "Strongest path on this sample: `aurora_forecast`" in normalized["insight"]
     assert "using `ets_forecast`" not in normalized["insight"]
     assert "`aurora_forecast`" in normalized["recommendation"]
 
@@ -779,11 +1300,11 @@ def test_normalize_learning_summary_answer_uses_candidate_reasoning_without_gt_p
         execution_log,
     )
 
-    assert "Winner for this run:" in normalized["insight"]
-    assert "`slice -> arima_forecast`" in normalized["insight"]
-    assert "Why it won:" in normalized["insight"]
+    assert "Winner for this run:" not in normalized["insight"]
+    assert "Strongest path on this sample: `slice -> arima_forecast`" in normalized["insight"]
+    assert "Why it fit:" in normalized["insight"]
     assert "recent regime" in normalized["insight"].lower()
-    assert "Alternatives:" in normalized["insight"]
+    assert "Alternative signals:" in normalized["insight"]
     assert "GT-selected" not in normalized["insight"]
     assert "assigned path requires" not in normalized["insight"].lower()
     assert "GT evaluation" not in normalized["recommendation"]
@@ -819,6 +1340,64 @@ def test_notes_compact_candidate_reasoning_filters_framework_wording():
     assert "assigned path" not in text.lower()
     assert "before finishing" not in text.lower()
     assert "recent regime" in text.lower()
+
+
+def test_notes_compact_candidate_reasoning_drops_control_flow_wording():
+    trace = {
+        "tool_chain": ["llm_reasoning_correlation"],
+        "steps": [
+            {
+                "tool": "llm_reasoning_correlation",
+                "thought": (
+                    "We have isolated the post-publication window, but still need a task-valid "
+                    "candidate label grounded in both the clearly positive article tone and the "
+                    "sliced price reaction. The specialized multimodal correlation reasoning tool "
+                    "is the most direct next step."
+                ),
+            },
+            {
+                "tool": "llm_reasoning_correlation",
+                "thought": (
+                    "The post-publication window is positive while the article tone is clearly bullish."
+                ),
+            },
+        ],
+    }
+
+    from timeclaw.memory.hierarchical import Notes
+
+    text = Notes._compact_candidate_reasoning(trace)
+    assert "task-valid" not in text.lower()
+    assert "next step" not in text.lower()
+    assert "bullish" in text.lower()
+
+
+def test_notes_compact_candidate_reasoning_drops_tool_mandate_wording():
+    trace = {
+        "tool_chain": ["detect_trend"],
+        "steps": [
+            {
+                "tool": "detect_trend",
+                "thought": (
+                    "A tool must be called this turn, and the most relevant available tool to "
+                    "support the existing classification is to reaffirm the strong directional "
+                    "evidence directly from the series."
+                ),
+            },
+            {
+                "tool": "detect_trend",
+                "thought": "The series has a strong directional decline directly in the observed values.",
+            },
+        ],
+    }
+
+    from timeclaw.memory.hierarchical import Notes
+
+    text = Notes._compact_candidate_reasoning(trace)
+    assert "this turn" not in text.lower()
+    assert "available tool" not in text.lower()
+    assert "existing classification" not in text.lower()
+    assert "directional decline" in text.lower()
 
 
 def test_training_evaluation_requires_non_empty_metrics():
