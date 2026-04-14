@@ -120,6 +120,16 @@ def test_executor_tool_catalog_includes_descriptions_and_required_args():
     assert "framework will auto-fill them" in catalog
 
 
+def test_executor_tool_catalog_includes_structured_input_contract_for_granger():
+    from timeclaw.clawhub.tool_registry import discover_and_register
+
+    discover_and_register()
+    catalog = executor_prompt.build_tool_name_text(["granger_causality"])
+
+    assert "Current-state preconditions:" in catalog
+    assert "min_series_channels=2" in catalog
+
+
 def test_build_task_description_uses_full_prompt_template():
     sample = load_split("weather_aligned_short", "test")[0]
     description = build_task_description(sample, "forecast")

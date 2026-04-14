@@ -4,6 +4,7 @@ import pytest
 
 from timeclaw.mcp.server import ClawHubMCPServer
 from timeclaw.clawhub.tool_registry import discover_and_register, clear_registry
+from timeclaw.mcp.server_factory import register_category
 
 
 @pytest.fixture(autouse=True)
@@ -66,3 +67,22 @@ async def test_handle_jsonrpc_list_tools():
     })
     tools = response["result"]["tools"]
     assert len(tools) > 0
+
+
+def test_server_factory_prediction_excludes_hidden_tools():
+    class DummyMCP:
+        def __init__(self):
+            self.names = []
+
+        def tool(self, *, name, description):
+            def decorator(fn):
+                self.names.append(name)
+                return fn
+            return decorator
+
+    mcp = DummyMCP()
+    count = register_category(mcp, "prediction")
+
+    assert count > 0
+    assert "checkpoint_forecast" not in mcp.names
+    assert "ensemble_forecast" not in mcp.names

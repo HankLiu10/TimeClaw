@@ -23,6 +23,7 @@ import numpy as np
 from loguru import logger
 
 from timeclaw.clawhub.tool_base import ClawTool
+from timeclaw.clawhub.tool_registry import should_expose_tool_module
 
 
 class _NumpyEncoder(json.JSONEncoder):
@@ -158,6 +159,8 @@ def register_category(mcp: Any, category: str) -> int:
 
     for _importer, modname, _ispkg in pkgutil.iter_modules(pkg.__path__):
         if modname.startswith("_"):
+            continue
+        if not should_expose_tool_module(category, modname):
             continue
         try:
             mod = importlib.import_module(f"timeclaw.clawhub.{category}.{modname}")

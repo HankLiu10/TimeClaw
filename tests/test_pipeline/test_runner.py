@@ -184,6 +184,16 @@ async def test_pipeline_cancellation_writes_run_end(tmp_path, monkeypatch):
     assert records[-1]["payload"]["status"] == "cancelled"
 
 
+@pytest.mark.asyncio
+async def test_pipeline_shutdown_closes_router_even_without_memory(monkeypatch):
+    runner = PipelineRunner(disable_memory=True)
+    runner.router.shutdown = AsyncMock()
+
+    await runner.shutdown()
+
+    runner.router.shutdown.assert_awaited_once()
+
+
 def test_sanitize_reasoning_clause_keeps_evidence_but_drops_framework_preface():
     cleaned = PipelineRunner._sanitize_reasoning_clause(
         "The required hinted tool was used: entropy returned sample_entropy 0.778, "

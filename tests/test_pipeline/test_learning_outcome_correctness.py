@@ -1016,6 +1016,13 @@ def test_extract_candidate_traces_public_reasoning_ignores_final_candidate_summa
                             "near-term class is stable.\n"
                             "3. The final-turn instructions require no more tool calls."
                         ),
+                        "execution_context": {
+                            "tool_chain": ["llm_reasoning_classification"],
+                            "public_reasoning": [
+                                "The last three daily means differ by less than 0.1C, so the near-term class is stable"
+                            ],
+                            "evidence_summary": "The recent daily means are effectively unchanged, so the near-term class is stable.",
+                        },
                         "execution_log": [
                             {
                                 "tool": "llm_reasoning_classification",
@@ -1054,6 +1061,11 @@ def test_extract_candidate_traces_public_reasoning_can_be_empty_when_only_final_
                             "tool-produced answer in this branch.\n"
                             "2. Return the saved label unchanged."
                         ),
+                        "execution_context": {
+                            "tool_chain": ["llm_reasoning_classification"],
+                            "public_reasoning": [],
+                            "evidence_summary": "",
+                        },
                         "execution_log": [
                             {
                                 "tool": "llm_reasoning_classification",
@@ -1071,6 +1083,55 @@ def test_extract_candidate_traces_public_reasoning_can_be_empty_when_only_final_
 
     assert traces
     assert traces[0]["public_reasoning_snippets"] == []
+
+
+def test_normalize_learning_summary_answer_uses_execution_context_tool_chain_as_winner_hint():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "stable",
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "thought": "The last three daily means differ by less than 0.1C.",
+                                "observation": {"answer": "stable"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "observation": {
+                "results": [
+                    {
+                        "prediction": "stable",
+                        "metrics": {"score": 0.0},
+                    }
+                ]
+            },
+        },
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "insight": "stable path won",
+            "recommendation": "prefer the stable path",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["The last three daily means differ by less than 0.1C."],
+                "evidence_summary": "The near-term daily means are flat.",
+            },
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_tool_chain"] == ["llm_reasoning_classification"]
 
 
 def test_normalize_learning_summary_answer_rewrites_explicit_summary_when_text_conflicts_with_trace():
@@ -1336,10 +1397,7 @@ def test_notes_compact_candidate_reasoning_filters_framework_wording():
     from timeclaw.memory.hierarchical import Notes
 
     text = Notes._compact_candidate_reasoning(trace)
-    assert "execution context" not in text.lower()
-    assert "assigned path" not in text.lower()
-    assert "before finishing" not in text.lower()
-    assert "recent regime" in text.lower()
+    assert text == ""
 
 
 def test_notes_compact_candidate_reasoning_drops_control_flow_wording():
@@ -1367,9 +1425,7 @@ def test_notes_compact_candidate_reasoning_drops_control_flow_wording():
     from timeclaw.memory.hierarchical import Notes
 
     text = Notes._compact_candidate_reasoning(trace)
-    assert "task-valid" not in text.lower()
-    assert "next step" not in text.lower()
-    assert "bullish" in text.lower()
+    assert text == ""
 
 
 def test_notes_compact_candidate_reasoning_drops_tool_mandate_wording():
@@ -1394,10 +1450,7 @@ def test_notes_compact_candidate_reasoning_drops_tool_mandate_wording():
     from timeclaw.memory.hierarchical import Notes
 
     text = Notes._compact_candidate_reasoning(trace)
-    assert "this turn" not in text.lower()
-    assert "available tool" not in text.lower()
-    assert "existing classification" not in text.lower()
-    assert "directional decline" in text.lower()
+    assert text == ""
 
 
 def test_training_evaluation_requires_non_empty_metrics():

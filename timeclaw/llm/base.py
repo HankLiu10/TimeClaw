@@ -105,6 +105,14 @@ class LLMBackend:
             and self.api_key is not None
         )
 
+    async def shutdown(self) -> None:
+        """Release transport resources held by this backend."""
+        client = getattr(self, "_oai_client", None)
+        if client is None:
+            return
+        await client.close()
+        self._oai_client = None
+
     @staticmethod
     def _content_to_responses_input_parts(content: Any) -> list[dict[str, Any]]:
         if isinstance(content, str):

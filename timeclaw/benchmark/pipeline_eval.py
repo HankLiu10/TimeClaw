@@ -262,11 +262,14 @@ async def _build_record_learning_analysis(
     result: dict[str, Any],
     best_metrics: dict[str, Any],
     sample_fingerprint: str = "",
+    scope_keys: list[str] | None = None,
 ) -> tuple[dict[str, list[str]] | None, str]:
     candidate_traces = PipelineRunner._extract_candidate_traces(result.get("execution_log", []))
     fallback_summary = _build_pipeline_analysis_summary(result)
+    resolved_scope_keys = scope_keys or scope_keys_for_dataset_task(getattr(sample, "dataset", ""), task_type)
     return await generate_learning_analysis(
-        scope_key=(scope_keys_for_dataset_task(getattr(sample, "dataset", ""), task_type) or [""])[0],
+        scope_key=(resolved_scope_keys or [""])[0],
+        scope_keys=resolved_scope_keys,
         task_type=task_type,
         domain=sample.domain,
         task_description=task_description,

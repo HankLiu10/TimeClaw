@@ -447,6 +447,85 @@ async def test_generate_learning_analysis_strips_ground_truth_from_prompt_inputs
 
 
 @pytest.mark.asyncio
+async def test_generate_learning_analysis_prompt_treats_metrics_as_evidence_not_cause():
+    captured: dict[str, str] = {}
+
+    class _Resp:
+        parsed = {
+            "text_signals": [],
+            "sample_conditions": ["recent regime is flat with low volatility"],
+            "winner_evidence": [
+                "detect_anomaly matched the flat regime and then showed the lower MAE on this sample"
+            ],
+            "failure_signals": [],
+            "reusable_rule": ["When the regime is flat, consider detect_anomaly first."],
+        }
+
+    class _LLM:
+        async def complete(self, messages, **_kwargs):
+            captured["system"] = messages[0]["content"]
+            return _Resp()
+
+    await generate_learning_analysis(
+        scope_key="finance_aligned_long_forecast",
+        task_type="forecast",
+        domain="finance",
+        task_description="forecast task",
+        sample_fingerprint="horizon=33",
+        candidate_traces=[
+            {"name": "detect_anomaly", "tool_chain": ["detect_anomaly"], "metrics": {"mae": 0.384}},
+            {"name": "value_at", "tool_chain": ["value_at"], "metrics": {"mae": 0.691}},
+        ],
+        best_metrics={"mae": 0.384},
+        fallback_summary="fallback summary",
+        llm=_LLM(),
+    )
+
+    system_prompt = captured["system"]
+    assert "Do not treat better metrics as the cause of success." in system_prompt
+    assert "Explain method-data fit before metric outcomes" in system_prompt
+    assert 'Avoid bullets like "X won because it had lower error"' in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_learning_analysis_prompt_uses_scope_targets_for_multi_scope_runs():
+    captured: dict[str, str] = {}
+
+    class _Resp:
+        parsed = {
+            "text_signals": [],
+            "sample_conditions": ["recent regime is flat"],
+            "winner_evidence": ["segment preserved the local regime split"],
+            "failure_signals": [],
+            "reusable_rule": ["When the regime splits locally, segment first."],
+        }
+
+    class _LLM:
+        async def complete(self, messages, **_kwargs):
+            captured["user"] = messages[1]["content"]
+            return _Resp()
+
+    await generate_learning_analysis(
+        scope_key="weather_aligned_short_indicator",
+        scope_keys=[
+            "weather_aligned_short_indicator",
+            "weather_aligned_short_indicator_macd",
+        ],
+        task_type="indicator",
+        domain="weather",
+        task_description="indicator task",
+        sample_fingerprint="horizon=3",
+        candidate_traces=[],
+        best_metrics={"avg_mae": 0.2},
+        fallback_summary="fallback summary",
+        llm=_LLM(),
+    )
+
+    assert "Scope targets:" in captured["user"]
+    assert "weather_aligned_short_indicator_macd" in captured["user"]
+
+
+@pytest.mark.asyncio
 async def test_generate_learning_analysis_rewrites_slot_aliases_and_drops_framework_wording():
     class _Resp:
         parsed = {
@@ -1077,6 +1156,7 @@ def test_daily_note_formats_scored_candidates_and_input_signals():
                 "source_file": "file.json",
                 "sample_idx": 5,
                 "task_name": "forecast",
+                "train_run_id": "run-123",
             },
             "metrics": {"mae": 1.23, "rmse": 2.34},
             "tool_chain": ["chronos2_forecast"],
@@ -1095,6 +1175,7 @@ def test_daily_note_formats_scored_candidates_and_input_signals():
                     "tool_chain": ["chronos2_forecast"],
                     "prediction": [1, 2, 3],
                     "metrics": {"mae": 1.23, "rmse": 2.34},
+                    "public_reasoning_snippets": ["seasonality is present"],
                     "steps": [
                         {
                             "tool": "chronos2_forecast",
@@ -1109,6 +1190,7 @@ def test_daily_note_formats_scored_candidates_and_input_signals():
     )
     assert "Source:\n- Dataset: weather_aligned_short" in note
     assert "- Sample Ref: weather_aligned_short:file.json:5:forecast" in note
+    assert "- Train Run ID: run-123" in note
     assert "- Trace ID: abc123trace" in note
     assert "Task Prompt:\n[TASK_PROMPT_BEGIN]" in note
     assert "Your task is to predict the next 1 day(s) of hourly temperature readings (3 values)." in note
@@ -1124,6 +1206,24 @@ def test_daily_note_formats_scored_candidates_and_input_signals():
     assert "  Prediction:" not in note
 
 
+def test_daily_note_sanitizes_storage_breaking_control_bytes():
+    note = Notes._build_note(  # type: ignore[misc]
+        Notes.__new__(Notes),
+        {
+            "scope_key": "weather_aligned_short_trend_past",
+            "domain": "weather",
+            "task": "trend_past",
+            "pipeline_summary": (
+                "Sample Conditions:\n"
+                "- daily mean slope thresholds are \x00b10.25 for stable classification"
+            ),
+        },
+    )
+
+    assert "\x00" not in note
+    assert "±0.25" in note
+
+
 def test_daily_note_splits_generation_and_validation_tools():
     note = Notes._build_note(  # type: ignore[misc]
         Notes.__new__(Notes),
@@ -1135,6 +1235,9 @@ def test_daily_note_splits_generation_and_validation_tools():
                     "name": "ets_forecast",
                     "tool_chain": ["ets_forecast", "consistency_check"],
                     "metrics": {"avg_mae": 0.555},
+                    "public_reasoning_snippets": [
+                        "ets_forecast produced a stable upper bound candidate",
+                    ],
                     "steps": [
                         {"tool": "ets_forecast", "thought": "run ets", "observation": {"forecast": [1.0, 2.0]}},
                         {"tool": "consistency_check", "thought": "validate path", "observation": {"consistent": True}},
@@ -1146,17 +1249,43 @@ def test_daily_note_splits_generation_and_validation_tools():
 
     assert "Winner Tools:\n- ets_forecast\n- consistency_check" in note
     assert "  Tools: ets_forecast | Validation: consistency_check" in note
-    assert "  Reasoning: Run ets." in note
+    assert "  Reasoning: Ets_forecast produced a stable upper bound candidate." in note
     assert "Generation Steps:" not in note
     assert "Validation Steps:" not in note
 
 
-def test_daily_note_keeps_full_candidate_reasoning_without_truncation():
+def test_daily_note_uses_public_candidate_reasoning_without_truncation():
     long_reason = (
-        "Reason: I should inspect the most recent post-event regime before forecasting because "
-        "the late-sample drift is the strongest signal in this case and using only a global summary "
-        "would miss the regime break. Action: run slice first."
+        "Inspecting the most recent post-event regime matters here because the late-sample drift is "
+        "the strongest signal in this case and using only a global summary would miss the regime break"
     )
+    note = Notes._build_note(  # type: ignore[misc]
+        Notes.__new__(Notes),
+        {
+            "scope_key": "finance_aligned_long_forecast",
+            "candidate_traces": [
+                {
+                    "name": "slice_path",
+                    "tool_chain": ["slice", "arima_forecast"],
+                    "metrics": {"mae": 1.0, "rmse": 1.2},
+                    "public_reasoning_snippets": [long_reason],
+                    "steps": [
+                        {
+                            "tool": "slice",
+                            "thought": "run slice first",
+                            "observation": {"window": [1, 2, 3]},
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert "because the late-sample drift is the strongest signal in this case" in note
+    assert "would miss the regime break." in note
+
+
+def test_daily_note_does_not_recover_reasoning_from_raw_steps_without_public_snippets():
     note = Notes._build_note(  # type: ignore[misc]
         Notes.__new__(Notes),
         {
@@ -1169,7 +1298,9 @@ def test_daily_note_keeps_full_candidate_reasoning_without_truncation():
                     "steps": [
                         {
                             "tool": "slice",
-                            "thought": long_reason,
+                            "thought": (
+                                "The recent regime break matters more than the global average, so slice should run first."
+                            ),
                             "observation": {"window": [1, 2, 3]},
                         }
                     ],
@@ -1178,8 +1309,7 @@ def test_daily_note_keeps_full_candidate_reasoning_without_truncation():
         },
     )
 
-    assert "because the late-sample drift is the strongest signal in this case" in note
-    assert "would miss the regime break." in note
+    assert "Reasoning:" not in note
 
 
 def test_notes_compact_candidate_reasoning_respects_explicit_empty_public_snippets():
@@ -1194,6 +1324,31 @@ def test_notes_compact_candidate_reasoning_respects_explicit_empty_public_snippe
     }
 
     assert Notes._compact_candidate_reasoning(trace) == ""
+
+
+def test_learning_analysis_candidate_prompt_uses_public_reasoning_not_raw_thought():
+    prompt = learning_analysis_mod._candidate_prompt_block(
+        [
+            {
+                "name": "llm_reasoning_qa",
+                "tool_chain": ["llm_reasoning_qa"],
+                "public_reasoning_snippets": [
+                    "llm_reasoning_qa matched the timing mismatch in option C",
+                ],
+                "steps": [
+                    {
+                        "tool": "llm_reasoning_qa",
+                        "thought": "The most relevant next step is to use QA reasoning before finishing.",
+                        "observation": {"answer": "C"},
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert "Execution evidence: llm_reasoning_qa matched the timing mismatch in option C" in prompt
+    assert "thought=" not in prompt
+    assert "next step" not in prompt
 
 
 def test_text_signals_rank_sentences_by_task_relevance():

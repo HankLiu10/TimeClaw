@@ -3,6 +3,29 @@ from __future__ import annotations
 import re
 
 
+_BROKEN_PLUS_MINUS_RE = re.compile(r"\x00[bB]1")
+_DISALLOWED_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def sanitize_learning_text(text: str) -> str:
+    """Remove storage-breaking control bytes from learning artifacts.
+
+    New definition:
+        ``sanitize_learning_text`` is the shared storage-facing text cleaner for
+        learning artifacts. It preserves normal Unicode content, repairs the
+        common broken ``±`` sequence that occasionally arrives as ``\\x00b1``,
+        and strips other disallowed control bytes so notes/results stay valid
+        text files instead of silently becoming binary-ish artifacts.
+    """
+
+    cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not cleaned:
+        return ""
+    cleaned = _BROKEN_PLUS_MINUS_RE.sub("±", cleaned)
+    cleaned = _DISALLOWED_CONTROL_RE.sub("", cleaned)
+    return cleaned
+
+
 def normalize_learning_clause(text: str) -> str:
     """Normalize agent self-talk into reusable evidence phrasing.
 
@@ -13,7 +36,7 @@ def normalize_learning_clause(text: str) -> str:
         into neutral evidence language.
     """
 
-    cleaned = str(text).strip()
+    cleaned = sanitize_learning_text(text).strip()
     if not cleaned:
         return ""
 
@@ -47,4 +70,4 @@ def normalize_learning_clause(text: str) -> str:
         cleaned,
     ).strip()
 
-    return cleaned
+    return sanitize_learning_text(cleaned).strip()

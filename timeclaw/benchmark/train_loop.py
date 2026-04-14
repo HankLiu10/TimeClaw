@@ -26,6 +26,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 from loguru import logger
@@ -54,6 +55,8 @@ from timeclaw.benchmark.baseline_eval import (
 )
 
 TRAIN_RESULTS_DIR = Path(".timeclaw/train_results")
+TRAIN_SUMMARY_PATH = TRAIN_RESULTS_DIR / "train_summary.json"
+TRAIN_RUN_MANIFEST_PATH = TRAIN_RESULTS_DIR / "train_run_manifest.json"
 _TRAIN_RESULT_FRAMEWORK_TOOLS = {
     "spawn_subagent",
     "evaluate_against_gt",
@@ -66,6 +69,10 @@ def _task_train_checkpoint_path(ds_name: str, task: str) -> Path:
     return TRAIN_RESULTS_DIR / f"train_{ds_name}__{task}.json"
 
 
+def _task_note_view_path(ds_name: str, task: str) -> Path:
+    return TRAIN_RESULTS_DIR / f"train_notes_{ds_name}__{task}.md"
+
+
 def _load_checkpoint_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists() or path.stat().st_size <= 10:
         return []
@@ -73,7 +80,11 @@ def _load_checkpoint_rows(path: Path) -> list[dict[str, Any]]:
         data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return []
-    return [r for r in data if isinstance(r, dict)]
+    return [
+        _normalize_train_result_row(r)
+        for r in data
+        if isinstance(r, dict)
+    ]
 
 
 def _load_train_checkpoint(ds_name: str, task: str | None = None) -> list[dict[str, Any]]:
@@ -94,11 +105,56 @@ def _checkpoint_exists(ds_name: str) -> bool:
     )
 
 
+def _normalize_train_result_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize persisted train-result rows to a stable top-level schema.
+
+    New definition:
+        ``train_results`` rows should always expose the same locating fields at
+        the top level, even if older checkpoints were written before those
+        aliases existed. This keeps filtering, retrying, and winner-chain
+        analysis stable across historical and newly appended samples.
+    """
+    normalized = dict(row)
+
+    dataset_name = str(
+        normalized.get("dataset_name")
+        or normalized.get("dataset")
+        or ""
+    ).strip()
+    if dataset_name:
+        normalized["dataset_name"] = dataset_name
+        normalized["dataset"] = dataset_name
+
+    idx_value = normalized.get("idx", normalized.get("abs_idx"))
+    try:
+        idx_int = int(idx_value) if idx_value is not None else None
+    except (TypeError, ValueError):
+        idx_int = None
+    if idx_int is not None:
+        normalized["idx"] = idx_int
+        normalized["abs_idx"] = idx_int
+
+    substantive_tool_chain = _extract_train_result_tool_chain(normalized)
+    if substantive_tool_chain:
+        normalized["tool_chain"] = substantive_tool_chain
+        normalized["winner_tool_chain"] = list(substantive_tool_chain)
+    else:
+        normalized["winner_tool_chain"] = _filter_train_result_tool_chain(
+            normalized.get("winner_tool_chain")
+        )
+
+    train_run_id = str(normalized.get("train_run_id") or "").strip()
+    if train_run_id:
+        normalized["train_run_id"] = train_run_id
+
+    return normalized
+
+
 def _train_done_keys(rows: list[dict[str, Any]]) -> set[tuple[int, str]]:
     out: set[tuple[int, str]] = set()
     for r in rows:
         status = str(r.get("status", "")).lower()
-        if status in {"error", "timeout", "failed"}:
+        if status in {"error", "timeout", "failed", "max_steps_exhausted", "cancelled"}:
             continue
         if r.get("error"):
             continue
@@ -148,43 +204,244 @@ def _merge_train_rows(
     return merged
 
 
-def _preview_value(value: Any, limit: int = 400) -> str:
+def _preview_value(value: Any, limit: int | None = 400) -> str:
     try:
         text = json.dumps(value, ensure_ascii=False, default=str)
     except TypeError:
         text = str(value)
-    if len(text) <= limit:
+    if limit is None or len(text) <= limit:
         return text
     return text[:limit] + f"... [{len(text)} chars]"
 
 
-def _sanitize_learning_artifact_preview(value: Any, limit: int = 400) -> str:
+def _sanitize_learning_artifact_preview(value: Any, limit: int | None = 400) -> str:
+    """Sanitize visible training previews down to evidence-facing language.
+
+    New definition:
+        ``reasoning_preview`` is meant for humans to quickly inspect what
+        evidence or candidate comparison happened. It should not expose
+        orchestration mechanics such as branch contracts, "task-valid answer
+        already exists", or finish/return-control guidance from the executor.
+    """
     if isinstance(value, str):
         text = value
     else:
-        text = _preview_value(value, limit=limit * 2)
+        preview_limit = None if limit is None else limit * 2
+        text = _preview_value(value, limit=preview_limit)
     if not text:
         return text
-    banned_markers = (
+    # Numbered LLM reasoning sometimes arrives as one long line:
+    # "1. ... 2. ... 3. ..."
+    # Split those inline steps first so banned control-flow phrases only drop
+    # the affected step instead of erasing the whole preview.
+    text = re.sub(r"(?<!^)\s+(?=\d+\.\s)", "\n", text.strip())
+    hard_banned_markers = (
         "spawn_subagent",
         "evaluate_against_gt",
         "evaluate_batch_against_gt",
         "batch_evaluate_against_gt",
+    )
+    full_line_banned_markers = (
+        "current branch state confirms",
+        "available from a real tool result",
+        "returned unchanged as the final",
+        "may be returned unchanged",
+        "corrected final answer",
+        "repaired summary",
+        "retained in the branch",
+    )
+    soft_banned_markers = (
         "execution context",
         "assigned path",
         "before finishing",
+        "task-valid",
+        "learning mode",
+        "training mode",
+        "branch comparison",
+        "most efficient next step",
+        "most efficient way",
+        "most direct next step",
+        "available from a real tool result",
+        "returned unchanged as the final",
+        "may be returned unchanged",
+        "current branch state confirms",
+        "corrected final answer",
+        "repaired summary",
+        "retained in the branch",
     )
-    cleaned_lines = [
-        line for line in text.splitlines()
-        if not any(marker in line.lower() for marker in banned_markers)
-    ]
+    cleaned_lines: list[str] = []
+    soft_phrase_patterns = (
+        (r"(?i)\btask-valid\s+", ""),
+        (r"(?i)\bcurrent branch state confirms(?: that)?\b", ""),
+        (r"(?i)\bavailable from a real tool result\b", ""),
+        (r"(?i)\breturned unchanged as the final\b", ""),
+        (r"(?i)\bmay be returned unchanged\b", ""),
+        (r"(?i)\bbefore finishing\b", ""),
+        (r"(?i)\bexecution context\b", ""),
+        (r"(?i)\bassigned path\b", ""),
+        (r"(?i)\blearning mode\b", ""),
+        (r"(?i)\btraining mode\b", ""),
+        (r"(?i)\bbranch comparison\b", ""),
+        (r"(?i)\bmost efficient next step\b", ""),
+        (r"(?i)\bmost efficient way\b", ""),
+        (r"(?i)\bmost direct next step\b", ""),
+        (r"(?i)\bcorrected final answer\b", ""),
+        (r"(?i)\brepaired summary\b", ""),
+        (r"(?i)\bretained in the branch\b", ""),
+    )
+    for line in text.splitlines():
+        lower = line.lower()
+        if any(marker in lower for marker in hard_banned_markers):
+            continue
+        if any(marker in lower for marker in full_line_banned_markers):
+            continue
+        cleaned_line = line
+        for pattern, repl in soft_phrase_patterns:
+            cleaned_line = re.sub(pattern, repl, cleaned_line)
+        cleaned_line = re.sub(r"\s+", " ", cleaned_line).strip()
+        cleaned_line = re.sub(r"[ ,;\-]+$", "", cleaned_line)
+        if cleaned_line:
+            cleaned_lines.append(cleaned_line)
     cleaned = "\n".join(cleaned_lines).strip()
     lower_cleaned = cleaned.lower()
-    if any(marker in lower_cleaned for marker in banned_markers):
+    if any(marker in lower_cleaned for marker in hard_banned_markers):
         return ""
-    if len(cleaned) <= limit:
+    if any(marker in lower_cleaned for marker in full_line_banned_markers):
+        return ""
+    if any(marker in lower_cleaned for marker in soft_banned_markers):
+        return ""
+    if limit is None or len(cleaned) <= limit:
         return cleaned
     return cleaned[:limit] + f"... [{len(cleaned)} chars]"
+
+
+def _extract_train_result_reasoning_preview(
+    result: dict[str, Any],
+    learning_summary: dict[str, Any],
+) -> str:
+    """Return a readable reasoning preview instead of raw final-answer JSON.
+
+    New definition:
+        ``train_results.reasoning_preview`` should prefer the actual natural-
+        language reasoning string. If the executor stored the final envelope as
+        JSON text, extract nested ``reasoning`` first and only fall back to the
+        raw string when no cleaner explanation exists.
+    """
+    candidates: list[str] = []
+    execution_log = result.get("execution_log", [])
+    raw_answer = result.get("raw_answer")
+    if isinstance(execution_log, list) and execution_log:
+        candidate_traces = PipelineRunner._extract_candidate_traces(execution_log)
+        if candidate_traces:
+            evaluated_metrics = [
+                trace.get("metrics")
+                for trace in candidate_traces
+                if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
+            ]
+            best_metrics = PipelineRunner._select_best_metrics(evaluated_metrics)
+            winner_trace, _winner_source = PipelineRunner._resolve_learning_summary_winner_trace(
+                raw_answer if isinstance(raw_answer, dict) else {},
+                candidate_traces,
+                best_metrics,
+            )
+            winner_prediction = (winner_trace or {}).get("prediction")
+            if winner_prediction is None and isinstance(raw_answer, dict):
+                winner_prediction = raw_answer.get("winner_prediction")
+            substantive_tool_chain = _extract_train_result_tool_chain(result)
+            preview_trace = winner_trace
+            winner_chain = _filter_train_result_tool_chain((winner_trace or {}).get("tool_chain"))
+            if (
+                preview_trace is None
+                or (substantive_tool_chain and winner_chain and winner_chain != substantive_tool_chain)
+            ):
+                preview_trace = _select_train_result_preview_trace_by_chain(
+                    candidate_traces,
+                    substantive_tool_chain,
+                    winner_prediction=winner_prediction,
+                )
+            if preview_trace is None and winner_trace is not None:
+                preview_trace = winner_trace
+            preview = _format_train_result_reasoning_preview_from_trace(preview_trace)
+            if preview:
+                return preview
+
+    summary_reasoning = learning_summary.get("reasoning")
+    if isinstance(summary_reasoning, str) and summary_reasoning.strip():
+        candidates.append(summary_reasoning)
+
+    execution_context = (
+        result.get("execution_context")
+        if isinstance(result.get("execution_context"), dict)
+        else {}
+    )
+    public_reasoning = execution_context.get("public_reasoning")
+    if isinstance(public_reasoning, list):
+        joined_public = "\n".join(
+            str(item).strip()
+            for item in public_reasoning
+            if str(item).strip()
+        ).strip()
+        if joined_public:
+            candidates.append(joined_public)
+    evidence_summary = str(execution_context.get("evidence_summary") or "").strip()
+    if evidence_summary:
+        candidates.append(evidence_summary)
+
+    raw_reasoning = result.get("reasoning", "")
+    parsed_reasoning = PipelineRunner._parse_json_like_payload(raw_reasoning)
+    if isinstance(parsed_reasoning, dict):
+        nested_answer = parsed_reasoning.get("answer")
+        if isinstance(nested_answer, dict):
+            nested_reasoning = nested_answer.get("reasoning")
+            if isinstance(nested_reasoning, str) and nested_reasoning.strip():
+                candidates.append(nested_reasoning)
+        parsed_text_reasoning = parsed_reasoning.get("reasoning")
+        if isinstance(parsed_text_reasoning, str) and parsed_text_reasoning.strip():
+            candidates.append(parsed_text_reasoning)
+        parsed_thought = parsed_reasoning.get("thought")
+        if isinstance(parsed_thought, str) and parsed_thought.strip():
+            reason_only = _preview_reason_only(parsed_thought)
+            if reason_only:
+                candidates.append(reason_only)
+            candidates.append(parsed_thought)
+    if isinstance(raw_reasoning, str) and raw_reasoning.strip():
+        candidates.append(raw_reasoning)
+
+    for candidate in candidates:
+        preview = _sanitize_learning_artifact_preview(candidate, limit=None)
+        if preview:
+            return preview
+    return ""
+
+
+def _format_train_result_reasoning_preview_from_trace(trace: dict[str, Any] | None) -> str:
+    if not isinstance(trace, dict):
+        return ""
+    steps = trace.get("steps")
+    step_list = steps if isinstance(steps, list) else []
+    lines: list[str] = []
+    for idx, step in enumerate(step_list[:4], 1):
+        if not isinstance(step, dict):
+            continue
+        tool = str(step.get("tool") or "").strip() or "unknown_tool"
+        observation = PipelineRunner._parse_json_like_payload(step.get("observation"))
+        if observation is None or observation == "":
+            continue
+        prediction = PipelineRunner._prediction_from_observation(observation)
+        payload = prediction if prediction is not None else observation
+        preview = _preview_value(payload, limit=180)
+        lines.append(f"{len(lines) + 1}. {tool} produced {preview}.")
+    if not lines:
+        snippets = PipelineRunner._reasoning_snippets(trace)
+        for idx, snippet in enumerate(snippets[:4], 1):
+            if not isinstance(snippet, str) or not snippet.strip():
+                continue
+            lines.append(
+                f"{idx}. {snippet if str(snippet).rstrip().endswith(('.', '!', '?')) else str(snippet).rstrip() + '.'}"
+            )
+    if not lines:
+        return ""
+    return _sanitize_learning_artifact_preview("\n".join(lines), limit=None)
 
 
 def _filter_train_result_tool_chain(chain: list[Any] | tuple[Any, ...] | None) -> list[str]:
@@ -211,9 +468,27 @@ def _extract_train_result_tool_chain(result: dict[str, Any]) -> list[str]:
     """
     raw_answer = result.get("raw_answer")
     if isinstance(raw_answer, dict):
-        winner_chain = _filter_train_result_tool_chain(raw_answer.get("winner_tool_chain"))
+        execution_context = (
+            raw_answer.get("execution_context")
+            if isinstance(raw_answer.get("execution_context"), dict)
+            else {}
+        )
+        winner_chain = _filter_train_result_tool_chain(
+            raw_answer.get("winner_tool_chain") or execution_context.get("tool_chain")
+        )
         if winner_chain:
             return winner_chain
+
+    execution_context = (
+        result.get("execution_context")
+        if isinstance(result.get("execution_context"), dict)
+        else {}
+    )
+    winner_chain = _filter_train_result_tool_chain(
+        execution_context.get("tool_chain")
+    )
+    if winner_chain:
+        return winner_chain
 
     execution_log = result.get("execution_log", [])
     if isinstance(execution_log, list) and execution_log:
@@ -278,9 +553,40 @@ def _build_train_result_evidence_preview(
     if not candidate_traces:
         return _sanitize_learning_artifact_preview(raw_summary, limit=400)
 
+    evaluated_metrics = [
+        trace.get("metrics")
+        for trace in candidate_traces
+        if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
+    ]
+    best_metrics = PipelineRunner._select_best_metrics(evaluated_metrics)
+    winner_trace, _winner_source = PipelineRunner._resolve_learning_summary_winner_trace(
+        raw_answer if isinstance(raw_answer, dict) else {},
+        candidate_traces,
+        best_metrics,
+    )
+    winner_prediction = (winner_trace or {}).get("prediction")
+    if winner_prediction is None and isinstance(raw_answer, dict):
+        winner_prediction = raw_answer.get("winner_prediction")
+
+    winner_chain = _filter_train_result_tool_chain((winner_trace or {}).get("tool_chain"))
+    if winner_trace is not None and (
+        not substantive_tool_chain or winner_chain == substantive_tool_chain
+    ):
+        preview = _format_train_result_evidence_preview_from_steps(winner_trace.get("steps"))
+        if _preview_has_substantive_step_detail(preview):
+            return preview
+        trace_preview = _build_train_result_evidence_preview_from_trace(
+            trace_id=str(result.get("trace_id") or "").strip(),
+            substantive_tool_chain=winner_chain or substantive_tool_chain,
+        )
+        if trace_preview:
+            return trace_preview
+        return preview
+
     exact_match = _select_train_result_preview_trace_by_chain(
         candidate_traces,
         substantive_tool_chain,
+        winner_prediction=winner_prediction,
     )
     if exact_match is not None:
         preview = _format_train_result_evidence_preview_from_steps(exact_match.get("steps"))
@@ -293,18 +599,6 @@ def _build_train_result_evidence_preview(
         if trace_preview:
             return trace_preview
         return preview
-
-    evaluated_metrics = [
-        trace.get("metrics")
-        for trace in candidate_traces
-        if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
-    ]
-    best_metrics = PipelineRunner._select_best_metrics(evaluated_metrics)
-    winner_trace, _winner_source = PipelineRunner._resolve_learning_summary_winner_trace(
-        raw_answer if isinstance(raw_answer, dict) else {},
-        candidate_traces,
-        best_metrics,
-    )
 
     if winner_trace is None:
         for trace in candidate_traces:
@@ -333,6 +627,7 @@ def _build_train_result_evidence_preview(
 def _select_train_result_preview_trace_by_chain(
     candidate_traces: list[dict[str, Any]],
     substantive_tool_chain: list[str],
+    winner_prediction: Any | None = None,
 ) -> dict[str, Any] | None:
     if not substantive_tool_chain:
         return None
@@ -345,6 +640,14 @@ def _select_train_result_preview_trace_by_chain(
             exact_matches.append(trace)
     if not exact_matches:
         return None
+    if winner_prediction is not None:
+        prediction_matches = [
+            trace
+            for trace in exact_matches
+            if PipelineRunner._predictions_match(trace.get("prediction"), winner_prediction)
+        ]
+        if len(prediction_matches) == 1:
+            return prediction_matches[0]
     return max(
         exact_matches,
         key=lambda item: (
@@ -362,16 +665,48 @@ def _format_train_result_evidence_preview_from_steps(steps: Any) -> str:
         if not isinstance(step, dict):
             continue
         tool = str(step.get("tool") or "").strip() or "unknown_tool"
-        thought = str(step.get("thought") or "").strip()
         observation = str(step.get("observation") or "").strip()
-        detail = thought or observation or "no detail recorded"
+        detail = _build_train_result_step_detail(step)
         status = "OK" if observation else "FAIL"
         if observation:
             successful_steps += 1
-        formatted_lines.append(f"  [{status}] Step {idx}: {tool} -> {detail[:500]}")
+        formatted_lines.append(f"  [{status}] Step {idx}: {tool} -> {detail}")
     if step_list:
         formatted_lines.append(f"  Successful steps: {successful_steps}/{len(step_list)}")
-    return _sanitize_learning_artifact_preview("\n".join(formatted_lines), limit=400)
+    return _sanitize_learning_artifact_preview("\n".join(formatted_lines), limit=None)
+
+
+def _build_train_result_step_detail(step: dict[str, Any]) -> str:
+    """Format one preview step from actual execution, not intended next actions.
+
+    New definition:
+        ``evidence_summary_preview`` is an execution summary of what actually
+        happened. If a step has an observation, that observation is the preview
+        payload; we do not append ReAct-style ``Reason:`` text, because that
+        text often describes control flow or search intent rather than grounded
+        evidence. Thought text is only used when no observation was recorded.
+    """
+    observation = str(step.get("observation") or "").strip()
+    raw_thought = str(step.get("thought") or "").strip()
+    cleaned_fallback = PipelineRunner._sanitize_reasoning_clause(raw_thought)
+
+    if observation:
+        return f"Observed: {observation}"
+    if cleaned_fallback:
+        return cleaned_fallback
+    return "no detail recorded"
+
+
+def _preview_reason_only(thought: str) -> str:
+    text = str(thought or "").strip()
+    if not text:
+        return ""
+    reason_match = re.search(r"\breason\s*:\s*(.*)", text, flags=re.IGNORECASE | re.DOTALL)
+    if reason_match is None:
+        return PipelineRunner._sanitize_reasoning_clause(text)
+    reason_text = reason_match.group(1).strip()
+    parts = re.split(r"\baction\s*:", reason_text, maxsplit=1, flags=re.IGNORECASE)
+    return PipelineRunner._sanitize_reasoning_clause(parts[0].strip())
 
 
 def _preview_has_substantive_step_detail(preview: str) -> bool:
@@ -531,6 +866,150 @@ def _trace_preview_text(value: Any) -> str:
     return str(value)
 
 
+def _recover_failed_result_from_trace(trace_id: str | None) -> dict[str, Any]:
+    """Recover the last solve-ready payload from a persisted trace.
+
+    Why this exists:
+        Some failed train rows are not execution failures in the usual sense.
+        The agent may already have produced a final `learning_summary`, but the
+        terminal reuse gate rejects the packaging and the run then exhausts the
+        remaining step budget. In that case the trace still contains the final
+        attempted payload, and train_results should preserve it for debugging
+        instead of recording an empty shell row.
+    """
+    trace_name = str(trace_id or "").strip()
+    if not trace_name:
+        return {}
+    trace_path = Path(".timeclaw/traces") / f"{trace_name}.jsonl"
+    if not trace_path.exists():
+        return {}
+
+    recovered: dict[str, Any] = {}
+    last_done_payload: dict[str, Any] = {}
+    try:
+        for raw_line in trace_path.read_text().splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            record = json.loads(raw_line)
+            event = str(record.get("event") or "").strip()
+            payload = record.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+
+            if event == "content_block":
+                kind = str(payload.get("kind") or "").strip()
+                if kind != "prompt_message/assistant":
+                    continue
+                content = str(payload.get("content") or "").strip()
+                if not content.startswith("{"):
+                    continue
+                try:
+                    parsed = json.loads(content)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                if parsed.get("done") is True and parsed.get("answer_type"):
+                    last_done_payload = parsed
+                continue
+
+            if event == "run_end":
+                recovered["trace_status"] = str(payload.get("status") or "").strip()
+                recovered["trace_error"] = str(payload.get("error") or "").strip()
+                recovered["trace_error_type"] = str(payload.get("error_type") or "").strip()
+                recovered["trace_failure_reason"] = str(payload.get("failure_reason") or "").strip()
+
+        if last_done_payload:
+            recovered.update(
+                {
+                    "answer_type": str(last_done_payload.get("answer_type") or "").strip(),
+                    "raw_answer": last_done_payload.get("answer"),
+                    "confidence": last_done_payload.get("confidence"),
+                    "reasoning": str(last_done_payload.get("reasoning") or "").strip(),
+                    "execution_context": (
+                        last_done_payload.get("execution_context")
+                        if isinstance(last_done_payload.get("execution_context"), dict)
+                        else {}
+                    ),
+                    "control_context": (
+                        last_done_payload.get("control_context")
+                        if isinstance(last_done_payload.get("control_context"), dict)
+                        else {}
+                    ),
+                    "trace_recovered": True,
+                }
+            )
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return recovered
+
+
+def _build_failed_result_payload(exc: Exception, recovered: dict[str, Any]) -> dict[str, Any]:
+    """Merge direct exception payloads with trace fallback for failed samples.
+
+    New definition:
+        Failed train rows should keep the richest execution-side debug evidence
+        available immediately: prefer executor/pipeline `partial_result`
+        payloads, then explicit exception attributes, then trace recovery.
+        This avoids empty-shell `train_results` rows when the run had already
+        executed tools or produced a near-final learning payload before failing.
+    """
+    partial_result = getattr(exc, "partial_result", None)
+    partial = partial_result if isinstance(partial_result, dict) else {}
+
+    def _pick(*values: Any) -> Any:
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, dict) and not value:
+                continue
+            if isinstance(value, list) and not value:
+                continue
+            return value
+        return None
+
+    raw_answer = _pick(
+        partial.get("answer"),
+        getattr(exc, "raw_answer", None),
+        recovered.get("raw_answer"),
+    )
+    execution_log = _pick(
+        partial.get("execution_log"),
+        getattr(exc, "execution_log", None),
+    ) or []
+    execution_context = _pick(
+        partial.get("execution_context"),
+        getattr(exc, "execution_context", None),
+        recovered.get("execution_context"),
+    ) or {}
+    control_context = _pick(
+        partial.get("control_context"),
+        getattr(exc, "control_context", None),
+        recovered.get("control_context"),
+    ) or {}
+
+    return {
+        "answer_type": str(_pick(partial.get("answer_type"), getattr(exc, "answer_type", None), recovered.get("answer_type"), "") or ""),
+        "execution_log": execution_log if isinstance(execution_log, list) else [],
+        "prediction": _pick(partial.get("prediction"), raw_answer),
+        "status": str(getattr(exc, "failure_reason", "") or "error"),
+        "error": str(exc),
+        "error_type": str(getattr(exc, "error_type", type(exc).__name__)),
+        "failure_reason": str(getattr(exc, "failure_reason", "") or "error"),
+        "trace_id": getattr(exc, "trace_id", None),
+        "total_ms": getattr(exc, "total_ms", 0),
+        "raw_answer": raw_answer,
+        "confidence": _pick(partial.get("confidence"), getattr(exc, "confidence", None), recovered.get("confidence")),
+        "reasoning": str(_pick(partial.get("reasoning"), getattr(exc, "reasoning", None), recovered.get("reasoning"), "") or ""),
+        "execution_context": execution_context if isinstance(execution_context, dict) else {},
+        "control_context": control_context if isinstance(control_context, dict) else {},
+        "trace_recovered": bool(recovered.get("trace_recovered", False)),
+    }
+
+
 def _build_train_result_row(
     *,
     ds_name: str,
@@ -540,37 +1019,55 @@ def _build_train_result_row(
     pipeline_task: str,
     scope_keys: list[str],
     result: dict[str, Any],
+    train_run_id: str = "",
 ) -> dict[str, Any]:
+    """Persist one train-result row with both preview and full debug payloads.
+
+    New definition:
+        `train_results` rows keep the compact previews for quick scanning, but
+        also store the exact executor outputs (`raw_answer`,
+        `execution_context`, `control_context`, `execution_log`) so debugging
+        no longer needs an immediate second hop into traces.
+    """
     raw_answer = result.get("raw_answer")
     learning_summary = raw_answer if isinstance(raw_answer, dict) else {}
     sample_ref = f"{ds_name}:{sample.file}:{sample_idx}:{task}"
     substantive_tool_chain = _extract_train_result_tool_chain(result)
 
-    return {
+    row = {
         "idx": sample_idx,
+        "abs_idx": sample_idx,
+        "dataset": ds_name,
         "dataset_name": ds_name,
         "sample_ref": sample_ref,
         "file": sample.file,
         "task": task,
         "pipeline_task": pipeline_task,
         "scope_keys": list(scope_keys),
+        "train_run_id": str(train_run_id or "").strip(),
         "domain": sample.domain,
         "status": result.get("status", "completed"),
         "answer_type": result.get("answer_type", ""),
         "has_prediction": result.get("prediction") is not None,
         "trace_id": result.get("trace_id"),
+        "trace_recovered": bool(result.get("trace_recovered", False)),
         "gate": "PASS" if result.get("gate_accepted") else "FAIL",
         "gate_accepted": result.get("gate_accepted"),
         "gate_rejections": list(result.get("gate_rejections", [])),
         "confidence": result.get("confidence"),
         "tools_run": len(substantive_tool_chain),
         "tool_chain": substantive_tool_chain,
+        "winner_tool_chain": list(substantive_tool_chain),
         "total_ms": result.get("total_ms", 0),
         "error": result.get("error"),
         "error_type": result.get("error_type"),
         "failure_reason": result.get("failure_reason"),
-        "reasoning_preview": _sanitize_learning_artifact_preview(result.get("reasoning", ""), limit=300),
+        "reasoning_preview": _extract_train_result_reasoning_preview(result, learning_summary),
+        "raw_answer": raw_answer,
         "raw_answer_preview": _sanitize_learning_artifact_preview(raw_answer, limit=500),
+        "execution_context": result.get("execution_context"),
+        "control_context": result.get("control_context"),
+        "execution_log": result.get("execution_log", []),
         "learning_insight": learning_summary.get("insight"),
         "learning_recommendation": learning_summary.get("recommendation"),
         "evidence_summary_preview": _build_train_result_evidence_preview(
@@ -578,6 +1075,7 @@ def _build_train_result_row(
             substantive_tool_chain,
         ),
     }
+    return _normalize_train_result_row(row)
 
 
 # ── Ground truth extraction ──────────────────────────────────────────
@@ -659,6 +1157,7 @@ async def _process_one_sample(
     supported_tasks: list[str],
     pipeline: PipelineRunner,
     sem: asyncio.Semaphore,
+    train_run_id: str,
 ) -> list[dict[str, Any]]:
     """Process a single sample across all its tasks (semaphore-gated)."""
     async with sem:
@@ -697,6 +1196,7 @@ async def _process_one_sample(
                     "task_name": task,
                     "pipeline_task": pipeline_task,
                     "domain": sample.domain,
+                    "train_run_id": train_run_id,
                 }
                 result = await asyncio.wait_for(
                     pipeline.run(
@@ -725,23 +1225,9 @@ async def _process_one_sample(
                 }
             except Exception as e:
                 logger.error(f"[TrainLoop] {ds_name}[{sample_idx}] {task}: {e}")
-                error_type = type(e).__name__
-                failure_reason = (
-                    "max_steps_exhausted"
-                    if error_type == "MaxStepsExhaustedError"
-                    else "error"
-                )
-                result = {
-                    "answer_type": "",
-                    "execution_log": [],
-                    "prediction": None,
-                    "status": failure_reason,
-                    "error": str(e),
-                    "error_type": error_type,
-                    "failure_reason": failure_reason,
-                    "trace_id": getattr(e, "trace_id", None),
-                    "total_ms": getattr(e, "total_ms", 0),
-                }
+                trace_id = getattr(e, "trace_id", None)
+                recovered = _recover_failed_result_from_trace(trace_id)
+                result = _build_failed_result_payload(e, recovered)
 
             results.append(_build_train_result_row(
                 ds_name=ds_name,
@@ -750,6 +1236,7 @@ async def _process_one_sample(
                 task=task,
                 pipeline_task=pipeline_task,
                 scope_keys=scope_keys,
+                train_run_id=train_run_id,
                 result=result,
             ))
         return results
@@ -763,6 +1250,7 @@ async def _process_one_task_sample(
     pipeline: PipelineRunner,
     sem: asyncio.Semaphore,
     task_sem: asyncio.Semaphore | None = None,
+    train_run_id: str = "",
 ) -> dict[str, Any] | None:
     """Process one (sample, task) pair with optional per-task gating."""
     gt = _extract_ground_truth(sample, task)
@@ -799,6 +1287,7 @@ async def _process_one_task_sample(
         "task_name": task,
         "pipeline_task": pipeline_task,
         "domain": sample.domain,
+        "train_run_id": train_run_id,
     }
     try:
         async with sem:
@@ -830,25 +1319,9 @@ async def _process_one_task_sample(
                 }
             except Exception as e:
                 logger.error(f"[TrainLoop] {ds_name}[{sample_idx}] {task}: {e}")
-                error_type = getattr(e, "error_type", type(e).__name__)
-                failure_reason = getattr(
-                    e,
-                    "failure_reason",
-                    "max_steps_exhausted"
-                    if error_type == "MaxStepsExhaustedError"
-                    else "error",
-                )
-                result = {
-                    "answer_type": "",
-                    "execution_log": [],
-                    "prediction": None,
-                    "status": failure_reason,
-                    "error": str(e),
-                    "error_type": error_type,
-                    "failure_reason": failure_reason,
-                    "trace_id": getattr(e, "trace_id", None),
-                    "total_ms": getattr(e, "total_ms", 0),
-                }
+                trace_id = getattr(e, "trace_id", None)
+                recovered = _recover_failed_result_from_trace(trace_id)
+                result = _build_failed_result_payload(e, recovered)
 
         return _build_train_result_row(
             ds_name=ds_name,
@@ -857,6 +1330,7 @@ async def _process_one_task_sample(
             task=task,
             pipeline_task=pipeline_task,
             scope_keys=scope_keys,
+            train_run_id=train_run_id,
             result=result,
         )
     finally:
@@ -872,6 +1346,7 @@ async def _run_task_work_item(
     pipeline: PipelineRunner,
     sem: asyncio.Semaphore,
     task_sem: asyncio.Semaphore | None = None,
+    train_run_id: str = "",
 ) -> tuple[str, list[dict[str, Any]], Exception | None]:
     try:
         row = await _process_one_task_sample(
@@ -882,6 +1357,7 @@ async def _run_task_work_item(
             pipeline=pipeline,
             sem=sem,
             task_sem=task_sem,
+            train_run_id=train_run_id,
         )
     except Exception as e:  # pragma: no cover - catastrophic wrapper fallback
         return ds_name, [], e
@@ -895,6 +1371,7 @@ async def _run_sample_work_item(
     supported_tasks: list[str],
     pipeline: PipelineRunner,
     sem: asyncio.Semaphore,
+    train_run_id: str,
 ) -> tuple[str, list[dict[str, Any]], Exception | None]:
     try:
         rows = await _process_one_sample(
@@ -904,6 +1381,7 @@ async def _run_sample_work_item(
             supported_tasks=supported_tasks,
             pipeline=pipeline,
             sem=sem,
+            train_run_id=train_run_id,
         )
     except Exception as e:  # pragma: no cover - catastrophic wrapper fallback
         return ds_name, [], e
@@ -952,6 +1430,8 @@ async def run_train_loop(
             f"{len(datasets_with_benchmark_tasks())} datasets (see registry)"
         )
 
+    train_run_id = time.strftime("%Y%m%d_%H%M%S") + f"_{uuid4().hex[:8]}"
+    started_at = time.time()
     pipeline = PipelineRunner(cfg, disable_memory=False)
     sample_indices_map = (
         load_sample_indices(sample_indices)
@@ -965,11 +1445,13 @@ async def run_train_loop(
         else datasets_with_benchmark_tasks()
     )
     all_results: dict[str, Any] = {}
+    _save_train_summary(all_results)
     sem = asyncio.Semaphore(concurrency)
     dataset_work_items: list[tuple[str, int, MTBenchSample, str]] = []
     dataset_samples: dict[str, list[MTBenchSample]] = {}
     dataset_tasks: dict[str, list[str]] = {}
     dataset_existing_rows: dict[str, list[dict[str, Any]]] = {}
+    run_rows_by_task: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
 
     for ds_name in datasets_to_run:
         info = DATASET_REGISTRY.get(ds_name)
@@ -1070,13 +1552,22 @@ async def run_train_loop(
                     task_sem=task_sems_global.get((a, t))
                     if (per_task_concurrency is not None or indicator_concurrency is not None)
                     else None,
+                    train_run_id=train_run_id,
                 ))
                 for (a, si, s, t) in dataset_work_items
             ]
         else:
             batch_work = [w for w in dataset_work_items if w[3] == "__all__"]
             pending_tasks = [
-                asyncio.create_task(_run_sample_work_item(a, si, s, dataset_tasks[a], pipeline, sem))
+                asyncio.create_task(_run_sample_work_item(
+                    a,
+                    si,
+                    s,
+                    dataset_tasks[a],
+                    pipeline,
+                    sem,
+                    train_run_id,
+                ))
                 for (a, si, s, _) in batch_work
             ]
 
@@ -1098,6 +1589,7 @@ async def run_train_loop(
                     rows_by_task[task_name].append(row)
                 for task_name, task_rows in rows_by_task.items():
                     key = (ds_name, task_name)
+                    run_rows_by_task[key].extend(task_rows)
                     merged_rows_by_ds_task[key] = _merge_train_rows(
                         merged_rows_by_ds_task.get(key, []),
                         task_rows,
@@ -1126,14 +1618,31 @@ async def run_train_loop(
             else:
                 summary = _summarize_results(existing_rows)
                 all_results[ds_name] = {"total": len(existing_rows), "summary": summary}
+                _save_train_summary(all_results)
                 logger.info(f"[TrainLoop] {ds_name}: nothing pending, kept {len(existing_rows)} checkpoint rows")
             continue
 
         merged = merged_rows_by_ds.get(ds_name, existing_rows)
         summary = _summarize_results(merged)
         all_results[ds_name] = {"total": len(merged), "summary": summary}
+        _save_train_summary(all_results)
         logger.info(f"[TrainLoop] {ds_name} done: {len(merged)} results")
 
+    note_view_paths = _export_train_note_views(
+        pipeline=pipeline,
+        train_run_id=train_run_id,
+        run_rows_by_task=run_rows_by_task,
+    )
+    manifest = _build_run_manifest(
+        train_run_id=train_run_id,
+        started_at=started_at,
+        finished_at=time.time(),
+        all_results=all_results,
+        run_rows_by_task=run_rows_by_task,
+        note_view_paths=note_view_paths,
+    )
+    _write_json_atomically(TRAIN_RUN_MANIFEST_PATH, manifest)
+    _save_train_summary(all_results)
     await pipeline.shutdown()
     return all_results
 
@@ -1141,7 +1650,133 @@ async def run_train_loop(
 def _save_task_checkpoint(results: list[dict[str, Any]], ds_name: str, task: str) -> None:
     TRAIN_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = _task_train_checkpoint_path(ds_name, task)
-    path.write_text(json.dumps(results, indent=2, default=str))
+    normalized_rows = [
+        _normalize_train_result_row({
+            **row,
+            "dataset_name": row.get("dataset_name") or ds_name,
+            "dataset": row.get("dataset") or ds_name,
+            "task": row.get("task") or task,
+        })
+        for row in results
+        if isinstance(row, dict)
+    ]
+    _write_json_atomically(path, normalized_rows)
+
+
+def _write_json_atomically(path: Path, payload: Any) -> None:
+    """Write JSON to a sibling temp file, then replace the target atomically.
+
+    New definition:
+        ``atomic JSON write`` here means readers either observe the previous
+        complete file or the new complete file, but not a partially written
+        intermediate state.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, default=str))
+    tmp_path.replace(path)
+
+
+def _save_train_summary(summary: dict[str, Any]) -> None:
+    _write_json_atomically(TRAIN_SUMMARY_PATH, summary)
+
+
+def _render_note_block(note_text: str) -> str:
+    stripped = str(note_text or "").strip()
+    if not stripped:
+        return ""
+    return stripped if stripped.startswith("### [") else f"### {stripped}"
+
+
+def _note_matches_run(note_text: str, *, train_run_id: str, sample_refs: set[str]) -> bool:
+    text = str(note_text or "")
+    if not text:
+        return False
+    if train_run_id and f"- Train Run ID: {train_run_id}" in text:
+        return True
+    return any(sample_ref and f"- Sample Ref: {sample_ref}" in text for sample_ref in sample_refs)
+
+
+def _export_train_note_views(
+    *,
+    pipeline: PipelineRunner,
+    train_run_id: str,
+    run_rows_by_task: dict[tuple[str, str], list[dict[str, Any]]],
+) -> dict[str, str]:
+    exports: dict[str, str] = {}
+    notes = getattr(getattr(pipeline, "memory", None), "notes", None)
+    if notes is None:
+        return exports
+
+    for (ds_name, task), rows in sorted(run_rows_by_task.items()):
+        sample_refs = {
+            str(row.get("sample_ref") or "").strip()
+            for row in rows
+            if isinstance(row, dict) and str(row.get("sample_ref") or "").strip()
+        }
+        if not sample_refs:
+            continue
+        blocks: list[str] = []
+        seen: set[str] = set()
+        for scope in scope_keys_for_dataset_task(ds_name, task):
+            for item in notes.get_scope_note_items(scope):
+                note_text = str(item.get("text") or "")
+                note_id = str(item.get("id") or "")
+                if note_id in seen or not _note_matches_run(
+                    note_text,
+                    train_run_id=train_run_id,
+                    sample_refs=sample_refs,
+                ):
+                    continue
+                block = _render_note_block(note_text)
+                if not block:
+                    continue
+                seen.add(note_id)
+                blocks.append(block)
+        if not blocks:
+            continue
+        path = _task_note_view_path(ds_name, task)
+        path.write_text("\n\n".join(blocks).rstrip() + "\n", encoding="utf-8")
+        exports[f"{ds_name}::{task}"] = str(path)
+    return exports
+
+
+def _build_run_manifest(
+    *,
+    train_run_id: str,
+    started_at: float,
+    finished_at: float,
+    all_results: dict[str, Any],
+    run_rows_by_task: dict[tuple[str, str], list[dict[str, Any]]],
+    note_view_paths: dict[str, str],
+) -> dict[str, Any]:
+    tasks: dict[str, Any] = {}
+    for (ds_name, task), rows in sorted(run_rows_by_task.items()):
+        status_counts: dict[str, int] = defaultdict(int)
+        failed_sample_refs: list[str] = []
+        for row in rows:
+            status = str(row.get("status") or "")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if status and status != "completed":
+                failed_sample_refs.append(str(row.get("sample_ref") or ""))
+        task_key = f"{ds_name}::{task}"
+        tasks[task_key] = {
+            "dataset": ds_name,
+            "task": task,
+            "rows": len(rows),
+            "status_counts": dict(status_counts),
+            "failed_sample_refs": failed_sample_refs,
+            "note_view_path": note_view_paths.get(task_key, ""),
+            "result_path": str(_task_train_checkpoint_path(ds_name, task)),
+        }
+    return {
+        "train_run_id": train_run_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "elapsed_s": round(max(0.0, finished_at - started_at), 3),
+        "dataset_summary": all_results,
+        "tasks": tasks,
+    }
 
 
 def _summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:

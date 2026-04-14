@@ -85,3 +85,8 @@ class ModelRouter:
         if models.text_heavy:
             assignments["text_heavy"] = models.text_heavy
         return assignments
+
+    async def shutdown(self) -> None:
+        """Close any shared backend transports created during the run."""
+        for backend in self._backends.values():
+            await backend.shutdown()

@@ -33,6 +33,8 @@ SUBAGENT_SLOT_POOL_SIZE = 10
 MAX_CONCURRENT_SUBAGENTS = SUBAGENT_SLOT_POOL_SIZE
 MIN_TRAINING_CANDIDATES = 2
 SUBAGENT_TIMEOUT_SECONDS = 120
+MAX_JSON_JUDGE_ATTEMPTS = 2
+MAX_TERMINAL_REPAIR_ATTEMPTS = 3
 _ORCHESTRATION_ONLY_TOOLS = frozenset({
     "spawn_subagent",
     "evaluate_against_gt",
@@ -54,10 +56,12 @@ class MaxStepsExhaustedError(RuntimeError):
         agent_kind: str,
         max_steps: int,
         sub_agent_idx: int | None = None,
+        partial_result: dict[str, Any] | None = None,
     ) -> None:
         self.agent_kind = str(agent_kind)
         self.max_steps = int(max_steps)
         self.sub_agent_idx = sub_agent_idx
+        self.partial_result = dict(partial_result or {})
         detail = (
             f"{self.agent_kind} exhausted max steps without producing a finalized answer"
         )
@@ -362,6 +366,13 @@ class ExecutorAgent(AgentBase):
         return (
             title_line
             + guide_line
+            + (
+                "- If the preferred anchor tool is not visible in the chosen slot, keep "
+                "the slot-local `tools_hint` fully supported by that slot and record the "
+                "preferred anchor explicitly in `branch_metadata.anchor`.\n"
+                if anchor_tools
+                else ""
+            )
             + "- Treat this only as a branch-construction prior, not as final evidence.\n"
         )
 
@@ -402,6 +413,54 @@ class ExecutorAgent(AgentBase):
             if name not in filtered:
                 filtered.append(name)
         return filtered
+
+    @staticmethod
+    def _runtime_compatible_candidates(
+        candidates: list[str],
+        *,
+        current_data: Any,
+        current_series_state: dict[str, Any] | None,
+    ) -> list[str]:
+        filtered: list[str] = []
+        for raw_name in candidates:
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            try:
+                tool = get_tool_instance(name)
+            except KeyError:
+                filtered.append(name)
+                continue
+            incompatibility = tool.runtime_compatibility_error(
+                current_data,
+                current_series_state=current_series_state,
+            )
+            if incompatibility:
+                continue
+            filtered.append(name)
+        return filtered
+
+    @staticmethod
+    def _tool_runtime_incompatibility_message(
+        tool_name: str,
+        *,
+        current_data: Any,
+        current_series_state: dict[str, Any] | None,
+    ) -> str | None:
+        name = str(tool_name or "").strip()
+        if not name:
+            return None
+        try:
+            tool = get_tool_instance(name)
+        except KeyError:
+            return None
+        incompatibility = tool.runtime_compatibility_error(
+            current_data,
+            current_series_state=current_series_state,
+        )
+        if not incompatibility:
+            return None
+        return "Self-correction: " + incompatibility
 
     @classmethod
     def _task_mismatched_reasoning_tool_message(
@@ -492,6 +551,15 @@ class ExecutorAgent(AgentBase):
                 return True
             if branch_metadata.get("uses_prior") is False:
                 return False
+            if anchor_tools:
+                explicit_anchor = ""
+                for key in ("anchor", "anchor_tool"):
+                    value = branch_metadata.get(key)
+                    if isinstance(value, str) and value.strip():
+                        explicit_anchor = value.strip()
+                        break
+                if explicit_anchor and explicit_anchor in set(anchor_tools):
+                    return True
         metadata_tools_hint = (
             branch_metadata.get("tools_hint")
             if isinstance(branch_metadata, dict)
@@ -739,6 +807,11 @@ class ExecutorAgent(AgentBase):
         accepted_answer_type: str = ""
         accepted_confidence: float | None = None
         accepted_reasoning: str = ""
+        recoverable_answer: dict[str, Any] | None = None
+        recoverable_final: dict[str, Any] | None = None
+        repair_delivery_mode = False
+        accepted_execution_context: dict[str, Any] = self._normalize_execution_context(None)
+        accepted_control_context: dict[str, Any] = self._normalize_control_context(None)
 
         system_memory = plan.get("system_memory", "")
         system_prompt = executor_prompt.REACT_SYSTEM_PROMPT.format(
@@ -753,6 +826,11 @@ class ExecutorAgent(AgentBase):
         system_prompt += executor_prompt.build_visible_tool_guidance(
             candidates,
             defer_learning_record=defer_learning_record,
+        )
+        expected_final_type = (
+            "learning_summary"
+            if is_train and not defer_learning_record
+            else plan["task_type"]
         )
 
         first_user = executor_prompt.REACT_FIRST_TURN.format(
@@ -775,7 +853,16 @@ class ExecutorAgent(AgentBase):
             profiling_section=plan.get("profiling_section", ""),
             execution_context_section=self._render_prompt_section(
                 "Execution Context",
+                "",
+            ),
+            control_context_section=self._render_prompt_section(
+                "Control Context",
                 self._join_prompt_sections(
+                    self._build_action_state_section(
+                        state="need_evidence",
+                        required_final_type=expected_final_type,
+                        execution_log=execution_log,
+                    ),
                     self._build_train_spawn_prior_section(
                         plan.get("train_spawn_prior_path", []),
                     ) if is_train else "",
@@ -821,8 +908,14 @@ class ExecutorAgent(AgentBase):
         _gt_obs_idx: int | None = None
         skip_generic_turn_prompt_once = False
         pending_spawn_requirement = False
+        repair_delivery_feedback_messages: list[str] = []
 
         for step in range(1, MAX_REACT_STEPS + 1):
+            turn_candidates = self._runtime_compatible_candidates(
+                candidates,
+                current_data=current_data,
+                current_series_state=current_series_state,
+            )
             is_train = (
                 plan.get("_mode") == "train"
                 and not bool(plan.get("_defer_learning_record", False))
@@ -850,45 +943,53 @@ class ExecutorAgent(AgentBase):
             )
             if not needs_more_candidates:
                 pending_spawn_requirement = False
-            spawn_only_turn = self._main_requires_spawn_only_turn(
-                step=step,
-                execution_log=execution_log,
-                plan=plan,
-                spawn_candidate_available="spawn_subagent" in candidates,
-            )
-            if pending_spawn_requirement and "spawn_subagent" in candidates and needs_more_candidates:
-                spawn_only_turn = True
-            eval_only_turn = self._main_requires_eval_only_turn(
-                step=step,
-                execution_log=execution_log,
-                plan=plan,
-            )
-            allow_finish = self._main_finish_allowed_this_turn(
-                execution_log=execution_log,
-                plan=plan,
-            )
-            spawn_available = "spawn_subagent" in candidates and not eval_only_turn
-            ordinary_tool_names = [
-                name for name in candidates
-                if name not in {
-                    "spawn_subagent",
-                    "evaluate_against_gt",
-                    "evaluate_batch_against_gt",
-                    "batch_evaluate_against_gt",
-                }
-            ]
-            if spawn_only_turn or eval_only_turn:
+            if repair_delivery_mode:
+                spawn_only_turn = False
+                eval_only_turn = False
+                allow_finish = True
+                spawn_available = False
                 ordinary_tool_names = []
-            evaluate_tool_names = [
-                name for name in candidates
-                if name in {
-                    "evaluate_against_gt",
-                    "evaluate_batch_against_gt",
-                    "batch_evaluate_against_gt",
-                }
-            ]
-            if spawn_only_turn:
                 evaluate_tool_names = []
+            else:
+                spawn_only_turn = self._main_requires_spawn_only_turn(
+                    step=step,
+                    execution_log=execution_log,
+                    plan=plan,
+                    spawn_candidate_available="spawn_subagent" in turn_candidates,
+                )
+                if pending_spawn_requirement and "spawn_subagent" in turn_candidates and needs_more_candidates:
+                    spawn_only_turn = True
+                eval_only_turn = self._main_requires_eval_only_turn(
+                    step=step,
+                    execution_log=execution_log,
+                    plan=plan,
+                )
+                allow_finish = self._main_finish_allowed_this_turn(
+                    execution_log=execution_log,
+                    plan=plan,
+                )
+                spawn_available = "spawn_subagent" in turn_candidates and not eval_only_turn
+                ordinary_tool_names = [
+                    name for name in turn_candidates
+                    if name not in {
+                        "spawn_subagent",
+                        "evaluate_against_gt",
+                        "evaluate_batch_against_gt",
+                        "batch_evaluate_against_gt",
+                    }
+                ]
+                if spawn_only_turn or eval_only_turn:
+                    ordinary_tool_names = []
+                evaluate_tool_names = [
+                    name for name in turn_candidates
+                    if name in {
+                        "evaluate_against_gt",
+                        "evaluate_batch_against_gt",
+                        "batch_evaluate_against_gt",
+                    }
+                ]
+                if spawn_only_turn:
+                    evaluate_tool_names = []
             if step > 1 and not skip_generic_turn_prompt_once:
                 follow_up = executor_prompt.REACT_NEXT_TURN.format(
                     step=step,
@@ -898,6 +999,7 @@ class ExecutorAgent(AgentBase):
                         spawn_available=spawn_available,
                         spawn_only=spawn_only_turn,
                         eval_only=eval_only_turn,
+                        tool_call_allowed=not repair_delivery_mode,
                     ),
                 )
                 conversation.append({"role": "user", "content": follow_up})
@@ -910,10 +1012,34 @@ class ExecutorAgent(AgentBase):
                 if budget_msg:
                     conversation.append({"role": "user", "content": budget_msg})
             skip_generic_turn_prompt_once = False
+            conversation.append({
+                "role": "user",
+                "content": self._render_prompt_section(
+                    "Decision State",
+                    self._build_action_state_section(
+                        state="repair_delivery" if repair_delivery_mode else "need_evidence",
+                        required_final_type=expected_final_type,
+                        execution_log=execution_log,
+                        recoverable_final=recoverable_answer or recoverable_final,
+                    ),
+                ).strip(),
+            })
 
+            decision_conversation = conversation
+            if repair_delivery_mode:
+                decision_conversation = self._build_clean_repair_delivery_conversation(
+                    expected_type=expected_final_type,
+                    task_type=plan["task_type"],
+                    task_description=plan.get("task_description", ""),
+                    execution_log=execution_log,
+                    recoverable_final=recoverable_answer or recoverable_final,
+                    feedback_messages=repair_delivery_feedback_messages,
+                    horizon=plan.get("horizon"),
+                    indicator_output_keys=plan.get("indicator_output_keys", []),
+                )
             response, decision = await self._request_structured_decision(
-                conversation,
-                allow_tool_call=True,
+                decision_conversation,
+                allow_tool_call=not repair_delivery_mode,
                 allow_finish=allow_finish,
                 ordinary_tool_names=ordinary_tool_names,
                 evaluate_tool_names=evaluate_tool_names,
@@ -924,14 +1050,6 @@ class ExecutorAgent(AgentBase):
                     if is_train
                     else "task"
                 ),
-            )
-            expected_final_type = (
-                "learning_summary"
-                if (
-                    plan.get("_mode") == "train"
-                    and not bool(plan.get("_defer_learning_record", False))
-                )
-                else plan["task_type"]
             )
             # GT sanitisation: after the LLM has seen and analysed the
             # evaluate_against_gt result (this step), strip the ground_truth
@@ -945,6 +1063,9 @@ class ExecutorAgent(AgentBase):
             parse_failed = bool(decision.get("_parse_failed"))
 
             if parse_failed and step < MAX_REACT_STEPS:
+                invalid_json_msg = self._invalid_json_self_correction_message(thought)
+                if repair_delivery_mode:
+                    repair_delivery_feedback_messages = [invalid_json_msg]
                 trace.agent_step("executor", f"react_step_{step}", {
                     "self_correction": True,
                     "reason": "invalid_json_response",
@@ -953,7 +1074,7 @@ class ExecutorAgent(AgentBase):
                 })
                 conversation.append({
                     "role": "user",
-                    "content": self._invalid_json_self_correction_message(thought),
+                    "content": invalid_json_msg,
                 })
                 skip_generic_turn_prompt_once = True
                 continue
@@ -964,6 +1085,13 @@ class ExecutorAgent(AgentBase):
             })
 
             if not self._has_structured_thought(thought) and step < MAX_REACT_STEPS:
+                structured_thought_msg = (
+                    "Self-correction: your `thought` must explicitly include "
+                    "`Reason:` and `Action:`. Please continue "
+                    "with the required structure."
+                )
+                if repair_delivery_mode:
+                    repair_delivery_feedback_messages = [structured_thought_msg]
                 trace.agent_step("executor", f"react_step_{step}", {
                     "self_correction": True,
                     "reason": "unstructured_or_unparsed_response",
@@ -974,11 +1102,7 @@ class ExecutorAgent(AgentBase):
                 })
                 conversation.append({
                     "role": "user",
-                    "content": (
-                        "Self-correction: your `thought` must explicitly include "
-                        "`Reason:` and `Action:`. Please continue "
-                        "with the required structure."
-                    ),
+                    "content": structured_thought_msg,
                 })
                 skip_generic_turn_prompt_once = True
                 continue
@@ -988,6 +1112,18 @@ class ExecutorAgent(AgentBase):
                 agent_answer_type = decision.get("answer_type", "")
                 agent_confidence = decision.get("confidence")
                 agent_reasoning = decision.get("reasoning", thought)
+                agent_execution_context = self._normalize_execution_context(
+                    decision.get("execution_context"),
+                    execution_log=execution_log,
+                )
+                agent_reasoning = self._normalize_reasoning_for_reuse(
+                    agent_reasoning,
+                    execution_log,
+                    agent_execution_context,
+                )
+                agent_control_context = self._normalize_control_context(
+                    decision.get("control_context")
+                )
                 is_train = plan.get("_mode") == "train"
                 deferred_learning_record = bool(plan.get("_defer_learning_record", False))
                 requested_type = plan["task_type"]
@@ -997,13 +1133,16 @@ class ExecutorAgent(AgentBase):
                     logger.info(
                         "[Executor] Self-correction: done=true without answer payload, retrying"
                     )
+                    missing_answer_msg = (
+                        "Self-correction: you set `done=true` but did not provide "
+                        "a final `answer`. Continue until you can return a valid "
+                        "task-typed answer payload."
+                    )
+                    if repair_delivery_mode:
+                        repair_delivery_feedback_messages = [missing_answer_msg]
                     conversation.append({
                         "role": "user",
-                        "content": (
-                            "Self-correction: you set `done=true` but did not provide "
-                            "a final `answer`. Continue until you can return a valid "
-                            "task-typed answer payload."
-                        ),
+                        "content": missing_answer_msg,
                     })
                     trace.agent_step("executor", f"react_step_{step}", {
                         "thought": thought,
@@ -1103,7 +1242,7 @@ class ExecutorAgent(AgentBase):
                         "with `answer_type='learning_summary'`, not a task-typed final answer. "
                         "Summarize the explored candidates, the winner, and the reusable lesson. "
                         "Use this exact shape: "
-                        '`{"answer":{"insight":"...","recommendation":"..."},"answer_type":"learning_summary","reasoning":"1. ..."}`. '
+                        '`{"answer":{"insight":"...","recommendation":"..."},"answer_type":"learning_summary","reasoning":"1. ...","execution_context":{"tool_chain":["..."],"public_reasoning":["..."],"evidence_summary":"..."},"control_context":{"completion_notes":""}}`. '
                         "Do not put the whole summary into a top-level string `answer`."
                     )
                     if step < MAX_REACT_STEPS:
@@ -1257,9 +1396,10 @@ class ExecutorAgent(AgentBase):
                 ):
                     correction_msg = (
                         "Self-correction: you may not invent a new task answer in the final step. "
-                        "Finish only by selecting or re-wrapping a task-valid answer that was "
-                        "already produced by a real tool in this branch. If no tool has produced "
-                        "one yet, call another tool."
+                        "Finish only by returning the exact task answer that was already "
+                        "produced by a real tool in this branch. Do not describe packaging, "
+                        "JSON repair, or payload wrapping. If no tool has produced one yet, "
+                        "call another tool."
                     )
                     trace.agent_step("executor", f"react_step_{step}", {
                         "thought": thought,
@@ -1273,15 +1413,94 @@ class ExecutorAgent(AgentBase):
                         conversation.append({"role": "user", "content": correction_msg})
                     continue
 
+                solve_ready_current = False
+                if learning_summary_allowed:
+                    solve_ready_current = self._is_learning_summary_solve_ready_finish(
+                        answer=agent_answer,
+                        answer_type=agent_answer_type,
+                        execution_log=execution_log,
+                        task_type=plan["task_type"],
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                    )
+                else:
+                    solve_ready_current = self._is_task_solve_ready_finish(
+                        task_type=requested_type,
+                        answer=agent_answer,
+                        answer_type=agent_answer_type,
+                        execution_log=execution_log,
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                        require_tool_use=(plan.get("_mode") != "train"),
+                    )
+                if solve_ready_current:
+                    recoverable_answer = self._recoverable_final_record(
+                        answer=agent_answer,
+                        answer_type=agent_answer_type,
+                        confidence=agent_confidence,
+                        reasoning=agent_reasoning,
+                        execution_context=agent_execution_context,
+                        control_context=agent_control_context,
+                    )
+                execution_context_verdict = {"passed": True, "missing": [], "explanation": ""}
                 if (
-                    step < MAX_REACT_STEPS
-                    and self._should_enforce_stepwise_reasoning(plan.get("_mode"))
-                    and not self._has_stepwise_reasoning(agent_reasoning, execution_log)
+                    self._should_enforce_stepwise_reasoning(plan.get("_mode"))
                 ):
-                    conversation.append({
-                        "role": "user",
-                        "content": self._stepwise_reasoning_correction_message(execution_log),
+                    execution_context_verdict = await self._execution_context_verdict(
+                        agent_execution_context,
+                        execution_log,
+                    )
+                if (
+                    self._should_enforce_stepwise_reasoning(plan.get("_mode"))
+                    and not execution_context_verdict.get("passed", False)
+                ):
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "thought": thought,
+                        "done": True,
+                        "self_correction": True,
+                        "reason": "execution_context_not_reusable",
+                        "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
+                        "execution_context_preview": json.dumps(
+                            agent_execution_context,
+                            ensure_ascii=False,
+                        )[:1200],
+                        "execution_context_gate_missing": list(
+                            execution_context_verdict.get("missing", [])
+                        ),
+                        "execution_context_gate_explanation": str(
+                            execution_context_verdict.get("explanation") or ""
+                        ),
                     })
+                    if step < MAX_REACT_STEPS:
+                        repair_delivery_feedback_messages = [
+                            self._execution_context_correction_message(
+                                execution_log,
+                                verdict=execution_context_verdict,
+                            )
+                        ]
+                        conversation.append({
+                            "role": "user",
+                            "content": repair_delivery_feedback_messages[0],
+                        })
+                    if recoverable_answer is not None:
+                        repair_delivery_mode = True
+                    continue
+
+                if solve_ready_current:
+                    recoverable_final = recoverable_answer
+
+                reasoning_verdict = {"passed": True, "missing": [], "explanation": ""}
+                if (
+                    self._should_enforce_stepwise_reasoning(plan.get("_mode"))
+                ):
+                    reasoning_verdict = await self._stepwise_reasoning_verdict(
+                        agent_reasoning,
+                        execution_log,
+                    )
+                if (
+                    self._should_enforce_stepwise_reasoning(plan.get("_mode"))
+                    and not reasoning_verdict.get("passed", False)
+                ):
                     trace.agent_step("executor", f"react_step_{step}", {
                         "thought": thought,
                         "done": True,
@@ -1289,7 +1508,22 @@ class ExecutorAgent(AgentBase):
                         "reasoning_too_shallow": True,
                         "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
                         "reasoning_preview": str(agent_reasoning)[:1200],
+                        "reasoning_gate_missing": list(reasoning_verdict.get("missing", [])),
+                        "reasoning_gate_explanation": str(reasoning_verdict.get("explanation") or ""),
                     })
+                    if step < MAX_REACT_STEPS:
+                        repair_delivery_feedback_messages = [
+                            self._stepwise_reasoning_correction_message(
+                                execution_log,
+                                verdict=reasoning_verdict,
+                            )
+                        ]
+                        conversation.append({
+                            "role": "user",
+                            "content": repair_delivery_feedback_messages[0],
+                        })
+                    if recoverable_answer is not None:
+                        repair_delivery_mode = True
                     continue
 
                 if agent_answer is not None:
@@ -1297,6 +1531,8 @@ class ExecutorAgent(AgentBase):
                 accepted_answer_type = agent_answer_type
                 accepted_confidence = agent_confidence
                 accepted_reasoning = agent_reasoning
+                accepted_execution_context = agent_execution_context
+                accepted_control_context = agent_control_context
                 trace.agent_step("executor", f"react_step_{step}", {
                     "thought": thought, "done": True,
                     "answer_type": agent_answer_type,
@@ -1368,59 +1604,11 @@ class ExecutorAgent(AgentBase):
                         slot_id = result.get("slot_id")
                         if isinstance(slot_id, int):
                             used_slot_ids.add(slot_id)
-                candidate_count = self._count_training_candidates(
-                    execution_log,
-                    task_type=plan["task_type"],
-                    horizon=plan.get("horizon"),
-                    indicator_output_keys=plan.get("indicator_output_keys", []),
-                ) if is_train else 0
-                spawned_candidate_count = self._count_training_spawn_candidates(
-                    execution_log,
-                    plan["task_type"],
-                    horizon=plan.get("horizon"),
-                    indicator_output_keys=plan.get("indicator_output_keys", []),
-                ) if is_train else 0
                 spawn_min_tasks = 0
                 if is_train:
                     if needs_more_candidates:
                         pending_spawn_requirement = True
-                    if spawn_rounds >= 2:
-                        err_msg = (
-                            "Self-correction: training mode allows at most TWO "
-                            "`spawn_subagent` rounds. Reuse the existing branch results and "
-                            "finish with evaluation or a final summary instead of opening a "
-                            "third exploration round."
-                        )
-                        conversation.append({"role": "user", "content": err_msg})
-                        trace.agent_step("executor", f"react_step_{step}", {
-                            "thought": thought,
-                            "tool": "spawn_subagent",
-                            "self_correction": True,
-                            "reason": "second_spawn_round_forbidden",
-                        })
-                        continue
-                    if spawn_rounds == 1:
-                        if spawned_candidate_count >= MIN_TRAINING_CANDIDATES:
-                            err_msg = (
-                                "Self-correction: you already have enough task-valid spawned "
-                                "branches. Do not open another spawn round; evaluate the "
-                                "existing candidates or finish with a final summary."
-                            )
-                            conversation.append({"role": "user", "content": err_msg})
-                            trace.agent_step("executor", f"react_step_{step}", {
-                                "thought": thought,
-                                "tool": "spawn_subagent",
-                                "self_correction": True,
-                                "reason": "second_spawn_round_unnecessary",
-                            })
-                            continue
-                        # New definition:
-                        # every training spawn round must itself compare at least two
-                        # branches. Allowing a 1-branch second round was the direct
-                        # source of traces that violated the user's spawn>=2 contract.
-                        spawn_min_tasks = MIN_TRAINING_CANDIDATES
-                    else:
-                        spawn_min_tasks = MIN_TRAINING_CANDIDATES
+                    spawn_min_tasks = MIN_TRAINING_CANDIDATES
                 slot_error = self._validate_spawn_subagent_tasks(
                     tool_args.get("tasks", []),
                     plan.get("subagent_slots", []),
@@ -1515,7 +1703,7 @@ class ExecutorAgent(AgentBase):
                     )
                 continue
 
-            if tool_name not in candidates:
+            if tool_name not in turn_candidates:
                 err_msg = (
                     f"Tool '{tool_name}' not available. "
                     f"Choose from the tools listed in the first message."
@@ -1523,6 +1711,21 @@ class ExecutorAgent(AgentBase):
                 conversation.append({"role": "user", "content": err_msg})
                 trace.agent_step("executor", f"react_step_{step}", {
                     "thought": thought, "tool": tool_name, "error": "not in candidates",
+                })
+                continue
+
+            runtime_incompatibility_msg = self._tool_runtime_incompatibility_message(
+                tool_name,
+                current_data=current_data,
+                current_series_state=current_series_state,
+            )
+            if runtime_incompatibility_msg:
+                conversation.append({"role": "user", "content": runtime_incompatibility_msg})
+                trace.agent_step("executor", f"react_step_{step}", {
+                    "thought": thought,
+                    "tool": tool_name,
+                    "self_correction": True,
+                    "reason": "runtime_incompatible_tool",
                 })
                 continue
 
@@ -1626,6 +1829,7 @@ class ExecutorAgent(AgentBase):
                     normalized_predictions = self._normalize_batch_eval_predictions_arg(
                         predictions,
                         task_type=plan["task_type"],
+                        execution_log=execution_log,
                         horizon=plan.get("horizon"),
                         indicator_output_keys=plan.get("indicator_output_keys", []),
                     )
@@ -1726,6 +1930,12 @@ class ExecutorAgent(AgentBase):
                         horizon=plan.get("horizon"),
                         indicator_output_keys=plan.get("indicator_output_keys", []),
                     ),
+                    branch_task_answer_status=self._latest_branch_task_answer_status(
+                        task_type=plan["task_type"],
+                        execution_log=execution_log,
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                    ),
                 ),
             })
 
@@ -1738,8 +1948,57 @@ class ExecutorAgent(AgentBase):
                 "observation": observation_payload,
                 "thought": thought,
             }
-            execution_log.append(log_entry)
+            redundancy_status = self._latest_redundancy_status(
+                task_type=plan["task_type"],
+                execution_log=execution_log + [log_entry],
+                latest_tool_name=tool_name,
+                previous_series_state=pre_tool_series_state,
+                current_series_state=current_series_state,
+                horizon=plan.get("horizon"),
+                indicator_output_keys=plan.get("indicator_output_keys", []),
+            )
+            conversation[-1] = {
+                "role": "user",
+                "content": self._build_state_update_message(
+                    current_series_state=current_series_state,
+                    latest_artifact_state=latest_artifact_state,
+                    task_answer_status=self._task_answer_status(
+                        task_type=plan["task_type"],
+                        candidate=observation_payload,
+                        source_tool=tool_name,
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                    ),
+                    branch_task_answer_status=self._latest_branch_task_answer_status(
+                        task_type=plan["task_type"],
+                        execution_log=execution_log + [log_entry],
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                    ),
+                    latest_redundancy_status=redundancy_status,
+                ),
+            }
+            if redundancy_status.get("redundant") and step < MAX_REACT_STEPS:
+                trace.agent_step("executor", "self_correction", {
+                    "step": step,
+                    "reason": "repeated_task_valid_answer_without_new_evidence",
+                    "tool": tool_name,
+                    "repeat_count": redundancy_status.get("repeat_count"),
+                    "answer_preview": redundancy_status.get("answer_preview", ""),
+                })
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        "Self-correction: the latest tool call repeated the same task-valid answer "
+                        "from the same tool without changing the working artifact. This did not "
+                        "create a new candidate. If solving is already complete, finish with "
+                        "the exact earlier answer. Otherwise, switch to a tool that "
+                        "changes the evidence basis before asking for the same label again."
+                    ),
+                })
+                continue
 
+            execution_log.append(log_entry)
             self.evidence_log.append(EvidenceEntry(
                 step=self.evidence_log.num_steps,
                 thought=thought,
@@ -1763,58 +2022,88 @@ class ExecutorAgent(AgentBase):
                 )
                 else plan["task_type"]
             )
-            terminal_decision = await self._request_terminal_path_review(
-                conversation=conversation,
-                expected_type=expected_final_type,
-                trace_phase="act_terminal_self_correction",
-            )
-            terminal_answer = terminal_decision.get("answer")
-            terminal_answer_type = terminal_decision.get("answer_type", "")
-            terminal_reasoning = terminal_decision.get(
-                "reasoning",
-                terminal_decision.get("thought", ""),
-            )
+            terminal_decision: dict[str, Any] = {}
+            terminal_reuse_verdict = {
+                "passed": True,
+                "execution_context_verdict": {"passed": True, "missing": [], "explanation": ""},
+                "reasoning_verdict": {"passed": True, "missing": [], "explanation": ""},
+            }
+            terminal_feedback_messages: list[str] = []
             learning_summary_required = (
                 plan.get("_mode") == "train"
                 and not bool(plan.get("_defer_learning_record", False))
             )
-            terminal_valid = bool(terminal_decision.get("done", False))
-            if terminal_answer is None:
-                terminal_valid = False
-            elif (
-                plan.get("_mode") != "train"
-                and not self._subagent_made_any_tool_call(execution_log)
-            ):
-                terminal_valid = False
-            elif learning_summary_required:
-                terminal_valid = (
-                    terminal_answer_type == "learning_summary"
-                    and self._subagent_made_any_tool_call(execution_log)
-                    and self._is_valid_learning_summary_answer(terminal_answer)
-                    and self._training_completion_contract_satisfied(
+            terminal_valid = False
+            for terminal_attempt in range(MAX_TERMINAL_REPAIR_ATTEMPTS):
+                terminal_decision = await self._request_terminal_path_review(
+                    expected_type=expected_final_type,
+                    task_type=plan["task_type"],
+                    task_description=plan.get("task_description", ""),
+                    execution_log=execution_log,
+                    trace_phase="act_terminal_self_correction",
+                    feedback_messages=terminal_feedback_messages,
+                    horizon=plan.get("horizon"),
+                    indicator_output_keys=plan.get("indicator_output_keys", []),
+                    recoverable_final=recoverable_answer or recoverable_final,
+                )
+                terminal_answer = terminal_decision.get("answer")
+                terminal_answer_type = terminal_decision.get("answer_type", "")
+                terminal_reasoning = terminal_decision.get(
+                    "reasoning",
+                    terminal_decision.get("thought", ""),
+                )
+                terminal_failure_reason = ""
+                terminal_valid = bool(terminal_decision.get("done", False))
+                if terminal_decision.get("_parse_failed"):
+                    terminal_valid = False
+                    terminal_failure_reason = "invalid_json_or_missing_required_fields"
+                elif not terminal_valid:
+                    terminal_failure_reason = "not_finished"
+                elif terminal_answer is None:
+                    terminal_valid = False
+                    terminal_failure_reason = "missing_answer"
+                elif terminal_answer_type != expected_final_type:
+                    terminal_valid = False
+                    terminal_failure_reason = "wrong_answer_type"
+                elif (
+                    not learning_summary_required
+                    and plan.get("_mode") != "train"
+                    and not self._subagent_made_any_tool_call(execution_log)
+                ):
+                    terminal_valid = False
+                    terminal_failure_reason = "no_tool_use"
+                elif learning_summary_required:
+                    if not self._subagent_made_any_tool_call(execution_log):
+                        terminal_valid = False
+                        terminal_failure_reason = "no_tool_use"
+                    elif not self._is_valid_learning_summary_answer(terminal_answer):
+                        terminal_valid = False
+                        terminal_failure_reason = "invalid_learning_summary"
+                    elif not self._training_completion_contract_satisfied(
                         execution_log,
                         task_type=plan["task_type"],
                         horizon=plan.get("horizon"),
                         indicator_output_keys=plan.get("indicator_output_keys", []),
+                    ):
+                        terminal_valid = False
+                        terminal_failure_reason = "training_contract_unsatisfied"
+                else:
+                    present_in_prior_assistant_history = self._is_task_answer_present_in_assistant_history(
+                        plan["task_type"],
+                        terminal_answer,
+                        conversation[:-1],
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
                     )
-                )
-            else:
-                present_in_prior_assistant_history = self._is_task_answer_present_in_assistant_history(
-                    plan["task_type"],
-                    terminal_answer,
-                    conversation[:-1],
-                    horizon=plan.get("horizon"),
-                    indicator_output_keys=plan.get("indicator_output_keys", []),
-                )
-                terminal_valid = (
-                    terminal_answer_type == plan["task_type"]
-                    and self._is_valid_final_answer(
+                    if not self._is_valid_final_answer(
                         plan["task_type"],
                         terminal_answer,
                         horizon=plan.get("horizon"),
                         indicator_output_keys=plan.get("indicator_output_keys", []),
-                    )
-                    and (
+                    ):
+                        terminal_valid = False
+                        terminal_failure_reason = "invalid_final_answer"
+                    elif not (
                         self._is_task_answer_backed_by_tool_output(
                             plan["task_type"],
                             terminal_answer,
@@ -1823,17 +2112,129 @@ class ExecutorAgent(AgentBase):
                             indicator_output_keys=plan.get("indicator_output_keys", []),
                         )
                         or present_in_prior_assistant_history
-                    )
+                    ):
+                        terminal_valid = False
+                        terminal_failure_reason = "unsupported_answer"
+                if not terminal_valid:
+                    trace.agent_step("executor", "act_terminal_self_correction_invalid", {
+                        "reason": terminal_failure_reason or "invalid_terminal_delivery",
+                        "done": bool(terminal_decision.get("done", False)),
+                        "answer_type": terminal_answer_type,
+                        "parse_failed": bool(terminal_decision.get("_parse_failed")),
+                    })
+                    if terminal_attempt + 1 >= MAX_TERMINAL_REPAIR_ATTEMPTS:
+                        break
+                    terminal_feedback_messages = [
+                        self._terminal_delivery_correction_message(
+                            expected_type=expected_final_type,
+                            failure_reason=terminal_failure_reason,
+                        )
+                    ]
+                    continue
+
+                terminal_execution_context = self._normalize_execution_context(
+                    terminal_decision.get("execution_context"),
+                    execution_log=execution_log,
                 )
-            if terminal_valid:
-                accepted_answer = terminal_answer
-                accepted_answer_type = terminal_answer_type
-                accepted_confidence = terminal_decision.get("confidence")
-                accepted_reasoning = terminal_reasoning
-                trace.agent_step("executor", "act_terminal_self_correction_accepted", {
-                    "answer_type": terminal_answer_type,
+                terminal_reasoning = self._normalize_reasoning_for_reuse(
+                    terminal_reasoning,
+                    execution_log,
+                    terminal_execution_context,
+                )
+                terminal_recoverable = self._recoverable_final_record(
+                    answer=terminal_answer,
+                    answer_type=terminal_answer_type,
+                    confidence=terminal_decision.get("confidence"),
+                    reasoning=terminal_reasoning,
+                    execution_context=terminal_execution_context,
+                    control_context=self._normalize_control_context(
+                        terminal_decision.get("control_context")
+                    ),
+                )
+                try:
+                    terminal_reuse_verdict = await self._final_payload_reusability_verdict(
+                        mode=plan.get("_mode"),
+                        reasoning=terminal_reasoning,
+                        execution_context=terminal_execution_context,
+                        execution_log=execution_log,
+                    )
+                except Exception as e:
+                    self._attach_partial_result_to_exception(
+                        e,
+                        answer=terminal_answer,
+                        answer_type=terminal_answer_type,
+                        confidence=terminal_decision.get("confidence"),
+                        reasoning=terminal_reasoning,
+                        execution_context=terminal_execution_context,
+                        control_context=self._normalize_control_context(
+                            terminal_decision.get("control_context")
+                        ),
+                        execution_log=execution_log,
+                    )
+                    raise
+                if terminal_reuse_verdict.get("passed", False):
+                    accepted_answer = terminal_answer
+                    accepted_answer_type = terminal_answer_type
+                    accepted_confidence = terminal_decision.get("confidence")
+                    accepted_reasoning = terminal_reasoning
+                    accepted_execution_context = terminal_execution_context
+                    accepted_control_context = terminal_recoverable.get("control_context")
+                    trace.agent_step("executor", "act_terminal_self_correction_accepted", {
+                        "answer_type": terminal_answer_type,
+                        "confidence": accepted_confidence,
+                        "has_answer": True,
+                    })
+                    terminal_valid = True
+                    break
+
+                terminal_valid = False
+                recoverable_final = terminal_recoverable
+                trace.agent_step("executor", "act_terminal_self_correction_rejected", {
+                    "reason": (
+                        "execution_context_not_reusable"
+                        if not terminal_reuse_verdict["execution_context_verdict"].get("passed", False)
+                        else "reasoning_too_shallow"
+                    ),
+                    "execution_context_gate_missing": list(
+                        terminal_reuse_verdict["execution_context_verdict"].get("missing", [])
+                    ),
+                    "execution_context_gate_explanation": str(
+                        terminal_reuse_verdict["execution_context_verdict"].get("explanation") or ""
+                    ),
+                    "reasoning_gate_missing": list(
+                        terminal_reuse_verdict["reasoning_verdict"].get("missing", [])
+                    ),
+                    "reasoning_gate_explanation": str(
+                        terminal_reuse_verdict["reasoning_verdict"].get("explanation") or ""
+                    ),
+                })
+                if terminal_attempt + 1 >= MAX_TERMINAL_REPAIR_ATTEMPTS:
+                    break
+                terminal_feedback_messages = self._terminal_payload_repair_messages(
+                    execution_log,
+                    terminal_reuse_verdict,
+                )
+            if not accepted_answer_type and recoverable_final is not None:
+                accepted_answer = recoverable_final.get("answer")
+                accepted_answer_type = str(recoverable_final.get("answer_type") or "")
+                accepted_confidence = recoverable_final.get("confidence")
+                accepted_reasoning = str(recoverable_final.get("reasoning") or "")
+                accepted_execution_context = self._normalize_execution_context(
+                    recoverable_final.get("execution_context"),
+                    execution_log=execution_log,
+                )
+                accepted_reasoning = self._normalize_reasoning_for_reuse(
+                    accepted_reasoning,
+                    execution_log,
+                    accepted_execution_context,
+                )
+                accepted_control_context = self._normalize_control_context(
+                    recoverable_final.get("control_context")
+                )
+                trace.agent_step("executor", "act_recoverable_final_fallback", {
+                    "answer_type": accepted_answer_type,
                     "confidence": accepted_confidence,
-                    "has_answer": True,
+                    "has_answer": accepted_answer is not None,
                 })
 
         if not accepted_answer_type:
@@ -1845,6 +2246,21 @@ class ExecutorAgent(AgentBase):
             raise MaxStepsExhaustedError(
                 agent_kind="executor",
                 max_steps=MAX_REACT_STEPS,
+                partial_result={
+                    "prediction": accepted_answer,
+                    "answer": accepted_answer,
+                    "answer_type": accepted_answer_type,
+                    "confidence": accepted_confidence,
+                    "reasoning": accepted_reasoning,
+                    "execution_context": accepted_execution_context,
+                    "control_context": accepted_control_context,
+                    "execution_log": list(execution_log),
+                    "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
+                    "failure_reason": "max_steps_exhausted_without_final_answer",
+                    "last_tool_result_preview": (
+                        str(last_tool_result)[:5000] if last_tool_result is not None else ""
+                    ),
+                },
             )
 
         final_result = accepted_answer
@@ -1858,6 +2274,8 @@ class ExecutorAgent(AgentBase):
             "answer_type": accepted_answer_type,
             "confidence": accepted_confidence,
             "reasoning": accepted_reasoning,
+            "execution_context": accepted_execution_context,
+            "control_context": accepted_control_context,
             "execution_log": execution_log,
             "method_used": f"mini-react ({len(execution_log)} steps)",
             "modality": plan["modality"],
@@ -1905,14 +2323,6 @@ class ExecutorAgent(AgentBase):
     ) -> int:
         candidate_ids: set[str] = set()
         real_candidate_signatures: set[str] = set()
-        framework_tools = {
-            "spawn_subagent",
-            "evaluate_against_gt",
-            "evaluate_batch_against_gt",
-            "batch_evaluate_against_gt",
-            "bound_check",
-            "consistency_check",
-        }
 
         def _signature(answer: Any) -> str | None:
             normalized = cls._normalize_answer_for_comparison(
@@ -1987,22 +2397,15 @@ class ExecutorAgent(AgentBase):
                         answer,
                     )
                 continue
-            if tool_name in framework_tools:
-                continue
-            answer = cls._candidate_answer_from_entry(
-                entry,
-                task_type=task_type,
-            )
-            if not cls._is_valid_final_answer(
-                task_type,
-                answer,
-                horizon=horizon,
-                indicator_output_keys=indicator_output_keys,
-            ):
-                continue
+        for record in cls._top_level_candidate_records(
+            execution_log,
+            task_type=task_type,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        ):
             _record_real_candidate(
-                f"top_level::{tool_name}",
-                answer,
+                str(record.get("name") or "").strip(),
+                record.get("prediction"),
             )
         for idx, prediction in enumerate(pending_predictions or []):
             if not cls._is_valid_final_answer(
@@ -2060,8 +2463,77 @@ class ExecutorAgent(AgentBase):
                     continue
                 candidate_ids.add(
                     ExecutorAgent._candidate_branch_id(result, fallback_idx=idx),
-                )
+                    )
         return len(candidate_ids)
+
+    @staticmethod
+    def _top_level_candidate_path_name(tool_chain: list[str]) -> str:
+        cleaned = [str(tool).strip() for tool in tool_chain if str(tool).strip()]
+        if not cleaned:
+            return "top_level"
+        return f"top_level::{ ' -> '.join(cleaned) }"
+
+    @classmethod
+    def _top_level_candidate_records(
+        cls,
+        execution_log: list[dict[str, Any]],
+        *,
+        task_type: str,
+        horizon: int | None = None,
+        indicator_output_keys: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Collect top-level task-valid candidates using their full executed path.
+
+        New definition:
+            A top-level candidate is identified by the substantive tool path
+            executed up to the task-valid answer, not by the final tool alone.
+            This keeps `value_at -> window_stats -> llm_reasoning_classification`
+            distinct from `segment -> llm_reasoning_classification`, even though
+            both end at the same classifier.
+        """
+        framework_tools = {
+            "spawn_subagent",
+            "evaluate_against_gt",
+            "evaluate_batch_against_gt",
+            "batch_evaluate_against_gt",
+            "bound_check",
+            "consistency_check",
+        }
+        records: list[dict[str, Any]] = []
+        pending_chain: list[str] = []
+
+        for entry in execution_log:
+            tool_name = str(entry.get("tool") or "").strip()
+            if not tool_name:
+                continue
+            if tool_name in framework_tools:
+                pending_chain = []
+                continue
+
+            pending_chain.append(tool_name)
+            answer = cls._candidate_answer_from_entry(entry, task_type=task_type)
+            if task_type == "indicator":
+                answer = cls._canonicalize_indicator_answer(
+                    answer,
+                    indicator_output_keys=indicator_output_keys,
+                )
+            if not cls._is_valid_final_answer(
+                task_type,
+                answer,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            ):
+                continue
+
+            records.append(
+                {
+                    "name": cls._top_level_candidate_path_name(pending_chain),
+                    "tool_chain": list(pending_chain),
+                    "prediction": answer,
+                }
+            )
+            pending_chain = []
+        return records
 
     @staticmethod
     def _candidate_answer_from_entry(
@@ -2154,6 +2626,7 @@ class ExecutorAgent(AgentBase):
         predictions: Any,
         *,
         task_type: str,
+        execution_log: list[dict[str, Any]] | None = None,
         horizon: int | None = None,
         indicator_output_keys: list[str] | None = None,
     ) -> list[dict[str, Any]]:
@@ -2195,7 +2668,91 @@ class ExecutorAgent(AgentBase):
                 "name": candidate_name,
                 "prediction": candidate_prediction,
             })
+        if execution_log:
+            normalized = cls._align_batch_eval_prediction_names(
+                normalized,
+                execution_log=execution_log,
+                task_type=task_type,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
         return normalized
+
+    @classmethod
+    def _align_batch_eval_prediction_names(
+        cls,
+        predictions: list[dict[str, Any]],
+        *,
+        execution_log: list[dict[str, Any]],
+        task_type: str,
+        horizon: int | None = None,
+        indicator_output_keys: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not predictions:
+            return predictions
+
+        stable_predictions = cls._collect_batch_eval_predictions(
+            execution_log,
+            task_type=task_type,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        )
+        if not stable_predictions:
+            return predictions
+
+        aligned: list[dict[str, Any]] = []
+        used_stable_indices: set[int] = set()
+        for idx, item in enumerate(predictions):
+            if not isinstance(item, dict):
+                continue
+            candidate_name = str(item.get("name") or "").strip()
+            candidate_prediction = item.get("prediction")
+            aligned_name = candidate_name
+
+            # New definition:
+            #   Batch GT candidate names should carry stable branch identity when
+            #   that identity can be recovered from executed paths. Generic
+            #   placeholders like `approach_i` are evaluation-local only and must
+            #   not leak into downstream winner binding if a real branch name is
+            #   available.
+            if re.fullmatch(r"approach_\d+", candidate_name):
+                matched_idx = None
+                approach_idx_match = re.fullmatch(r"approach_(\d+)", candidate_name)
+                approach_idx = (
+                    int(approach_idx_match.group(1))
+                    if approach_idx_match is not None
+                    else idx
+                )
+                if (
+                    0 <= approach_idx < len(stable_predictions)
+                    and approach_idx not in used_stable_indices
+                ):
+                    matched_idx = approach_idx
+                for stable_idx, stable_item in enumerate(stable_predictions):
+                    if matched_idx is not None:
+                        break
+                    if stable_idx in used_stable_indices:
+                        continue
+                    if cls._answers_match_semantically(
+                        task_type,
+                        candidate_prediction,
+                        stable_item.get("prediction"),
+                        horizon=horizon,
+                        indicator_output_keys=indicator_output_keys,
+                    ):
+                        matched_idx = stable_idx
+                        break
+                if matched_idx is None and idx < len(stable_predictions) and idx not in used_stable_indices:
+                    matched_idx = idx
+                if matched_idx is not None:
+                    used_stable_indices.add(matched_idx)
+                    aligned_name = str(stable_predictions[matched_idx].get("name") or candidate_name).strip()
+
+            aligned.append({
+                "name": aligned_name or candidate_name,
+                "prediction": candidate_prediction,
+            })
+        return aligned
 
     @classmethod
     def _training_completion_contract_satisfied(
@@ -2543,7 +3100,7 @@ class ExecutorAgent(AgentBase):
             )
         if not tool_call_allowed:
             lines.append(
-                "This is a finish-only turn: re-wrap the best existing task-valid tool output exactly and finish now."
+                "This is a finish-only turn: do not seek new evidence. Reuse the already-solved answer and repair only its final delivery now."
             )
         return "\n".join(lines)
 
@@ -2560,6 +3117,368 @@ class ExecutorAgent(AgentBase):
         if not parts:
             return ""
         return "\n\n".join(parts) + "\n\n"
+
+    @classmethod
+    def _build_action_state_section(
+        cls,
+        *,
+        state: str,
+        required_final_type: str,
+        execution_log: list[dict[str, Any]],
+        recoverable_final: dict[str, Any] | None = None,
+    ) -> str:
+        lines = [
+            f"- Current state: {state}",
+            f"- Required final type in this run: {required_final_type}",
+        ]
+        substantive_chain = [
+            str(entry.get("tool") or "").strip()
+            for entry in execution_log
+            if (
+                str(entry.get("tool") or "").strip()
+                and str(entry.get("tool") or "").strip() not in _ORCHESTRATION_ONLY_TOOLS
+            )
+        ]
+        if substantive_chain:
+            lines.append(f"- Executed substantive tools so far: {' -> '.join(substantive_chain)}")
+        if state == "repair_delivery":
+            lines.append(
+                "- Solving is already complete for this run. Do NOT call any tool; only repair the final JSON delivery."
+            )
+            if recoverable_final is not None:
+                answer = recoverable_final.get("answer")
+                try:
+                    answer_preview = json.dumps(
+                        cls._round_prompt_numbers(answer),
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                except TypeError:
+                    answer_preview = str(answer)
+                lines.append(f"- Reuse this exact earlier answer unchanged: {answer_preview[:240]}")
+        else:
+            lines.append(
+                "- If you do not yet have a supported final answer, continue gathering evidence with the visible tools."
+            )
+        return "\n".join(lines)
+
+    @classmethod
+    def _build_clean_repair_trace_section(
+        cls,
+        execution_log: list[dict[str, Any]],
+    ) -> str:
+        lines: list[str] = []
+
+        for entry in execution_log:
+            if not isinstance(entry, dict):
+                continue
+            tool_name = str(entry.get("tool") or "").strip()
+            if not tool_name:
+                continue
+
+            if tool_name == "spawn_subagent":
+                output = entry.get("output") or []
+                for item in output:
+                    if not isinstance(item, dict) or not item.get("success"):
+                        continue
+                    result = item.get("result") or {}
+                    if not isinstance(result, dict):
+                        continue
+                    sub_execution_log = result.get("execution_log") or []
+                    candidate_chain = cls._reasoning_substantive_tool_chain(sub_execution_log)
+                    candidate_label = (
+                        " -> ".join(candidate_chain)
+                        or str(result.get("candidate_name") or "").strip()
+                        or " -> ".join(cls._hinted_tools(result.get("tools_hint")))
+                        or str(result.get("sub_task_description") or "").strip()
+                        or "candidate"
+                    )
+                    answer_preview = cls._format_prompt_payload(
+                        result.get("answer"),
+                        limit=400,
+                    )
+                    execution_context = (
+                        result.get("execution_context")
+                        if isinstance(result.get("execution_context"), dict)
+                        else {}
+                    )
+                    public_reasoning = [
+                        str(item).strip()
+                        for item in execution_context.get("public_reasoning") or []
+                        if str(item).strip()
+                    ]
+                    evidence_summary = str(
+                        execution_context.get("evidence_summary") or ""
+                    ).strip()
+                    evidence_parts = public_reasoning[:2]
+                    if evidence_summary:
+                        evidence_parts.append(evidence_summary)
+                    evidence_text = " | ".join(evidence_parts[:2])
+                    line = f"- Candidate {candidate_label}: answer={answer_preview}"
+                    if evidence_text:
+                        line += f"; evidence={evidence_text[:500]}"
+                    lines.append(line)
+                continue
+
+            if tool_name in _ORCHESTRATION_ONLY_TOOLS or not bool(entry.get("success")):
+                continue
+            args_text = cls._format_prompt_payload(entry.get("args", {}), limit=400)
+            observation_text = cls._format_prompt_payload(
+                entry.get("observation"),
+                limit=1200,
+            )
+            lines.append(
+                f"- {tool_name}: args={args_text}; result={observation_text}"
+            )
+
+        return "\n".join(lines) if lines else "- (no reusable execution-side trace available)"
+
+    @classmethod
+    def _build_clean_repair_prompt(
+        cls,
+        *,
+        expected_type: str,
+        task_type: str,
+        task_description: str,
+        execution_log: list[dict[str, Any]],
+        recoverable_final: dict[str, Any] | None,
+        feedback_messages: list[str] | None,
+        horizon: int | None = None,
+        indicator_output_keys: list[str] | None = None,
+        sub_task_description: str = "",
+        tools_hint: Any = None,
+        terminal_json: bool = False,
+    ) -> str:
+        feedback_messages = [
+            str(message).strip()
+            for message in (feedback_messages or [])
+            if str(message).strip()
+        ]
+        substantive_tools = cls._available_substantive_tool_names(execution_log)
+        candidate_labels = cls._reasoning_candidate_labels(execution_log)
+
+        repair_lines = [
+            f"- Required final type: {expected_type}",
+            f"- Underlying task type: {task_type}",
+            "- Repair mode only: do not gather new evidence and do not introduce any new tool result.",
+            "- `execution_context` must contain execution-side evidence only.",
+            "- `control_context` may hold completion/repair notes, or be empty.",
+            "- Never copy repair instructions, validator wording, GT/evaluation notes, or control-flow language into `execution_context`.",
+        ]
+        if sub_task_description:
+            repair_lines.append(f"- Sub-task: {sub_task_description}")
+        if tools_hint:
+            hinted_tools = ", ".join(cls._hinted_tools(tools_hint)) or str(tools_hint)
+            repair_lines.append(f"- Assigned visible tool path in this branch: {hinted_tools}")
+
+        reuse_section = ""
+        if recoverable_final is not None:
+            answer = recoverable_final.get("answer")
+            try:
+                answer_preview = json.dumps(
+                    cls._round_prompt_numbers(answer),
+                    ensure_ascii=False,
+                    default=str,
+                )
+            except TypeError:
+                answer_preview = str(answer)
+            reuse_section = cls._render_prompt_section(
+                "Reuse Answer",
+                (
+                    "Reuse this exact answer payload unchanged unless it is structurally invalid "
+                    "for the required final type.\n"
+                    f"{answer_preview[:2000]}"
+                ),
+            )
+
+        names_lines: list[str] = []
+        if substantive_tools:
+            names_lines.append("- Executed substantive tools: " + ", ".join(substantive_tools))
+        if candidate_labels:
+            names_lines.append("- Candidate path labels: " + ", ".join(candidate_labels))
+        if not names_lines:
+            names_lines.append("- (no substantive tool names recorded)")
+
+        feedback_section = ""
+        if feedback_messages:
+            feedback_section = cls._render_prompt_section(
+                "Repair Feedback",
+                (
+                    "Controller-side repair constraints only. Use them to repair the delivery, "
+                    "but do not quote or paraphrase them inside `execution_context`.\n"
+                    + "\n".join(f"- {message}" for message in feedback_messages)
+                ),
+            )
+
+        output_lines = [
+            "- Keep the answer grounded only in the execution trace below.",
+            "- Rewrite `reasoning` as numbered steps that expand the same execution-side evidence.",
+        ]
+        if terminal_json:
+            output_lines.append(
+                "- Return exactly one final JSON object with `thought`, `done=true`, `answer`, "
+                f"`answer_type='{expected_type}'`, `confidence`, `reasoning`, `execution_context`, and `control_context`."
+            )
+        else:
+            output_lines.append(
+                "- Use the finish action now. Do not choose any ordinary tool call."
+            )
+        if expected_type == "learning_summary":
+            output_lines.append(
+                "- For `learning_summary`, `answer` must be a JSON object with short non-empty string fields `insight` and `recommendation`."
+            )
+
+        return cls._join_prompt_sections(
+            cls._render_prompt_section(
+                "Repair Mode",
+                "\n".join(repair_lines),
+            ),
+            cls._render_prompt_section(
+                "Task Description",
+                task_description or "",
+            ),
+            cls._render_prompt_section(
+                "Task Boundary",
+                cls._build_task_boundary_section(
+                    task_type,
+                    horizon=horizon,
+                    indicator_output_keys=indicator_output_keys,
+                ),
+            ),
+            reuse_section,
+            cls._render_prompt_section(
+                "Execution Names",
+                "\n".join(names_lines),
+            ),
+            cls._render_prompt_section(
+                "Execution Trace",
+                cls._build_clean_repair_trace_section(execution_log),
+            ),
+            feedback_section,
+            cls._render_prompt_section(
+                "Output Requirements",
+                "\n".join(output_lines),
+            ),
+        ).strip()
+
+    @classmethod
+    def _build_clean_repair_delivery_conversation(
+        cls,
+        *,
+        expected_type: str,
+        task_type: str,
+        task_description: str,
+        execution_log: list[dict[str, Any]],
+        recoverable_final: dict[str, Any] | None,
+        feedback_messages: list[str] | None,
+        horizon: int | None = None,
+        indicator_output_keys: list[str] | None = None,
+        sub_task_description: str = "",
+        tools_hint: Any = None,
+    ) -> list[dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are repairing the final JSON delivery for a TimeClaw run. "
+                    "Use only the execution-side evidence provided below. "
+                    "Do not call any new analysis tool. "
+                    "Do not copy controller-side repair wording into `execution_context`."
+                ),
+            },
+            {
+                "role": "user",
+                "content": cls._build_clean_repair_prompt(
+                    expected_type=expected_type,
+                    task_type=task_type,
+                    task_description=task_description,
+                    execution_log=execution_log,
+                    recoverable_final=recoverable_final,
+                    feedback_messages=feedback_messages,
+                    horizon=horizon,
+                    indicator_output_keys=indicator_output_keys,
+                    sub_task_description=sub_task_description,
+                    tools_hint=tools_hint,
+                    terminal_json=False,
+                ),
+            },
+        ]
+
+    @staticmethod
+    def _recoverable_final_record(
+        *,
+        answer: Any,
+        answer_type: str,
+        confidence: Any,
+        reasoning: str,
+        execution_context: dict[str, Any],
+        control_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "answer": answer,
+            "answer_type": answer_type,
+            "confidence": confidence,
+            "reasoning": reasoning,
+            "execution_context": execution_context,
+            "control_context": control_context,
+        }
+
+    @classmethod
+    def _is_task_solve_ready_finish(
+        cls,
+        *,
+        task_type: str,
+        answer: Any,
+        answer_type: str,
+        execution_log: list[dict[str, Any]],
+        horizon: int | None,
+        indicator_output_keys: list[str] | None,
+        require_tool_use: bool,
+        tools_hint: Any = None,
+    ) -> bool:
+        if answer is None or answer_type != str(task_type).strip():
+            return False
+        if require_tool_use and not cls._subagent_made_any_tool_call(execution_log):
+            return False
+        if tools_hint is not None and not cls._subagent_followed_tools_hint(execution_log, tools_hint):
+            return False
+        return (
+            cls._is_valid_final_answer(
+                task_type,
+                answer,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
+            and cls._is_task_answer_backed_by_tool_output(
+                task_type,
+                answer,
+                execution_log,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
+        )
+
+    @classmethod
+    def _is_learning_summary_solve_ready_finish(
+        cls,
+        *,
+        answer: Any,
+        answer_type: str,
+        execution_log: list[dict[str, Any]],
+        task_type: str,
+        horizon: int | None,
+        indicator_output_keys: list[str] | None,
+    ) -> bool:
+        return (
+            answer_type == "learning_summary"
+            and cls._is_valid_learning_summary_answer(answer)
+            and cls._training_completion_contract_satisfied(
+                execution_log,
+                task_type=task_type,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
+        )
 
     @staticmethod
     def _build_tool_observation_message(
@@ -2596,7 +3515,7 @@ class ExecutorAgent(AgentBase):
             message += (
                 "\n\n## Answer Status\n"
                 "- This tool result already contains a task-valid answer for the current task.\n"
-                "- On a later turn, you may finish by re-wrapping this tool-produced answer exactly.\n"
+                "- On a later turn, you may finish by returning this exact tool-produced answer unchanged.\n"
             )
         return message
 
@@ -3210,7 +4129,7 @@ class ExecutorAgent(AgentBase):
         return (
             "Finish-only turn: a real tool in this branch already produced a task-valid "
             f"{task_type} answer via `{artifact.get('tool')}`. Do not call another tool. "
-            f"Finish now by returning that exact payload unchanged: {preview_text[:800]}"
+            f"Finish now by returning that exact answer unchanged: {preview_text[:800]}"
         )
 
     @classmethod
@@ -3229,10 +4148,9 @@ class ExecutorAgent(AgentBase):
         answer = artifact.get("answer")
         tool_chain = [e.get("tool", "") for e in execution_log if e.get("tool")]
         reasoning = (
-            f"1. `{tool_name}` already produced a task-valid {task_type} answer in this branch.\n"
-            "2. Near the branch step limit, the correct action is to reuse that exact "
-            "tool-produced payload unchanged instead of calling another tool or rewriting "
-            "the values."
+            f"1. `{tool_name}` produced this branch's {task_type} answer candidate.\n"
+            "2. Near the branch step limit, this branch should stop here and keep that "
+            "tool-produced result as its final candidate instead of adding another tool call."
         )
         return {
             "answer": answer,
@@ -3540,6 +4458,8 @@ class ExecutorAgent(AgentBase):
         current_series_state: dict[str, Any],
         latest_artifact_state: dict[str, Any],
         task_answer_status: dict[str, Any] | None = None,
+        branch_task_answer_status: dict[str, Any] | None = None,
+        latest_redundancy_status: dict[str, Any] | None = None,
     ) -> str:
         payload = {
             "current_series_state": current_series_state,
@@ -3547,6 +4467,10 @@ class ExecutorAgent(AgentBase):
         }
         if isinstance(task_answer_status, dict) and task_answer_status:
             payload["task_answer_status"] = task_answer_status
+        if isinstance(branch_task_answer_status, dict) and branch_task_answer_status:
+            payload["branch_task_answer_status"] = branch_task_answer_status
+        if isinstance(latest_redundancy_status, dict) and latest_redundancy_status:
+            payload["latest_redundancy_status"] = latest_redundancy_status
         return (
             "## Current Working State\n"
             + json.dumps(
@@ -3771,7 +4695,16 @@ class ExecutorAgent(AgentBase):
             profiling_section=plan.get("profiling_section", ""),
             execution_context_section=self._render_prompt_section(
                 "Execution Context",
+                "",
+            ),
+            control_context_section=self._render_prompt_section(
+                "Control Context",
                 self._join_prompt_sections(
+                    self._build_action_state_section(
+                        state="need_evidence",
+                        required_final_type=plan["task_type"],
+                        execution_log=[],
+                    ),
                     f"Branch Goal:\n{task_description}\n" if str(task_description).strip() else "",
                     self._build_subagent_tools_hint_section(
                         tools_hint,
@@ -3813,22 +4746,18 @@ class ExecutorAgent(AgentBase):
         current_series_state = self._initial_series_state(current_data)
         final_result: dict[str, Any] = {}
         execution_log: list[dict[str, Any]] = []
-        latest_task_answer_fallback: dict[str, Any] | None = None
+        recoverable_answer: dict[str, Any] | None = None
+        recoverable_final: dict[str, Any] | None = None
+        repair_delivery_mode = False
+        repair_delivery_feedback_messages: list[str] = []
 
         for step in range(1, MAX_SUB_REACT_STEPS + 1):
-            latest_task_answer = self._latest_task_valid_tool_answer(
-                task_type=plan["task_type"],
-                execution_log=execution_log,
-                horizon=plan.get("horizon"),
-                indicator_output_keys=plan.get("indicator_output_keys", []),
+            turn_candidates = self._runtime_compatible_candidates(
+                candidates,
+                current_data=current_data,
+                current_series_state=current_series_state,
             )
-            if (
-                latest_task_answer is not None
-                and self._subagent_made_any_tool_call(execution_log)
-                and self._subagent_followed_tools_hint(execution_log, tools_hint)
-            ):
-                latest_task_answer_fallback = latest_task_answer
-            tool_call_allowed = bool(step < MAX_SUB_REACT_STEPS)
+            tool_call_allowed = bool(step < MAX_SUB_REACT_STEPS) and not repair_delivery_mode
             if step > 1 and not skip_generic_turn_prompt_once:
                 follow_up = executor_prompt.REACT_NEXT_TURN.format(
                     step=step,
@@ -3848,13 +4777,39 @@ class ExecutorAgent(AgentBase):
                 if budget_msg:
                     conversation.append({"role": "user", "content": budget_msg})
             skip_generic_turn_prompt_once = False
+            conversation.append({
+                "role": "user",
+                "content": self._render_prompt_section(
+                    "Decision State",
+                    self._build_action_state_section(
+                        state="repair_delivery" if repair_delivery_mode else "need_evidence",
+                        required_final_type=plan["task_type"],
+                        execution_log=execution_log,
+                        recoverable_final=recoverable_answer or recoverable_final,
+                    ),
+                ).strip(),
+            })
 
+            decision_conversation = conversation
+            if repair_delivery_mode:
+                decision_conversation = self._build_clean_repair_delivery_conversation(
+                    expected_type=plan["task_type"],
+                    task_type=plan["task_type"],
+                    task_description=task_description,
+                    execution_log=execution_log,
+                    recoverable_final=recoverable_answer or recoverable_final,
+                    feedback_messages=repair_delivery_feedback_messages,
+                    horizon=plan.get("horizon"),
+                    indicator_output_keys=plan.get("indicator_output_keys", []),
+                    sub_task_description=task_description,
+                    tools_hint=tools_hint,
+                )
             response, decision = await self._request_structured_decision(
-                conversation,
+                decision_conversation,
                 allow_tool_call=tool_call_allowed,
                 allow_finish=True,
                 ordinary_tool_names=[
-                    name for name in candidates
+                    name for name in turn_candidates
                     if name not in {
                         "spawn_subagent",
                         "evaluate_against_gt",
@@ -3876,9 +4831,12 @@ class ExecutorAgent(AgentBase):
             })
 
             if parse_failed and step < MAX_SUB_REACT_STEPS:
+                invalid_json_msg = self._invalid_json_self_correction_message(thought)
+                if repair_delivery_mode:
+                    repair_delivery_feedback_messages = [invalid_json_msg]
                 conversation.append({
                     "role": "user",
-                    "content": self._invalid_json_self_correction_message(thought),
+                    "content": invalid_json_msg,
                 })
                 skip_generic_turn_prompt_once = True
                 continue
@@ -3889,12 +4847,15 @@ class ExecutorAgent(AgentBase):
             })
 
             if not self._has_structured_thought(thought) and step < MAX_SUB_REACT_STEPS:
+                structured_thought_msg = (
+                    "Your `thought` must explicitly include `Reason:` and "
+                    "`Action:`. Please continue with that structure."
+                )
+                if repair_delivery_mode:
+                    repair_delivery_feedback_messages = [structured_thought_msg]
                 conversation.append({
                     "role": "user",
-                    "content": (
-                        "Your `thought` must explicitly include `Reason:` and "
-                        "`Action:`. Please continue with that structure."
-                    ),
+                    "content": structured_thought_msg,
                 })
                 skip_generic_turn_prompt_once = True
                 continue
@@ -3904,6 +4865,13 @@ class ExecutorAgent(AgentBase):
                 answer_type = decision.get("answer_type", "")
                 requested_type = plan["task_type"]
                 if answer is None and step < MAX_SUB_REACT_STEPS:
+                    missing_answer_msg = (
+                        "Self-correction: you set `done=true` but did not provide "
+                        "a final `answer`. Continue until you can return a valid "
+                        "task-typed answer payload."
+                    )
+                    if repair_delivery_mode:
+                        repair_delivery_feedback_messages = [missing_answer_msg]
                     trace.agent_step("executor", "subagent_self_correction", {
                         "sub_agent_idx": idx,
                         "step": step,
@@ -3912,11 +4880,7 @@ class ExecutorAgent(AgentBase):
                     })
                     conversation.append({
                         "role": "user",
-                        "content": (
-                            "Self-correction: you set `done=true` but did not provide "
-                            "a final `answer`. Continue until you can return a valid "
-                            "task-typed answer payload."
-                        ),
+                        "content": missing_answer_msg,
                     })
                     continue
                 if (
@@ -4014,35 +4978,133 @@ class ExecutorAgent(AgentBase):
                             "role": "user",
                             "content": (
                                 "Self-correction: you may not invent a new task answer in the final step. "
-                                "Finish only by selecting or re-wrapping a task-valid answer that was "
-                                "already produced by a real tool in this branch. If no tool has produced "
-                                "one yet, call another tool."
+                                "Finish only by returning the exact task answer that was already "
+                                "produced by a real tool in this branch. Do not describe packaging, "
+                                "JSON repair, or payload wrapping. If no tool has produced one yet, "
+                                "call another tool."
                             ),
                         })
                     continue
                 reasoning = decision.get("reasoning", decision.get("thought", ""))
+                execution_context = self._normalize_execution_context(
+                    decision.get("execution_context"),
+                    execution_log=execution_log,
+                )
+                reasoning = self._normalize_reasoning_for_reuse(
+                    reasoning,
+                    execution_log,
+                    execution_context,
+                )
+                control_context = self._normalize_control_context(
+                    decision.get("control_context")
+                )
+                solve_ready_current = self._is_task_solve_ready_finish(
+                    task_type=requested_type,
+                    answer=answer,
+                    answer_type=answer_type,
+                    execution_log=execution_log,
+                    horizon=plan.get("horizon"),
+                    indicator_output_keys=plan.get("indicator_output_keys", []),
+                    require_tool_use=True,
+                    tools_hint=tools_hint,
+                )
+                if solve_ready_current:
+                    recoverable_answer = self._recoverable_final_record(
+                        answer=answer,
+                        answer_type=answer_type,
+                        confidence=decision.get("confidence"),
+                        reasoning=reasoning,
+                        execution_context=execution_context,
+                        control_context=control_context,
+                    )
+                execution_context_verdict = {"passed": True, "missing": [], "explanation": ""}
                 if (
-                    step < MAX_SUB_REACT_STEPS
-                    and self._should_enforce_stepwise_reasoning(plan.get("_mode"))
-                    and not self._has_stepwise_reasoning(reasoning, execution_log)
+                    self._should_enforce_stepwise_reasoning(plan.get("_mode"))
                 ):
+                    execution_context_verdict = await self._execution_context_verdict(
+                        execution_context,
+                        execution_log,
+                    )
+                if (
+                    self._should_enforce_stepwise_reasoning(plan.get("_mode"))
+                    and not execution_context_verdict.get("passed", False)
+                ):
+                    repair_delivery_feedback_messages = [
+                        self._execution_context_correction_message(
+                            execution_log,
+                            verdict=execution_context_verdict,
+                        )
+                    ]
+                    trace.agent_step("executor", "subagent_self_correction", {
+                        "sub_agent_idx": idx,
+                        "step": step,
+                        "reason": "execution_context_not_reusable",
+                        "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
+                        "execution_context_preview": json.dumps(
+                            execution_context,
+                            ensure_ascii=False,
+                        )[:1200],
+                        "execution_context_gate_missing": list(
+                            execution_context_verdict.get("missing", [])
+                        ),
+                        "execution_context_gate_explanation": str(
+                            execution_context_verdict.get("explanation") or ""
+                        ),
+                    })
+                    if step < MAX_SUB_REACT_STEPS:
+                        conversation.append({
+                            "role": "user",
+                            "content": repair_delivery_feedback_messages[0],
+                        })
+                    if recoverable_answer is not None:
+                        repair_delivery_mode = True
+                    continue
+
+                if solve_ready_current:
+                    recoverable_final = recoverable_answer
+
+                reasoning_verdict = {"passed": True, "missing": [], "explanation": ""}
+                if (
+                    self._should_enforce_stepwise_reasoning(plan.get("_mode"))
+                ):
+                    reasoning_verdict = await self._stepwise_reasoning_verdict(
+                        reasoning,
+                        execution_log,
+                    )
+                if (
+                    self._should_enforce_stepwise_reasoning(plan.get("_mode"))
+                    and not reasoning_verdict.get("passed", False)
+                ):
+                    repair_delivery_feedback_messages = [
+                        self._stepwise_reasoning_correction_message(
+                            execution_log,
+                            verdict=reasoning_verdict,
+                        )
+                    ]
                     trace.agent_step("executor", "subagent_self_correction", {
                         "sub_agent_idx": idx,
                         "step": step,
                         "reason": "reasoning_too_shallow",
                         "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
                         "reasoning_preview": str(reasoning)[:1200],
+                        "reasoning_gate_missing": list(reasoning_verdict.get("missing", [])),
+                        "reasoning_gate_explanation": str(reasoning_verdict.get("explanation") or ""),
                     })
-                    conversation.append({
-                        "role": "user",
-                        "content": self._stepwise_reasoning_correction_message(execution_log),
-                    })
+                    if step < MAX_SUB_REACT_STEPS:
+                        conversation.append({
+                            "role": "user",
+                            "content": repair_delivery_feedback_messages[0],
+                        })
+                    if recoverable_answer is not None:
+                        repair_delivery_mode = True
                     continue
                 final_result = {
                     "answer": answer,
                     "answer_type": answer_type,
                     "confidence": decision.get("confidence"),
                     "reasoning": reasoning,
+                    "execution_context": execution_context,
+                    "control_context": control_context,
                     "execution_log": execution_log,
                     "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
                     "slot_id": slot_id,
@@ -4059,10 +5121,27 @@ class ExecutorAgent(AgentBase):
                 conversation.append({"role": "user", "content": "Sub-agents cannot spawn further sub-agents."})
                 continue
 
-            if tool_name not in candidates:
+            if tool_name not in turn_candidates:
                 conversation.append({
                     "role": "user",
                     "content": f"Tool '{tool_name}' not available.",
+                })
+                continue
+            runtime_incompatibility_msg = self._tool_runtime_incompatibility_message(
+                tool_name,
+                current_data=current_data,
+                current_series_state=current_series_state,
+            )
+            if runtime_incompatibility_msg and step < MAX_SUB_REACT_STEPS:
+                trace.agent_step("executor", "subagent_self_correction", {
+                    "sub_agent_idx": idx,
+                    "step": step,
+                    "reason": "runtime_incompatible_tool",
+                    "tool": tool_name,
+                })
+                conversation.append({
+                    "role": "user",
+                    "content": runtime_incompatibility_msg,
                 })
                 continue
             mismatch_msg = self._task_mismatched_reasoning_tool_message(
@@ -4129,14 +5208,23 @@ class ExecutorAgent(AgentBase):
             observation_payload = (
                 result.data if success else {"error": result.error if result else "not found"}
             )
-            execution_log.append({
+            log_entry = {
                 "tool": tool_name,
                 "args": tool_args,
                 "success": success,
                 "output": result.data if success else None,
                 "observation": observation_payload,
                 "thought": thought,
-            })
+            }
+            redundancy_status = self._latest_redundancy_status(
+                task_type=plan["task_type"],
+                execution_log=execution_log + [log_entry],
+                latest_tool_name=tool_name,
+                previous_series_state=pre_tool_series_state,
+                current_series_state=current_series_state,
+                horizon=plan.get("horizon"),
+                indicator_output_keys=plan.get("indicator_output_keys", []),
+            )
             trace.agent_step("executor", "subagent_tool_result", {
                 "sub_agent_idx": idx,
                 "step": step,
@@ -4189,48 +5277,226 @@ class ExecutorAgent(AgentBase):
                         horizon=plan.get("horizon"),
                         indicator_output_keys=plan.get("indicator_output_keys", []),
                     ),
+                    branch_task_answer_status=self._latest_branch_task_answer_status(
+                        task_type=plan["task_type"],
+                        execution_log=execution_log + [log_entry],
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                    ),
+                    latest_redundancy_status=redundancy_status,
                 ),
             })
 
+            if redundancy_status.get("redundant") and step < MAX_SUB_REACT_STEPS:
+                trace.agent_step("executor", "subagent_self_correction", {
+                    "sub_agent_idx": idx,
+                    "step": step,
+                    "reason": "repeated_task_valid_answer_without_new_evidence",
+                    "tool": tool_name,
+                    "repeat_count": redundancy_status.get("repeat_count"),
+                })
+                conversation.append({
+                    "role": "user",
+                    "content": (
+                        "Self-correction: the latest tool call repeated the same task-valid answer "
+                        "from the same tool without changing the working artifact. This did not "
+                        "add a new candidate for this branch. If you already have the needed "
+                        "answer, finish with that exact earlier answer. Otherwise, use a different tool that "
+                        "changes the evidence basis before calling the same reasoning tool again."
+                    ),
+                })
+                continue
+
+            execution_log.append(log_entry)
+
         if not final_result:
-            terminal_decision = await self._request_terminal_path_review(
-                conversation=conversation,
-                expected_type=plan["task_type"],
-                trace_phase="subagent_terminal_self_correction",
-                sub_agent_idx=idx,
-            )
-            terminal_answer = terminal_decision.get("answer")
-            terminal_answer_type = terminal_decision.get("answer_type", "")
-            terminal_reasoning = terminal_decision.get(
-                "reasoning",
-                terminal_decision.get("thought", ""),
-            )
-            terminal_valid = (
-                bool(terminal_decision.get("done", False))
-                and terminal_answer is not None
-                and terminal_answer_type == plan["task_type"]
-                and self._is_valid_final_answer(
+            terminal_reuse_verdict = {
+                "passed": True,
+                "execution_context_verdict": {"passed": True, "missing": [], "explanation": ""},
+                "reasoning_verdict": {"passed": True, "missing": [], "explanation": ""},
+            }
+            terminal_feedback_messages: list[str] = []
+            for terminal_attempt in range(MAX_TERMINAL_REPAIR_ATTEMPTS):
+                terminal_decision = await self._request_terminal_path_review(
+                    expected_type=plan["task_type"],
+                    task_type=plan["task_type"],
+                    task_description=task_description,
+                    execution_log=execution_log,
+                    trace_phase="subagent_terminal_self_correction",
+                    feedback_messages=terminal_feedback_messages,
+                    horizon=plan.get("horizon"),
+                    indicator_output_keys=plan.get("indicator_output_keys", []),
+                    sub_agent_idx=idx,
+                    recoverable_final=recoverable_answer or recoverable_final,
+                    sub_task_description=task_description,
+                    tools_hint=tools_hint,
+                )
+                terminal_answer = terminal_decision.get("answer")
+                terminal_answer_type = terminal_decision.get("answer_type", "")
+                terminal_reasoning = terminal_decision.get(
+                    "reasoning",
+                    terminal_decision.get("thought", ""),
+                )
+                terminal_failure_reason = ""
+                terminal_valid = bool(terminal_decision.get("done", False))
+                if terminal_decision.get("_parse_failed"):
+                    terminal_valid = False
+                    terminal_failure_reason = "invalid_json_or_missing_required_fields"
+                elif not terminal_valid:
+                    terminal_failure_reason = "not_finished"
+                elif terminal_answer is None:
+                    terminal_valid = False
+                    terminal_failure_reason = "missing_answer"
+                elif terminal_answer_type != plan["task_type"]:
+                    terminal_valid = False
+                    terminal_failure_reason = "wrong_answer_type"
+                elif not self._is_valid_final_answer(
                     plan["task_type"],
                     terminal_answer,
                     horizon=plan.get("horizon"),
                     indicator_output_keys=plan.get("indicator_output_keys", []),
-                )
-                and self._is_task_answer_backed_by_tool_output(
+                ):
+                    terminal_valid = False
+                    terminal_failure_reason = "invalid_final_answer"
+                elif not self._is_task_answer_backed_by_tool_output(
                     plan["task_type"],
                     terminal_answer,
                     execution_log,
                     horizon=plan.get("horizon"),
                     indicator_output_keys=plan.get("indicator_output_keys", []),
+                ):
+                    terminal_valid = False
+                    terminal_failure_reason = "unsupported_answer"
+                elif not self._subagent_made_any_tool_call(execution_log):
+                    terminal_valid = False
+                    terminal_failure_reason = "no_tool_use"
+                elif not self._subagent_followed_tools_hint(execution_log, tools_hint):
+                    terminal_valid = False
+                    terminal_failure_reason = "tools_hint_not_followed"
+                if not terminal_valid:
+                    trace.agent_step("executor", "subagent_terminal_self_correction_invalid", {
+                        "sub_agent_idx": idx,
+                        "slot_id": slot_id,
+                        "reason": terminal_failure_reason or "invalid_terminal_delivery",
+                        "done": bool(terminal_decision.get("done", False)),
+                        "answer_type": terminal_answer_type,
+                        "parse_failed": bool(terminal_decision.get("_parse_failed")),
+                    })
+                    if terminal_attempt + 1 >= MAX_TERMINAL_REPAIR_ATTEMPTS:
+                        break
+                    terminal_feedback_messages = [
+                        self._terminal_delivery_correction_message(
+                            expected_type=plan["task_type"],
+                            failure_reason=terminal_failure_reason,
+                        )
+                    ]
+                    continue
+
+                terminal_execution_context = self._normalize_execution_context(
+                    terminal_decision.get("execution_context"),
+                    execution_log=execution_log,
                 )
-                and self._subagent_made_any_tool_call(execution_log)
-                and self._subagent_followed_tools_hint(execution_log, tools_hint)
-            )
-            if terminal_valid:
+                terminal_reasoning = self._normalize_reasoning_for_reuse(
+                    terminal_reasoning,
+                    execution_log,
+                    terminal_execution_context,
+                )
+                terminal_recoverable = self._recoverable_final_record(
+                    answer=terminal_answer,
+                    answer_type=terminal_answer_type,
+                    confidence=terminal_decision.get("confidence"),
+                    reasoning=terminal_reasoning,
+                    execution_context=terminal_execution_context,
+                    control_context=self._normalize_control_context(
+                        terminal_decision.get("control_context")
+                    ),
+                )
+                try:
+                    terminal_reuse_verdict = await self._final_payload_reusability_verdict(
+                        mode=plan.get("_mode"),
+                        reasoning=terminal_reasoning,
+                        execution_context=terminal_execution_context,
+                        execution_log=execution_log,
+                    )
+                except Exception as e:
+                    self._attach_partial_result_to_exception(
+                        e,
+                        answer=terminal_answer,
+                        answer_type=terminal_answer_type,
+                        confidence=terminal_decision.get("confidence"),
+                        reasoning=terminal_reasoning,
+                        execution_context=terminal_execution_context,
+                        control_context=self._normalize_control_context(
+                            terminal_decision.get("control_context")
+                        ),
+                        execution_log=execution_log,
+                    )
+                    raise
+                if terminal_reuse_verdict.get("passed", False):
+                    final_result = {
+                        "answer": terminal_answer,
+                        "answer_type": terminal_answer_type,
+                        "confidence": terminal_decision.get("confidence"),
+                        "reasoning": terminal_reasoning,
+                        "execution_context": terminal_execution_context,
+                        "control_context": terminal_recoverable.get("control_context"),
+                        "execution_log": execution_log,
+                        "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
+                        "slot_id": slot_id,
+                        "sub_task_description": task_description,
+                        "tools_hint": tools_hint,
+                        "branch_metadata": branch_metadata,
+                    }
+                    trace.agent_step("executor", "subagent_terminal_self_correction_accepted", {
+                        "sub_agent_idx": idx,
+                        "slot_id": slot_id,
+                        "answer_type": terminal_answer_type,
+                        "tool_chain": final_result.get("tool_chain", []),
+                    })
+                    break
+
+                recoverable_final = terminal_recoverable
+                trace.agent_step("executor", "subagent_terminal_self_correction_rejected", {
+                    "sub_agent_idx": idx,
+                    "slot_id": slot_id,
+                    "reason": (
+                        "execution_context_not_reusable"
+                        if not terminal_reuse_verdict["execution_context_verdict"].get("passed", False)
+                        else "reasoning_too_shallow"
+                    ),
+                    "execution_context_gate_missing": list(
+                        terminal_reuse_verdict["execution_context_verdict"].get("missing", [])
+                    ),
+                    "execution_context_gate_explanation": str(
+                        terminal_reuse_verdict["execution_context_verdict"].get("explanation") or ""
+                    ),
+                    "reasoning_gate_missing": list(
+                        terminal_reuse_verdict["reasoning_verdict"].get("missing", [])
+                    ),
+                    "reasoning_gate_explanation": str(
+                        terminal_reuse_verdict["reasoning_verdict"].get("explanation") or ""
+                    ),
+                })
+                if terminal_attempt + 1 >= MAX_TERMINAL_REPAIR_ATTEMPTS:
+                    break
+                terminal_feedback_messages = self._terminal_payload_repair_messages(
+                    execution_log,
+                    terminal_reuse_verdict,
+                )
+
+            if not final_result and recoverable_final is not None:
                 final_result = {
-                    "answer": terminal_answer,
-                    "answer_type": terminal_answer_type,
-                    "confidence": terminal_decision.get("confidence"),
-                    "reasoning": terminal_reasoning,
+                    "answer": recoverable_final.get("answer"),
+                    "answer_type": str(recoverable_final.get("answer_type") or ""),
+                    "confidence": recoverable_final.get("confidence"),
+                    "reasoning": str(recoverable_final.get("reasoning") or ""),
+                    "execution_context": self._normalize_execution_context(
+                        recoverable_final.get("execution_context"),
+                        execution_log=execution_log,
+                    ),
+                    "control_context": self._normalize_control_context(
+                        recoverable_final.get("control_context")
+                    ),
                     "execution_log": execution_log,
                     "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
                     "slot_id": slot_id,
@@ -4238,30 +5504,12 @@ class ExecutorAgent(AgentBase):
                     "tools_hint": tools_hint,
                     "branch_metadata": branch_metadata,
                 }
-                trace.agent_step("executor", "subagent_terminal_self_correction_accepted", {
+                trace.agent_step("executor", "subagent_recoverable_final_fallback", {
                     "sub_agent_idx": idx,
                     "slot_id": slot_id,
-                    "answer_type": terminal_answer_type,
-                    "tool_chain": final_result.get("tool_chain", []),
+                    "answer_type": final_result.get("answer_type"),
+                    "steps": len(execution_log),
                 })
-
-        if not final_result and latest_task_answer_fallback is not None:
-            final_result = self._build_subagent_tool_backed_result(
-                artifact=latest_task_answer_fallback,
-                task_type=plan["task_type"],
-                execution_log=execution_log,
-                slot_id=slot_id,
-                task_description=task_description,
-                tools_hint=tools_hint,
-                branch_metadata=branch_metadata,
-            )
-            trace.agent_step("executor", "subagent_terminal_fallback", {
-                "sub_agent_idx": idx,
-                "slot_id": slot_id,
-                "answer_type": plan["task_type"],
-                "tool": latest_task_answer_fallback.get("tool"),
-                "steps": len(execution_log),
-            })
 
         if not final_result:
             trace.agent_step("executor", "subagent_incomplete", {
@@ -4277,6 +5525,15 @@ class ExecutorAgent(AgentBase):
                 agent_kind="subagent",
                 max_steps=MAX_SUB_REACT_STEPS,
                 sub_agent_idx=idx,
+                partial_result={
+                    "execution_log": list(execution_log),
+                    "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
+                    "slot_id": slot_id,
+                    "sub_task_description": task_description,
+                    "tools_hint": tools_hint,
+                    "branch_metadata": branch_metadata,
+                    "failure_reason": "max_steps_exhausted_without_final_answer",
+                },
             )
 
         logger.info(f"[Executor] Sub-agent {idx} done: {final_result.get('answer_type', '?')}")
@@ -4382,13 +5639,20 @@ class ExecutorAgent(AgentBase):
             "- `insight` must be a short non-empty string that names the winning candidate path/tool chain and the decisive evidence that made it stronger than the compared candidates.\n"
             "- `recommendation` must be a short non-empty string stating one reusable next-time lesson tied to the same kind of evidence pattern; if the selected winner is incorrect overall, state a cautionary failure pattern instead.\n"
             "- `recommendation` is not the task prediction, not a forecast array, and not an indicator JSON object.\n"
+            "- `reasoning` must be the numbered long-form version of the same execution-side evidence recorded in `execution_context.public_reasoning`; reuse the same literal tool/path names instead of introducing looser aliases.\n"
+            "- Final-answer fields must also include `execution_context` and `control_context`.\n"
+            "- `execution_context` must contain only execution-side evidence: the substantive `tool_chain`, reusable `public_reasoning`, and a concise `evidence_summary`.\n"
+            "- `control_context` is the only place for completion/comparison mechanics; use an empty string if there is nothing extra to record.\n"
             "- Do not write about framework/orchestration mechanics such as `spawn_subagent`, `evaluate_*`, `execution context`, `assigned path`, `before finishing`, or ground truth revelation.\n"
+            "- Do not justify the summary with control-flow phrases such as `task-valid`, `must call a tool`, `latest instruction requires`, `branch comparison`, `learning mode`, or `spawning independent branches`.\n"
+            "- Do not write about answer packaging mechanics such as re-wrapping, payload preservation, JSON repair, or returning an unchanged saved answer.\n"
             "- Even if your top-level work was mostly orchestration, summarize the real candidate approaches, their concrete tool chains, the decisive evidence, and why the winner was selected.\n"
             "- The framework will derive winner fields from the actual candidate traces, but you should still summarize which candidate won and why.\n"
             '- Exact legacy JSON finish shape if you are not using a tool call: '
             '`{"thought":"Reason: ... Action: finish with learning summary.","done":true,'
             '"answer":{"insight":"...","recommendation":"..."},"answer_type":"learning_summary",'
-            '"confidence":0.90,"reasoning":"1. ..."}`\n'
+            '"confidence":0.90,"reasoning":"1. ...","execution_context":{"tool_chain":["..."],"public_reasoning":["..."],"evidence_summary":"..."},'
+            '"control_context":{"completion_notes":""}}`\n'
         )
 
     @staticmethod
@@ -4405,7 +5669,7 @@ class ExecutorAgent(AgentBase):
     def _build_tool_backed_answer_contract_section() -> str:
         return (
             "- Do not invent new task content in the final step.\n"
-            "- The final task answer must be selected from, or be a lossless re-wrapping of, a task-valid output already produced by a real tool in this branch.\n"
+            "- The final task answer must exactly match a task-valid output already produced by a real tool in this branch.\n"
             "- If no tool has produced a task-valid answer yet, call another tool instead of finishing.\n"
         )
 
@@ -4506,7 +5770,7 @@ class ExecutorAgent(AgentBase):
             return (
                 "Self-correction: a training `learning_summary` answer must be a JSON object "
                 "with string fields `insight` and `recommendation`. Use this exact shape: "
-                '`{"answer":{"insight":"...","recommendation":"..."},"answer_type":"learning_summary","reasoning":"1. ..."}'
+                '`{"answer":{"insight":"...","recommendation":"..."},"answer_type":"learning_summary","reasoning":"1. ...","execution_context":{"tool_chain":["..."],"public_reasoning":["..."],"evidence_summary":"..."},"control_context":{"completion_notes":""}}`'
             )
 
         insight = answer.get("insight")
@@ -4524,7 +5788,7 @@ class ExecutorAgent(AgentBase):
         return (
             "Self-correction: a training `learning_summary` answer must be a JSON object with "
             + "; ".join(issues)
-            + '. Use this exact shape: `{"answer":{"insight":"...","recommendation":"..."},"answer_type":"learning_summary","reasoning":"1. ..."}`. '
+            + '. Use this exact shape: `{"answer":{"insight":"...","recommendation":"..."},"answer_type":"learning_summary","reasoning":"1. ...","execution_context":{"tool_chain":["..."],"public_reasoning":["..."],"evidence_summary":"..."},"control_context":{"completion_notes":""}}`. '
             + "Keep it concise, base it on the actually explored candidate paths, name the winning path/tool chain and decisive evidence, and do not mention framework wording such as spawn_subagent, evaluate_*, execution context, assigned path, before finishing, or ground truth."
         )
 
@@ -4556,7 +5820,7 @@ class ExecutorAgent(AgentBase):
                 + " Do not append a second JSON object in the same reply. "
                 + "Choose exactly one action type this turn. Do not mix tool-call fields "
                 + "(`tool`, `args`) with final-answer fields (`answer`, `answer_type`, "
-                + "`confidence`, `reasoning`) in the same reply."
+                + "`confidence`, `reasoning`, `execution_context`, `control_context`) in the same reply."
             )
         if lowered == "json_followed_by_pseudo_tool_transcript":
             return (
@@ -5058,7 +6322,14 @@ class ExecutorAgent(AgentBase):
         if left_norm is None or right_norm is None:
             return False
         if task_type == "forecast":
-            return bool(np.allclose(left_norm, right_norm, atol=5e-3, rtol=1e-5))
+            try:
+                left_arr = np.asarray(left_norm, dtype=float).ravel()
+                right_arr = np.asarray(right_norm, dtype=float).ravel()
+            except (ValueError, TypeError):
+                return False
+            if left_arr.shape != right_arr.shape:
+                return False
+            return bool(np.allclose(left_arr, right_arr, atol=5e-3, rtol=1e-5))
         if task_type == "indicator":
             if set(left_norm.keys()) != set(right_norm.keys()):
                 return False
@@ -5070,6 +6341,8 @@ class ExecutorAgent(AgentBase):
                         left_arr = np.asarray(left_value, dtype=float).ravel()
                         right_arr = np.asarray(right_value, dtype=float).ravel()
                     except (ValueError, TypeError):
+                        return False
+                    if left_arr.shape != right_arr.shape:
                         return False
                     if not np.allclose(left_arr, right_arr, atol=5e-3, rtol=1e-5):
                         return False
@@ -5159,10 +6432,132 @@ class ExecutorAgent(AgentBase):
             "available": True,
             "task_type": task_type_text,
             "source_tool": str(source_tool or "").strip(),
-            "note": "A task-valid answer is already available from a real tool result. You may finish by re-wrapping it exactly.",
+            "note": "A task-valid answer is already available from a real tool result. You may finish by returning that exact answer unchanged.",
             "answer_preview": preview_text[:240],
         }
         return status
+
+    @classmethod
+    def _latest_branch_task_answer_status(
+        cls,
+        *,
+        task_type: str | None,
+        execution_log: list[dict[str, Any]],
+        horizon: int | None = None,
+        indicator_output_keys: list[str] | None = None,
+    ) -> dict[str, Any]:
+        task_type_text = str(task_type or "").strip()
+        if not task_type_text:
+            return {"available": False}
+
+        for entry in reversed(execution_log):
+            if not isinstance(entry, dict) or not entry.get("success"):
+                continue
+            status = cls._task_answer_status(
+                task_type=task_type_text,
+                candidate=entry.get("output"),
+                source_tool=entry.get("tool"),
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
+            if status.get("available"):
+                branch_status = dict(status)
+                branch_status["availability_scope"] = "branch"
+                branch_status["note"] = (
+                    "A task-valid answer remains available from an earlier real tool result in "
+                    "this branch. You may finish by returning that exact answer unchanged."
+                )
+                return branch_status
+        return {"available": False}
+
+    @staticmethod
+    def _state_signature(state: dict[str, Any] | None) -> str:
+        if not isinstance(state, dict):
+            return ""
+        try:
+            return json.dumps(
+                ExecutorAgent._round_prompt_numbers(state),
+                ensure_ascii=False,
+                default=str,
+                sort_keys=True,
+            )
+        except TypeError:
+            return str(state)
+
+    @classmethod
+    def _latest_redundancy_status(
+        cls,
+        *,
+        task_type: str | None,
+        execution_log: list[dict[str, Any]],
+        latest_tool_name: str | None,
+        previous_series_state: dict[str, Any] | None,
+        current_series_state: dict[str, Any] | None,
+        horizon: int | None = None,
+        indicator_output_keys: list[str] | None = None,
+    ) -> dict[str, Any]:
+        task_type_text = str(task_type or "").strip()
+        latest_tool = str(latest_tool_name or "").strip()
+        if not task_type_text or not latest_tool or len(execution_log) < 2:
+            return {"redundant": False}
+        if cls._state_signature(previous_series_state) != cls._state_signature(current_series_state):
+            return {"redundant": False}
+
+        latest_entry = execution_log[-1]
+        if not isinstance(latest_entry, dict) or not latest_entry.get("success"):
+            return {"redundant": False}
+        if str(latest_entry.get("tool") or "").strip() != latest_tool:
+            return {"redundant": False}
+
+        latest_answer = latest_entry.get("output")
+        latest_status = cls._task_answer_status(
+            task_type=task_type_text,
+            candidate=latest_answer,
+            source_tool=latest_tool,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        )
+        if not latest_status.get("available"):
+            return {"redundant": False}
+
+        repeat_count = 1
+        for earlier in reversed(execution_log[:-1]):
+            if not isinstance(earlier, dict) or not earlier.get("success"):
+                continue
+            if str(earlier.get("tool") or "").strip() != latest_tool:
+                continue
+            earlier_status = cls._task_answer_status(
+                task_type=task_type_text,
+                candidate=earlier.get("output"),
+                source_tool=latest_tool,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
+            if not earlier_status.get("available"):
+                continue
+            if not cls._answers_match_semantically(
+                task_type_text,
+                latest_answer,
+                earlier.get("output"),
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            ):
+                continue
+            repeat_count += 1
+
+        if repeat_count <= 1:
+            return {"redundant": False}
+
+        redundancy = dict(latest_status)
+        redundancy["redundant"] = True
+        redundancy["repeat_count"] = repeat_count
+        redundancy["note"] = (
+            "The latest tool call repeated the same task-valid answer from the same real tool "
+            "while the current working artifact did not change. This did not add a new "
+            "candidate or new evidence. Either finish with the existing answer, or "
+            "switch to a tool that changes the evidence basis before asking for the label again."
+        )
+        return redundancy
 
     @staticmethod
     def _thought_schema() -> dict[str, Any]:
@@ -5171,6 +6566,370 @@ class ExecutorAgent(AgentBase):
             "description": "Must contain both labeled parts in this order: `Reason:` then `Action:`.",
             "pattern": r"^Reason:[\s\S]*Action:[\s\S]*$",
         }
+
+    @staticmethod
+    def _execution_context_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "tool_chain": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The substantive tool chain that directly produced this answer. "
+                        "Do not include orchestration-only tools."
+                    ),
+                },
+                "public_reasoning": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Reusable evidence sentences grounded in actual tool outputs or data characteristics. "
+                        "Do not mention branch control, completion mechanics, or packaging."
+                    ),
+                },
+                "evidence_summary": {
+                    "type": "string",
+                    "description": "One concise execution-side summary of why the answer is supported.",
+                },
+            },
+            "required": ["tool_chain", "public_reasoning", "evidence_summary"],
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _control_context_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "completion_notes": {
+                    "type": "string",
+                    "description": (
+                        "Flow-control or completion notes reserved for controller/trace use. "
+                        "Use an empty string when there is nothing extra to note."
+                    ),
+                },
+            },
+            "required": ["completion_notes"],
+            "additionalProperties": False,
+        }
+
+    @classmethod
+    def _normalize_execution_context(
+        cls,
+        payload: Any,
+        *,
+        execution_log: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            payload = {}
+        observed_tools = (
+            set(cls._available_substantive_tool_names(execution_log))
+            if execution_log is not None
+            else None
+        )
+        tool_chain: list[str] = []
+        seen_tools: set[str] = set()
+        for raw_tool in payload.get("tool_chain") or []:
+            tool = cls._normalize_execution_context_tool_chain_entry(
+                raw_tool,
+                observed_tools=observed_tools,
+            )
+            if not tool:
+                continue
+            if tool in seen_tools:
+                continue
+            seen_tools.add(tool)
+            tool_chain.append(tool)
+        if execution_log:
+            primary_chain = cls._reasoning_substantive_tool_chain(execution_log)
+            plain_tools = [tool for tool in tool_chain if "->" not in tool]
+            path_labels = [tool for tool in tool_chain if "->" in tool]
+            if path_labels and plain_tools:
+                tool_chain = path_labels
+            elif (
+                len(primary_chain) >= 2
+                and len(plain_tools) > len(primary_chain)
+                and all(tool in plain_tools for tool in primary_chain)
+            ):
+                tool_chain = list(primary_chain)
+
+        public_reasoning = [
+            cls._sanitize_execution_context_text(str(item).strip())
+            for item in payload.get("public_reasoning") or []
+            if str(item).strip()
+        ]
+        public_reasoning = [item for item in public_reasoning if item]
+        evidence_summary = cls._sanitize_execution_context_text(
+            str(payload.get("evidence_summary") or "").strip()
+        )
+        if not evidence_summary and public_reasoning:
+            evidence_summary = "; ".join(public_reasoning[:2])[:400].strip()
+        if execution_log:
+            tool_chain = cls._canonicalize_execution_context_tool_chain(
+                tool_chain,
+                public_reasoning=public_reasoning,
+                evidence_summary=evidence_summary,
+                execution_log=execution_log,
+            )
+        return {
+            "tool_chain": tool_chain,
+            "public_reasoning": public_reasoning,
+            "evidence_summary": evidence_summary,
+        }
+
+    @staticmethod
+    def _sanitize_execution_context_text(text: str) -> str:
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return ""
+
+        sentence_re = re.compile(r"(?<=[.!?])\s+|;\s+")
+        replacements = [
+            (r"(?i)\btask-valid\b", ""),
+            (r"(?i)\bexact task-valid format\b", "exact format"),
+            (r"(?i)\breturn(?:ed|ing)? unchanged\b", ""),
+            (r"(?i)\bused unchanged\b", ""),
+            (r"(?i)\bprovided reuse answer\b", ""),
+            (r"(?i)\breuse answer\b", ""),
+            (r"(?i)\baccepted (?:result|answer|forecast|payload)\b", "result"),
+            (r"(?i)\bwinning (?:branch|candidate|path)\b", "path"),
+            (r"(?i)\bbest candidate among explored branches\b", "path"),
+            (r"(?i)\bexplored branches\b", "tested paths"),
+            (r"(?i)\brepair-only\b", ""),
+            (r"(?i)\bfinish-only\b", ""),
+            (r"(?i)\bfinal JSON delivery\b", ""),
+            (r"(?i)\bfinal answer\b", ""),
+            (r"(?i)\bthe user requested\b", ""),
+            (r"(?i)\bexecution context\b", ""),
+            (r"(?i)\bcompletion mechanics\b", ""),
+            (r"(?i)\bpayload wrapping\b", ""),
+            (r"(?i)\bcontroller-side\b", ""),
+            (r"(?i)\bcontroller\b", ""),
+        ]
+        hard_control_markers = (
+            "ground truth",
+            "ground_truth",
+            "evaluate_against_gt",
+            "evaluate_batch_against_gt",
+            "batch_evaluate_against_gt",
+            "spawn_subagent",
+            "json repair",
+            "before finishing",
+            " repair ",
+            "completion contract",
+            "branch instructions",
+            "return the corrected final answer",
+        )
+        kept_parts: list[str] = []
+        for part in sentence_re.split(cleaned):
+            chunk = str(part or "").strip()
+            if not chunk:
+                continue
+            for pattern, repl in replacements:
+                chunk = re.sub(pattern, repl, chunk)
+            lowered = f" {chunk.lower()} "
+            if any(marker in lowered for marker in hard_control_markers):
+                continue
+            chunk = re.sub(r"\s+", " ", chunk)
+            chunk = re.sub(r"\s+([,.;:])", r"\1", chunk)
+            chunk = chunk.strip(" -|,;:")
+            if re.match(r"(?i)^(use|return|wrap|resend|copy)\b", chunk):
+                continue
+            if chunk:
+                kept_parts.append(chunk)
+        if not kept_parts:
+            return ""
+        return ". ".join(kept_parts).strip().rstrip(".")
+
+    @staticmethod
+    def _normalize_control_context(payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            payload = {}
+        return {
+            "completion_notes": str(payload.get("completion_notes") or "").strip(),
+        }
+
+    @staticmethod
+    def _normalize_execution_context_tool_chain_entry(
+        raw_tool: Any,
+        *,
+        observed_tools: set[str] | None,
+    ) -> str:
+        tool = str(raw_tool or "").strip()
+        if not tool or tool in _ORCHESTRATION_ONLY_TOOLS:
+            return ""
+        if observed_tools is None:
+            return tool
+        if tool in observed_tools:
+            return tool
+        if "->" not in tool:
+            return ""
+        segments = [segment.strip() for segment in tool.split("->")]
+        if len(segments) < 2:
+            return ""
+        if any(
+            not segment
+            or segment in _ORCHESTRATION_ONLY_TOOLS
+            or segment not in observed_tools
+            for segment in segments
+        ):
+            return ""
+        return " -> ".join(segments)
+
+    @staticmethod
+    def _normalize_label_text(text: Any) -> str:
+        normalized = str(text or "").strip()
+        normalized = re.sub(r"\s*->\s*", " -> ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()
+
+    @classmethod
+    def _mentioned_candidate_path_labels(
+        cls,
+        text: str,
+        candidate_labels: list[str],
+    ) -> list[str]:
+        haystack = cls._normalize_label_text(text).lower()
+        if not haystack:
+            return []
+        matches: list[str] = []
+        for label in candidate_labels:
+            normalized_label = cls._normalize_label_text(label)
+            if normalized_label and normalized_label.lower() in haystack:
+                matches.append(normalized_label)
+        return matches
+
+    @classmethod
+    def _mentioned_substantive_tools(
+        cls,
+        text: str,
+        substantive_tools: list[str],
+    ) -> list[str]:
+        haystack = str(text or "").lower()
+        if not haystack:
+            return []
+        mentioned: list[str] = []
+        for tool in substantive_tools:
+            aliases = cls._reasoning_tool_aliases(tool)
+            if any(alias.lower() in haystack for alias in aliases):
+                mentioned.append(tool)
+        return mentioned
+
+    @classmethod
+    def _canonicalize_execution_context_tool_chain(
+        cls,
+        tool_chain: list[str],
+        *,
+        public_reasoning: list[str],
+        evidence_summary: str,
+        execution_log: list[dict[str, Any]],
+    ) -> list[str]:
+        candidate_labels = cls._reasoning_candidate_labels(execution_log)
+        substantive_tools = cls._available_substantive_tool_names(execution_log)
+        evidence_text = " ".join([*public_reasoning, evidence_summary]).strip()
+        mentioned_labels = cls._mentioned_candidate_path_labels(evidence_text, candidate_labels)
+        if mentioned_labels:
+            return [mentioned_labels[0]]
+
+        path_labels = [item for item in tool_chain if "->" in item]
+        plain_tools = [item for item in tool_chain if "->" not in item]
+        if path_labels:
+            return path_labels
+
+        primary_chain = cls._reasoning_substantive_tool_chain(execution_log)
+        if len(primary_chain) >= 2 and all(tool in plain_tools for tool in primary_chain):
+            return list(primary_chain)
+
+        mentioned_tools = cls._mentioned_substantive_tools(evidence_text, substantive_tools)
+        if mentioned_tools:
+            filtered_plain = [tool for tool in plain_tools if tool in mentioned_tools]
+            if filtered_plain:
+                tool_chain = filtered_plain
+
+        if (
+            len(primary_chain) >= 2
+            and len(tool_chain) > len(primary_chain)
+            and all(tool in tool_chain for tool in primary_chain)
+        ):
+            return list(primary_chain)
+        return tool_chain
+
+    @classmethod
+    def _selected_candidate_label_from_context(
+        cls,
+        execution_context: dict[str, Any],
+        execution_log: list[dict[str, Any]],
+    ) -> str:
+        candidate_labels = cls._reasoning_candidate_labels(execution_log)
+        if not candidate_labels:
+            return ""
+        tool_chain = [
+            cls._normalize_label_text(item)
+            for item in execution_context.get("tool_chain") or []
+            if cls._normalize_label_text(item)
+        ]
+        for entry in tool_chain:
+            for label in candidate_labels:
+                normalized_label = cls._normalize_label_text(label)
+                if entry == normalized_label:
+                    return normalized_label
+        joined = " ".join([
+            *(
+                str(item).strip()
+                for item in execution_context.get("public_reasoning") or []
+                if str(item).strip()
+            ),
+            str(execution_context.get("evidence_summary") or "").strip(),
+        ])
+        mentioned = cls._mentioned_candidate_path_labels(joined, candidate_labels)
+        return mentioned[0] if mentioned else ""
+
+    @classmethod
+    def _normalize_reasoning_for_reuse(
+        cls,
+        reasoning: Any,
+        execution_log: list[dict[str, Any]],
+        execution_context: dict[str, Any],
+    ) -> str:
+        text = str(reasoning or "").strip()
+        if not text:
+            return ""
+        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+        cleaned_lines: list[str] = []
+        for raw_line in lines:
+            line = raw_line
+            line = re.sub(r"(?i)\btask-valid\b", "", line)
+            line = re.sub(
+                r"(?i)\b(spawn_subagent|evaluate_against_gt|evaluate_batch_against_gt|batch_evaluate_against_gt|execution context|control context)\b",
+                "",
+                line,
+            )
+            line = re.sub(r"\s+", " ", line)
+            line = line.strip()
+            if line:
+                cleaned_lines.append(line)
+        normalized = "\n".join(cleaned_lines).strip()
+        candidate_labels = cls._reasoning_candidate_labels(execution_log)
+        selected_label = cls._selected_candidate_label_from_context(
+            execution_context,
+            execution_log,
+        )
+        if len(candidate_labels) >= 2 and selected_label:
+            lowered = normalized.lower()
+            selection_markers = (" was selected", " winner", " won", " best ", " outperformed", " lowest ")
+            mentions_selected = selected_label.lower() in lowered
+            has_selection = any(marker in lowered for marker in selection_markers)
+            if not (mentions_selected and has_selection):
+                step_count = len(re.findall(r"(?:^|\n)\s*\d+\.\s+", normalized))
+                next_step = step_count + 1 if step_count > 0 else 1
+                evidence_summary = cls._sanitize_execution_context_text(
+                    str(execution_context.get("evidence_summary") or "").strip()
+                )
+                support = evidence_summary or "it best matched the decisive evidence above"
+                addition = f"{next_step}. {selected_label} was selected because {support.rstrip('.')}."
+                normalized = f"{normalized}\n{addition}".strip() if normalized else addition
+        return normalized
 
     @classmethod
     def _is_task_answer_present_in_assistant_history(
@@ -5233,8 +6992,6 @@ class ExecutorAgent(AgentBase):
         horizon: int | None = None,
         indicator_output_keys: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        predictions: list[dict[str, Any]] = []
-        seen_names: set[str] = set()
         framework_tools = {
             "spawn_subagent",
             "evaluate_against_gt",
@@ -5243,9 +7000,13 @@ class ExecutorAgent(AgentBase):
             "bound_check",
             "consistency_check",
         }
+        predictions: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        pending_chain: list[str] = []
         for entry in execution_log:
             tool_name = str(entry.get("tool") or "").strip()
             if tool_name == "spawn_subagent":
+                pending_chain = []
                 output = entry.get("output") or []
                 for idx, item in enumerate(output):
                     if not isinstance(item, dict) or not item.get("success"):
@@ -5279,14 +7040,14 @@ class ExecutorAgent(AgentBase):
                         )
                     predictions.append({"name": name, "prediction": eval_prediction})
                 continue
-
+            if not tool_name:
+                continue
             if tool_name in framework_tools:
+                pending_chain = []
                 continue
 
-            answer = cls._candidate_answer_from_entry(
-                entry,
-                task_type=task_type,
-            )
+            pending_chain.append(tool_name)
+            answer = cls._candidate_answer_from_entry(entry, task_type=task_type)
             if task_type == "indicator":
                 answer = cls._canonicalize_indicator_answer(
                     answer,
@@ -5299,8 +7060,10 @@ class ExecutorAgent(AgentBase):
                 indicator_output_keys=indicator_output_keys,
             ):
                 continue
-            name = f"top_level::{tool_name}"
+
+            name = cls._top_level_candidate_path_name(pending_chain)
             if name in seen_names:
+                pending_chain = []
                 continue
             seen_names.add(name)
             eval_prediction = cls._coerce_prediction_for_evaluation(task_type, answer)
@@ -5310,6 +7073,7 @@ class ExecutorAgent(AgentBase):
                     indicator_output_keys=indicator_output_keys,
                 )
             predictions.append({"name": name, "prediction": eval_prediction})
+            pending_chain = []
         return predictions
 
     @staticmethod
@@ -5362,6 +7126,7 @@ class ExecutorAgent(AgentBase):
             return ""
         keys = [
             "modality_report",
+            "compute_statistics",
             "basic_stats",
             "autocorrelation",
             "stationarity_test",
@@ -5413,6 +7178,574 @@ class ExecutorAgent(AgentBase):
         return all(label in thought for label in ("Reason:", "Action:"))
 
     @staticmethod
+    def _reasoning_substantive_tool_chain(
+        execution_log: list[dict[str, Any]],
+    ) -> list[str]:
+        return [
+            str(entry.get("tool", "")).strip()
+            for entry in execution_log
+            if (
+                str(entry.get("tool", "")).strip()
+                and str(entry.get("tool", "")).strip() not in _ORCHESTRATION_ONLY_TOOLS
+            )
+        ]
+
+    @classmethod
+    def _available_substantive_tool_names(
+        cls,
+        execution_log: list[dict[str, Any]],
+    ) -> list[str]:
+        names: list[str] = []
+        seen: set[str] = set()
+
+        def _add_tool(raw_tool: Any) -> None:
+            tool = str(raw_tool or "").strip()
+            if not tool or tool in _ORCHESTRATION_ONLY_TOOLS or tool in seen:
+                return
+            seen.add(tool)
+            names.append(tool)
+
+        for entry in execution_log:
+            if not isinstance(entry, dict):
+                continue
+            tool_name = str(entry.get("tool") or "").strip()
+            _add_tool(tool_name)
+            if tool_name != "spawn_subagent":
+                continue
+            output = entry.get("output") or []
+            for item in output:
+                if not isinstance(item, dict) or not item.get("success"):
+                    continue
+                result = item.get("result") or {}
+                if not isinstance(result, dict):
+                    continue
+                for log_entry in result.get("execution_log") or []:
+                    if isinstance(log_entry, dict):
+                        _add_tool(log_entry.get("tool"))
+        return names
+
+    @classmethod
+    def _reasoning_candidate_tool_chains(
+        cls,
+        execution_log: list[dict[str, Any]],
+    ) -> list[list[str]]:
+        chains: list[list[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for entry in execution_log:
+            if entry.get("tool") != "spawn_subagent":
+                continue
+            output = entry.get("output") or []
+            for item in output:
+                if not isinstance(item, dict) or not item.get("success"):
+                    continue
+                result = item.get("result") or {}
+                if not isinstance(result, dict):
+                    continue
+                sub_execution_log = result.get("execution_log") or []
+                sub_chain = cls._reasoning_substantive_tool_chain(sub_execution_log)
+                if not sub_chain:
+                    continue
+                key = tuple(sub_chain)
+                if key in seen:
+                    continue
+                seen.add(key)
+                chains.append(sub_chain)
+        return chains
+
+    @staticmethod
+    def _reasoning_tool_aliases(tool_name: str) -> list[str]:
+        tool = str(tool_name or "").strip()
+        if not tool or tool in _ORCHESTRATION_ONLY_TOOLS:
+            return []
+        aliases: list[str] = [tool]
+        canonical_aliases = {
+            "chronos2_forecast": ["Chronos-2"],
+            "timesfm2_forecast": ["TimesFM 2.0"],
+            "moirai1_1_r_base_forecast": ["Moirai 1.1 R-base"],
+            "sundial_base_128m_forecast": ["Sundial Base 128M"],
+            "aurora_forecast": ["Aurora"],
+            "arima_forecast": ["ARIMA"],
+            "ets_forecast": ["ETS"],
+            "prophet_forecast": ["Prophet"],
+        }
+        for alias in canonical_aliases.get(tool, []):
+            if alias not in aliases:
+                aliases.append(alias)
+        return aliases
+
+    @classmethod
+    def _reasoning_explicit_name_hints(
+        cls,
+        execution_log: list[dict[str, Any]],
+    ) -> list[str]:
+        seen: set[str] = set()
+        hints: list[str] = []
+        for chain in cls._reasoning_candidate_tool_chains(execution_log):
+            for tool in chain:
+                for alias in cls._reasoning_tool_aliases(tool):
+                    key = alias.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    hints.append(f"{tool}: {alias}")
+        for tool in cls._reasoning_substantive_tool_chain(execution_log):
+            for alias in cls._reasoning_tool_aliases(tool):
+                key = alias.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                hints.append(f"{tool}: {alias}")
+        return hints
+
+    @classmethod
+    def _reasoning_candidate_labels(
+        cls,
+        execution_log: list[dict[str, Any]],
+    ) -> list[str]:
+        labels: list[str] = []
+        seen: set[str] = set()
+        for entry in execution_log:
+            if entry.get("tool") != "spawn_subagent":
+                continue
+            output = entry.get("output") or []
+            for idx, item in enumerate(output):
+                if not isinstance(item, dict) or not item.get("success"):
+                    continue
+                result = item.get("result") or {}
+                if not isinstance(result, dict):
+                    continue
+                sub_execution_log = result.get("execution_log") or []
+                sub_chain = cls._reasoning_substantive_tool_chain(sub_execution_log)
+                label = (
+                    " -> ".join(sub_chain)
+                    or str(result.get("candidate_name") or "").strip()
+                    or " -> ".join(cls._hinted_tools(result.get("tools_hint")))
+                    or str(result.get("sub_task_description") or "").strip()
+                    or f"candidate_{idx}"
+                )
+                lowered = label.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                labels.append(label)
+        return labels
+
+    async def _stepwise_reasoning_verdict(
+        self,
+        reasoning: Any,
+        execution_log: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        text = str(reasoning or "").strip()
+        candidate_labels = self._reasoning_candidate_labels(execution_log)
+        substantive_chain = self._reasoning_substantive_tool_chain(execution_log)
+        explicit_name_hints = self._reasoning_explicit_name_hints(execution_log)
+        mode = "candidate_comparison" if len(candidate_labels) >= 2 else "single_path"
+        allowed_missing = {
+            "numbered_steps",
+            "explicit_names",
+            "decisive_evidence",
+            "winner_selection",
+            "tool_purpose_or_result",
+            "orchestration_only_language",
+        }
+        if not text:
+            return {
+                "passed": False,
+                "missing": ["numbered_steps", "explicit_names"],
+                "explanation": "reasoning is empty",
+            }
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict JSON judge for TimeClaw final reasoning quality. "
+                    "This reasoning will be consumed by downstream agents and memory, so "
+                    "it must explicitly name real executed paths/tools.\n\n"
+                    "Return exactly one JSON object with keys `passed`, `missing`, and "
+                    "`explanation`.\n"
+                    "`passed` must be a boolean.\n"
+                    "`missing` must be an array containing only items from "
+                    "[`numbered_steps`, `explicit_names`, `decisive_evidence`, "
+                    "`winner_selection`, `tool_purpose_or_result`, "
+                    "`orchestration_only_language`].\n"
+                    "`explanation` must be a short string.\n\n"
+                    "Judging rules:\n"
+                    "1. Be strict.\n"
+                    "2. Treat a name as explicit only if the reasoning literally includes "
+                    "either (a) an exact concrete tool/path name string from the provided "
+                    "lists, or (b) an exact canonical alias from the provided explicit-name "
+                    "hint list. Do not invent new aliases.\n"
+                    "3. Never require orchestration-only tools such as spawn_subagent or "
+                    "evaluate_*.\n"
+                    "4. If the reasoning talks mainly about orchestration/framework actions, "
+                    "fail with `orchestration_only_language`.\n"
+                    "5. In `candidate_comparison` mode, pass only if the reasoning has "
+                    "numbered steps, explicitly names at least two compared real candidate "
+                    "paths or concrete tool names from those paths, states the decisive "
+                    "evidence, and states why the winner was selected.\n"
+                    "6. In `single_path` mode, pass only if the reasoning has numbered "
+                    "steps, explicitly names the real substantive tools used in this branch, "
+                    "and explains why each named tool mattered or what key result it produced.\n"
+                    "7. If all requirements are satisfied, return `passed=true` and "
+                    "`missing=[]`."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Mode: {mode}\n"
+                    "Exact candidate path labels:\n"
+                    + (
+                        "\n".join(f"- {label}" for label in candidate_labels)
+                        if candidate_labels else "- (none)"
+                    )
+                    + "\n\nExact substantive tool chain for this branch:\n"
+                    + (
+                        "\n".join(f"- {tool}" for tool in substantive_chain)
+                        if substantive_chain else "- (none)"
+                    )
+                    + "\n\nExplicit-name hints that still count as concrete if quoted literally:\n"
+                    + (
+                        "\n".join(f"- {hint}" for hint in explicit_name_hints)
+                        if explicit_name_hints else "- (none)"
+                    )
+                    + "\n\nReasoning to judge:\n"
+                    + text
+                ),
+            },
+        ]
+        parsed = await self._complete_json_judge_response(
+            messages,
+            error_message="stepwise reasoning judge returned invalid JSON",
+        )
+        missing = [
+            str(item).strip()
+            for item in (parsed.get("missing") or [])
+            if str(item).strip() in allowed_missing
+        ]
+        passed = bool(parsed.get("passed"))
+        if passed:
+            missing = []
+        return {
+            "passed": passed,
+            "missing": missing,
+            "explanation": str(parsed.get("explanation") or "").strip(),
+        }
+
+    async def _execution_context_verdict(
+        self,
+        execution_context: dict[str, Any],
+        execution_log: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        candidate_labels = self._reasoning_candidate_labels(execution_log)
+        substantive_tools = self._available_substantive_tool_names(execution_log)
+        allowed_missing = {
+            "tool_chain_alignment",
+            "public_reasoning",
+            "evidence_summary",
+            "explicit_tool_names",
+            "decisive_evidence",
+            "execution_only_language",
+        }
+        if not substantive_tools:
+            return {"passed": True, "missing": [], "explanation": ""}
+        execution_text = "\n".join([
+            *(
+                str(item).strip()
+                for item in execution_context.get("public_reasoning") or []
+                if str(item).strip()
+            ),
+            str(execution_context.get("evidence_summary") or "").strip(),
+        ]).lower()
+        hard_control_markers = (
+            "task-valid",
+            "ground truth",
+            "ground_truth",
+            "evaluate_against_gt",
+            "evaluate_batch_against_gt",
+            "batch_evaluate_against_gt",
+            "spawn_subagent",
+            "return unchanged",
+            "execution context",
+            "json repair",
+            "payload wrapping",
+            "before finishing",
+        )
+        if any(marker in execution_text for marker in hard_control_markers):
+            missing = ["execution_only_language"]
+            if any(
+                str(tool).strip() in _ORCHESTRATION_ONLY_TOOLS
+                for tool in execution_context.get("tool_chain") or []
+            ):
+                missing.insert(0, "tool_chain_alignment")
+            return {
+                "passed": False,
+                "missing": missing,
+                "explanation": "execution_context contains controller-only language",
+            }
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict JSON judge for TimeClaw execution_context quality. "
+                    "This payload will be reused by downstream memory and agents, so it must "
+                    "contain execution-side evidence only.\n\n"
+                    "Return exactly one JSON object with keys `passed`, `missing`, and "
+                    "`explanation`.\n"
+                    "`passed` must be a boolean.\n"
+                    "`missing` must be an array containing only items from "
+                    "[`tool_chain_alignment`, `public_reasoning`, `evidence_summary`, "
+                    "`explicit_tool_names`, `decisive_evidence`, "
+                    "`execution_only_language`].\n"
+                    "`explanation` must be a short string.\n\n"
+                    "Judging rules:\n"
+                    "1. Be strict.\n"
+                    "2. `tool_chain_alignment` passes only if each entry in "
+                    "`execution_context.tool_chain` is either (a) an exact real "
+                    "substantive tool name from the provided executed-tool list, or "
+                    "(b) an exact candidate path label from the provided list whose "
+                    "segments are all real substantive executed tools. Never allow "
+                    "orchestration-only tools such as spawn_subagent or evaluate_*.\n"
+                    "3. `public_reasoning` passes only if it is non-empty and each item is "
+                    "reusable execution-side evidence grounded in real tool results or data "
+                    "properties, not controller instructions.\n"
+                    "4. `evidence_summary` passes only if it is a concise execution-side "
+                    "summary grounded in the same evidence.\n"
+                    "5. `explicit_tool_names` passes only if the public reasoning or "
+                    "evidence summary literally names concrete tools or candidate paths from "
+                    "the provided lists. Do not invent aliases.\n"
+                    "6. `decisive_evidence` passes only if the payload explains the actual "
+                    "evidence that made the accepted answer or winner convincing.\n"
+                    "7. Fail with `execution_only_language` if the payload talks about "
+                    "task-valid status, ground truth, evaluate_*, spawn_subagent, branch "
+                    "control requirements, completion mechanics, future steps, packaging, "
+                    "JSON repair, or returning an answer unchanged.\n"
+                    "8. If all requirements are satisfied, return `passed=true` and "
+                    "`missing=[]`."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Exact candidate path labels:\n"
+                    + (
+                        "\n".join(f"- {label}" for label in candidate_labels)
+                        if candidate_labels else "- (none)"
+                    )
+                    + "\n\nExact executed substantive tools:\n"
+                    + "\n".join(f"- {tool}" for tool in substantive_tools)
+                    + "\n\nExecution context to judge:\n"
+                    + json.dumps(execution_context, ensure_ascii=False, indent=2)
+                ),
+            },
+        ]
+        parsed = await self._complete_json_judge_response(
+            messages,
+            error_message="execution_context judge returned invalid JSON",
+        )
+        missing = [
+            str(item).strip()
+            for item in (parsed.get("missing") or [])
+            if str(item).strip() in allowed_missing
+        ]
+        passed = bool(parsed.get("passed"))
+        if passed:
+            missing = []
+        return {
+            "passed": passed,
+            "missing": missing,
+            "explanation": str(parsed.get("explanation") or "").strip(),
+        }
+
+    async def _final_payload_reusability_verdict(
+        self,
+        *,
+        mode: Any,
+        reasoning: Any,
+        execution_context: dict[str, Any],
+        execution_log: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not self._should_enforce_stepwise_reasoning(mode):
+            return {
+                "passed": True,
+                "execution_context_verdict": {"passed": True, "missing": [], "explanation": ""},
+                "reasoning_verdict": {"passed": True, "missing": [], "explanation": ""},
+            }
+
+        execution_context_verdict = await self._execution_context_verdict(
+            execution_context,
+            execution_log,
+        )
+        if not execution_context_verdict.get("passed", False):
+            return {
+                "passed": False,
+                "execution_context_verdict": execution_context_verdict,
+                "reasoning_verdict": {"passed": True, "missing": [], "explanation": ""},
+            }
+
+        reasoning_verdict = await self._stepwise_reasoning_verdict(
+            reasoning,
+            execution_log,
+        )
+        return {
+            "passed": bool(reasoning_verdict.get("passed", False)),
+            "execution_context_verdict": execution_context_verdict,
+            "reasoning_verdict": reasoning_verdict,
+        }
+
+    async def _complete_json_judge_response(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        error_message: str,
+    ) -> dict[str, Any]:
+        for attempt in range(MAX_JSON_JUDGE_ATTEMPTS):
+            response = await self.llm.complete(messages, response_format="json")
+            parsed = self._json_dict_from_response(response)
+            if isinstance(parsed, dict) and "passed" in parsed:
+                return parsed
+            response_text = str(getattr(response, "text", "") or "").strip()
+            if response_text or attempt + 1 >= MAX_JSON_JUDGE_ATTEMPTS:
+                break
+        raise RuntimeError(error_message)
+
+    @staticmethod
+    def _attach_partial_result_to_exception(
+        exc: Exception,
+        *,
+        answer: Any,
+        answer_type: str,
+        confidence: Any,
+        reasoning: str,
+        execution_context: dict[str, Any],
+        control_context: dict[str, Any],
+        execution_log: list[dict[str, Any]],
+    ) -> None:
+        """Preserve terminal evidence when a late judge fails.
+
+        New definition:
+            Some failures happen after the executor already has a real terminal
+            payload, but before it can be accepted. In that case the exception
+            should carry a ``partial_result`` so train/test artifacts can still
+            show the actual answer candidate and evidence instead of an empty
+            shell row.
+        """
+        partial = getattr(exc, "partial_result", None)
+        payload = dict(partial) if isinstance(partial, dict) else {}
+        if answer is not None:
+            payload["answer"] = answer
+        if answer_type:
+            payload["answer_type"] = str(answer_type)
+        payload["confidence"] = confidence
+        if reasoning:
+            payload["reasoning"] = str(reasoning)
+        if isinstance(execution_context, dict):
+            payload["execution_context"] = execution_context
+        if isinstance(control_context, dict):
+            payload["control_context"] = control_context
+        if isinstance(execution_log, list):
+            payload["execution_log"] = list(execution_log)
+        setattr(exc, "partial_result", payload)
+        setattr(exc, "execution_log", payload.get("execution_log", []))
+        setattr(exc, "raw_answer", payload.get("answer"))
+        setattr(exc, "answer_type", payload.get("answer_type", ""))
+        setattr(exc, "confidence", payload.get("confidence"))
+        setattr(exc, "reasoning", payload.get("reasoning", ""))
+        setattr(exc, "execution_context", payload.get("execution_context", {}))
+        setattr(exc, "control_context", payload.get("control_context", {}))
+
+    @staticmethod
+    def _json_dict_from_response(response: Any) -> dict[str, Any]:
+        parsed = response.parsed if isinstance(getattr(response, "parsed", None), dict) else {}
+        if not parsed and isinstance(getattr(response, "text", None), str) and response.text.strip():
+            try:
+                parsed = json.loads(response.text)
+            except json.JSONDecodeError:
+                parsed = {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _terminal_payload_repair_messages(
+        cls,
+        execution_log: list[dict[str, Any]],
+        terminal_reuse_verdict: dict[str, Any] | None,
+    ) -> list[str]:
+        verdict = terminal_reuse_verdict or {}
+        execution_context_verdict = verdict.get("execution_context_verdict") or {}
+        reasoning_verdict = verdict.get("reasoning_verdict") or {}
+        messages: list[str] = []
+        if not execution_context_verdict.get("passed", False):
+            messages.append(
+                cls._execution_context_correction_message(
+                    execution_log,
+                    verdict=execution_context_verdict,
+                )
+            )
+        elif not reasoning_verdict.get("passed", False):
+            messages.append(
+                cls._stepwise_reasoning_correction_message(
+                    execution_log,
+                    verdict=reasoning_verdict,
+                )
+            )
+        return messages
+
+    @staticmethod
+    def _terminal_delivery_correction_message(
+        *,
+        expected_type: str,
+        failure_reason: str,
+    ) -> str:
+        detail_map = {
+            "invalid_json_or_missing_required_fields": (
+                "The last reply was not a valid final JSON object with all required fields."
+            ),
+            "not_finished": (
+                "The last reply returned `done=false`; this turn must either finish correctly or explain why completion is impossible."
+            ),
+            "missing_answer": "The last reply did not include a final `answer` payload.",
+            "wrong_answer_type": (
+                f"The last reply used the wrong `answer_type`; it must be `{expected_type}`."
+            ),
+            "invalid_learning_summary": (
+                "For `learning_summary`, `answer.insight` and `answer.recommendation` must both be short non-empty strings."
+            ),
+            "training_contract_unsatisfied": (
+                "In training, a `learning_summary` is valid only after the required candidate-generation and evaluation steps are already complete."
+            ),
+            "invalid_final_answer": (
+                "The last `answer` did not satisfy the task-specific final answer shape."
+            ),
+            "unsupported_answer": (
+                "The last `answer` was not grounded in the completed path's evidence."
+            ),
+            "no_tool_use": (
+                "A final answer here must be backed by at least one actual tool call in this path."
+            ),
+            "tools_hint_not_followed": (
+                "This branch must finish using only evidence from its assigned visible tools."
+            ),
+        }
+        detail = detail_map.get(
+            failure_reason,
+            "The last terminal reply was not an acceptable final delivery for this run.",
+        )
+        return (
+            "Self-correction: your last terminal reply was not an acceptable final delivery. "
+            "Do not call any tool. Return exactly one JSON object with "
+            "`thought`, `done=true`, `answer`, "
+            f"`answer_type='{expected_type}'`, `confidence`, `reasoning`, "
+            "`execution_context`, and `control_context`. "
+            "`reasoning` must explain the evidence in numbered steps. "
+            "`execution_context` must contain execution-only evidence, and "
+            "`control_context` is only for completion notes. "
+            f"{detail} If completion is genuinely impossible from the existing path, "
+            "return `done=false` and explain why."
+        )
+
+    @staticmethod
     def _has_stepwise_reasoning(
         reasoning: Any,
         execution_log: list[dict[str, Any]],
@@ -5454,51 +7787,96 @@ class ExecutorAgent(AgentBase):
     @staticmethod
     def _stepwise_reasoning_correction_message(
         execution_log: list[dict[str, Any]],
+        verdict: dict[str, Any] | None = None,
     ) -> str:
-        candidate_names = ExecutorAgent._reasoning_candidate_names(execution_log)
-        if candidate_names:
-            names_text = ", ".join(candidate_names)
+        missing_map = {
+            "numbered_steps": "numbered steps",
+            "explicit_names": "explicit concrete candidate/tool names",
+            "decisive_evidence": "the decisive evidence",
+            "winner_selection": "why the winner was selected",
+            "tool_purpose_or_result": "why each named tool mattered or what key result it produced",
+            "orchestration_only_language": "removing orchestration/framework wording",
+        }
+        missing = [
+            missing_map[item]
+            for item in (verdict or {}).get("missing", [])
+            if item in missing_map
+        ]
+        missing_text = ""
+        if missing:
+            missing_text = " The last draft was missing: " + ", ".join(missing) + "."
+
+        candidate_labels = ExecutorAgent._reasoning_candidate_labels(execution_log)
+        if len(candidate_labels) >= 2:
+            names_text = ", ".join(candidate_labels)
             return (
-                "Self-correction: your final `reasoning` must explain substantive "
-                f"candidate approaches, not orchestration tools. Rewrite it as numbered "
-                f"steps comparing these candidate paths where relevant: {names_text}. "
-                "State which candidate patterns were considered, what decisive evidence "
-                "separated them, and why the winner was selected. Do not mention "
+                "Self-correction: your final `reasoning` is not explicit enough for downstream "
+                "reuse. Rewrite it as numbered steps. Explicitly name at least two real candidate "
+                f"paths using these concrete names where relevant: {names_text}. "
+                "State the decisive evidence and why the winner was selected. Do not mention "
                 "spawn_subagent, evaluate_*, execution context, assigned path, before finishing, "
-                "or other framework wording in the reasoning. Do not call another tool; "
-                "return the corrected final JSON now."
+                "or other framework wording in the reasoning. Do not call another tool; return "
+                f"the corrected final answer now.{missing_text}"
             )
 
-        tool_chain = [
-            str(entry.get("tool", "")).strip()
-            for entry in execution_log
-            if str(entry.get("tool", "")).strip()
-        ]
-        substantive_chain = [
-            str(tool).strip()
-            for tool in tool_chain
-            if str(tool).strip() and str(tool).strip() not in _ORCHESTRATION_ONLY_TOOLS
-        ]
+        substantive_chain = ExecutorAgent._reasoning_substantive_tool_chain(execution_log)
         if substantive_chain:
             chain_text = " -> ".join(substantive_chain)
             return (
-                "Self-correction: your final `reasoning` is too shallow. Rewrite it as a "
-                "numbered step-by-step explanation with one numbered item per substantive "
-                f"analysis tool for this executed chain: {chain_text}. "
-                "For each numbered item, state: "
-                "1. why that tool was chosen; "
-                "2. the key observation or result it produced; "
-                "3. how that result changed the next decision or the final answer. "
-                "Do not mention orchestration-only tools such as spawn_subagent or "
-                "evaluate_* in the reasoning. Do not call another tool; return the "
-                "corrected final JSON now."
+                "Self-correction: your final `reasoning` is not explicit enough for downstream "
+                "reuse. Rewrite it as numbered steps and explicitly name the real substantive "
+                f"tools from this branch: {chain_text}. For each named tool, state why it was "
+                "chosen and what key result it contributed to the final answer. Do not mention "
+                "orchestration-only tools such as spawn_subagent or evaluate_* in the reasoning. "
+                f"Do not call another tool; return the corrected final answer now.{missing_text}"
             )
 
         return (
-            "Self-correction: your final `reasoning` is too shallow. Rewrite it as a "
-            "numbered step-by-step explanation focused on substantive evidence, not "
+            "Self-correction: your final `reasoning` is not explicit enough for downstream "
+            "reuse. Rewrite it as numbered steps focused on substantive evidence, not "
             "orchestration-only tools such as spawn_subagent or evaluate_*. Do not "
-            "call another tool; return the corrected final JSON now."
+            f"call another tool; return the corrected final answer now.{missing_text}"
+        )
+
+    @staticmethod
+    def _execution_context_correction_message(
+        execution_log: list[dict[str, Any]],
+        verdict: dict[str, Any] | None = None,
+    ) -> str:
+        missing_map = {
+            "tool_chain_alignment": "a tool_chain containing only real substantive tools",
+            "public_reasoning": "non-empty reusable public_reasoning",
+            "evidence_summary": "a concise execution-side evidence_summary",
+            "explicit_tool_names": "explicit concrete tool/path names",
+            "decisive_evidence": "the decisive evidence",
+            "execution_only_language": "removing control-flow and packaging language",
+        }
+        missing = [
+            missing_map[item]
+            for item in (verdict or {}).get("missing", [])
+            if item in missing_map
+        ]
+        missing_text = ""
+        if missing:
+            missing_text = " The last draft was missing: " + ", ".join(missing) + "."
+
+        candidate_labels = ExecutorAgent._reasoning_candidate_labels(execution_log)
+        substantive_tools = ExecutorAgent._available_substantive_tool_names(execution_log)
+        names_text = ", ".join(candidate_labels) if candidate_labels else ", ".join(substantive_tools)
+        return (
+            "Self-correction: your final `execution_context` is not reusable yet. "
+            "Rewrite the final answer now without calling another tool. Keep "
+            "`execution_context.tool_chain` limited to the real substantive tools that "
+            f"produced the accepted result, using these concrete names where relevant: {names_text or '(none)'}. "
+            "Treat previous controller, evaluator, and completion wording as non-evidence; "
+            "rebuild `execution_context` from tool outputs and observed data properties only. "
+            "Rewrite `execution_context.public_reasoning` as 1-3 short execution-side "
+            "evidence statements, and rewrite `execution_context.evidence_summary` as one "
+            "concise execution-side summary. Move any task-valid wording, ground-truth "
+            "notes, evaluation/control mechanics, packaging language, or 'return unchanged' "
+            "phrasing into `control_context.completion_notes` or omit it. Then rewrite "
+            "`reasoning` as numbered steps expanding the same execution-side evidence. "
+            f"Do not call another tool; return the corrected final answer now.{missing_text}"
         )
 
     @staticmethod
@@ -5740,8 +8118,18 @@ class ExecutorAgent(AgentBase):
                                 },
                                 "confidence": {"type": "number"},
                                 "reasoning": {"type": "string"},
+                                "execution_context": ExecutorAgent._execution_context_schema(),
+                                "control_context": ExecutorAgent._control_context_schema(),
                             },
-                            "required": ["thought", "insight", "recommendation", "confidence", "reasoning"],
+                            "required": [
+                                "thought",
+                                "insight",
+                                "recommendation",
+                                "confidence",
+                                "reasoning",
+                                "execution_context",
+                                "control_context",
+                            ],
                             "additionalProperties": False,
                         },
                     },
@@ -5768,8 +8156,18 @@ class ExecutorAgent(AgentBase):
                             },
                             "confidence": {"type": "number"},
                             "reasoning": {"type": "string"},
+                            "execution_context": ExecutorAgent._execution_context_schema(),
+                            "control_context": ExecutorAgent._control_context_schema(),
                         },
-                        "required": ["thought", "answer_type", "answer_json", "confidence", "reasoning"],
+                        "required": [
+                            "thought",
+                            "answer_type",
+                            "answer_json",
+                            "confidence",
+                            "reasoning",
+                            "execution_context",
+                            "control_context",
+                        ],
                         "additionalProperties": False,
                     },
                 },
@@ -5984,6 +8382,12 @@ class ExecutorAgent(AgentBase):
                     "answer_type": "learning_summary",
                     "confidence": arguments.get("confidence"),
                     "reasoning": reasoning,
+                    "execution_context": cls._normalize_execution_context(
+                        arguments.get("execution_context")
+                    ),
+                    "control_context": cls._normalize_control_context(
+                        arguments.get("control_context")
+                    ),
                 }
             answer_json = arguments.get("answer_json")
             if not isinstance(answer_json, str):
@@ -6007,6 +8411,12 @@ class ExecutorAgent(AgentBase):
                 "answer_type": str(arguments.get("answer_type") or ""),
                 "confidence": arguments.get("confidence"),
                 "reasoning": str(arguments.get("reasoning") or ""),
+                "execution_context": cls._normalize_execution_context(
+                    arguments.get("execution_context")
+                ),
+                "control_context": cls._normalize_control_context(
+                    arguments.get("control_context")
+                ),
             }
         return {"done": False, "_parse_failed": True, "thought": fallback_thought}
 
@@ -6046,13 +8456,25 @@ class ExecutorAgent(AgentBase):
                 "answer_type": answer_type,
                 "confidence": confidence,
                 "reasoning": reasoning,
+                "execution_context": cls._normalize_execution_context(
+                    decision.get("execution_context")
+                ),
+                "control_context": cls._normalize_control_context(
+                    decision.get("control_context")
+                ),
             }
 
         tool = str(decision.get("tool") or "")
         args = decision.get("args")
         if not allow_tool_call or not tool or not isinstance(args, dict):
             return None
-        if "answer" in decision or "answer_type" in decision or "reasoning" in decision:
+        if (
+            "answer" in decision
+            or "answer_type" in decision
+            or "reasoning" in decision
+            or "execution_context" in decision
+            or "control_context" in decision
+        ):
             return None
         return {
             "thought": thought,
@@ -6187,11 +8609,23 @@ class ExecutorAgent(AgentBase):
     async def _request_terminal_path_review(
         self,
         *,
-        conversation: list[dict[str, str]],
         expected_type: str,
         trace_phase: str,
+        task_type: str | None = None,
+        task_description: str = "",
+        execution_log: list[dict[str, Any]] | None = None,
+        feedback_messages: list[str] | None = None,
+        horizon: int | None = None,
+        indicator_output_keys: list[str] | None = None,
         sub_agent_idx: int | None = None,
+        recoverable_final: dict[str, Any] | None = None,
+        sub_task_description: str = "",
+        tools_hint: Any = None,
+        conversation: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        del conversation
+        task_type = str(task_type or expected_type or "").strip()
+        execution_log = execution_log or []
         trace_payload = {
             "reason": "path_review_after_budget_exhaustion",
             "expected_type": expected_type,
@@ -6200,32 +8634,39 @@ class ExecutorAgent(AgentBase):
             trace_payload["sub_agent_idx"] = sub_agent_idx
         trace.agent_step("executor", trace_phase, trace_payload)
 
-        conversation.append({
-            "role": "user",
-            "content": (
-                "Terminal self-correction: you have exhausted the normal step budget. "
-                "Review the entire path above, including your previous assistant replies "
-                "and all tool observations. If any earlier reply already contained a valid "
-                "task payload but was missing the required final decision envelope, reuse "
-                "that SAME payload unchanged and return one JSON object with `thought`, "
-                "`done=true`, `answer`, and "
-                f"`answer_type='{expected_type}'`. If there was no earlier bare payload "
-                "but the completed path already gives enough evidence for a valid final "
-                "answer, return that final answer now in the same envelope. Do not call "
-                "any tool. If the required final type is `learning_summary`, then `answer` "
-                "must be a JSON object with short non-empty string fields `insight` and "
-                "`recommendation`; `recommendation` must be a reusable textual lesson or a "
-                "cautionary failure pattern, not the task prediction object. If neither is "
-                "possible, return `done=false` and explain why."
-            ),
-        })
-        retry_response = await self.llm.complete(conversation, response_format="json")
+        clean_conversation = [
+            {
+                "role": "system",
+                "content": (
+                    "You are repairing the final JSON delivery for a TimeClaw run after the "
+                    "normal step budget was exhausted. Use only the execution-side evidence "
+                    "provided below. Return exactly one JSON object. Do not call any tool. "
+                    "Do not copy controller-side repair wording into `execution_context`."
+                ),
+            },
+            {
+                "role": "user",
+                "content": self._build_clean_repair_prompt(
+                    expected_type=expected_type,
+                    task_type=task_type,
+                    task_description=task_description,
+                    execution_log=execution_log,
+                    recoverable_final=recoverable_final,
+                    feedback_messages=feedback_messages,
+                    horizon=horizon,
+                    indicator_output_keys=indicator_output_keys,
+                    sub_task_description=sub_task_description,
+                    tools_hint=tools_hint,
+                    terminal_json=True,
+                ),
+            },
+        ]
+        retry_response = await self.llm.complete(clean_conversation, response_format="json")
         retry_decision = self._coerce_llm_decision(
             retry_response.parsed,
             retry_response.text,
             fallback_thought="LLM parse failed after terminal path review",
         )
-        conversation.append({"role": "assistant", "content": retry_response.text or ""})
 
         retry_trace = {
             "reason": "terminal_path_review_response",

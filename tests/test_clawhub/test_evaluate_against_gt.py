@@ -39,6 +39,17 @@ def test_forecast_metrics_accepts_answer_wrapper():
     assert metrics["mae"] == 0.0
 
 
+def test_compute_metrics_normalises_dataset_scoped_forecast_task_type():
+    tool = EvaluateAgainstGTTool()
+    metrics = tool._compute_metrics(
+        {"answer": [1.0, 2.0, 3.0]},
+        [1.0, 2.0, 3.0],
+        "weather_aligned_short_forecast",
+    )
+    assert "mae" in metrics
+    assert "accuracy" not in metrics
+
+
 def test_indicator_metrics_requires_exact_indicator_keys():
     metrics = EvaluateAgainstGTTool._indicator_metrics(
         {"macd_forecast": [1.0, 2.0, 3.0]},
@@ -55,6 +66,17 @@ def test_indicator_metrics_accepts_answer_wrapper():
     )
 
     assert metrics["macd_mae"] == 0.333
+
+
+def test_compute_metrics_normalises_dataset_scoped_indicator_task_type():
+    tool = EvaluateAgainstGTTool()
+    metrics = tool._compute_metrics(
+        {"answer": {"macd": [1.0, 2.0, 3.0]}},
+        {"macd": [1.0, 2.0, 4.0]},
+        "finance_aligned_long_indicator_macd",
+    )
+    assert metrics["macd_mae"] == 0.333
+    assert "accuracy" not in metrics
 
 
 @pytest.mark.asyncio
@@ -87,6 +109,20 @@ async def test_evaluate_batch_against_gt_accepts_raw_prediction_payloads():
     assert len(result["results"]) == 2
     assert result["results"][0]["name"] == "approach_0"
     assert result["results"][0]["metrics"]["mae"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_batch_against_gt_normalises_dataset_scoped_task_type():
+    tool = BatchEvaluateAgainstGTTool()
+    result = await tool._run(
+        predictions=[
+            {"name": "a", "prediction": {"macd": [1.0, 2.0, 3.0]}},
+        ],
+        task_type="finance_aligned_long_indicator_macd",
+        _ground_truth={"macd": [1.0, 2.0, 4.0]},
+    )
+    assert result["results"][0]["metrics"]["macd_mae"] == 0.333
+    assert "accuracy" not in result["results"][0]["metrics"]
 
 
 @pytest.mark.asyncio

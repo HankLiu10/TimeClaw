@@ -47,6 +47,7 @@ New definition:
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from contextvars import copy_context
 from difflib import SequenceMatcher
 import hashlib
@@ -56,11 +57,12 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, unquote
 
 from loguru import logger
 
 from timeclaw.core import trace_logger as trace
-from timeclaw.core.learning_text import normalize_learning_clause
+from timeclaw.core.learning_text import normalize_learning_clause, sanitize_learning_text
 
 MEMORY_ROOT = Path(".timeclaw/hierarchical_memory")
 NOTES_DIR = MEMORY_ROOT / "notes"
@@ -102,12 +104,69 @@ _TOOL_NAME_ALIASES = {
 # - `global note count`: total number of note blocks across all scopes
 #
 # Distillation cadence:
-# - Notes -> MEMORY: whenever one scope accumulates at least 5 undistilled notes
+# - Notes -> MEMORY: whenever one scope accumulates at least 2 undistilled notes
 # - MEMORY -> SKILLS / TOOLS / cross_domain: rebuild from the latest full MEMORY
 #   view when their source fingerprint changes
-_DISTILL_L1_TO_L2 = 5
+_DISTILL_L1_TO_L2 = 2
 _MEMORY_RULE_CAP = 30
 _L1_RETRIEVAL_K = 5
+
+
+class _ScopeStorageCodec:
+    """Reversible on-disk encoding for arbitrary scope names.
+
+    New definition:
+        `storage scope name` is the filename-safe, reversible encoding of one
+        logical `scope_key`. We use percent-encoding so scope-bound artifacts
+        keep exact identity even when a custom scope contains spaces, slashes,
+        brackets, or other path-sensitive characters.
+    """
+
+    _SAFE = "._-"
+
+    @classmethod
+    def encode(cls, scope: str) -> str:
+        scope_name = str(scope).strip() or "__default__"
+        return quote(scope_name, safe=cls._SAFE)
+
+    @classmethod
+    def decode(cls, storage_name: str) -> str:
+        name = str(storage_name).strip()
+        if not name:
+            return ""
+        return unquote(name)
+
+    @classmethod
+    def path(cls, root: Path, scope: str, suffix: str) -> Path:
+        return root / f"{cls.encode(scope)}{suffix}"
+
+    @classmethod
+    def dir(cls, root: Path, scope: str) -> Path:
+        return root / cls.encode(scope)
+
+    @classmethod
+    def resolve_existing_path(cls, root: Path, scope: str, suffix: str) -> Path:
+        encoded_path = cls.path(root, scope, suffix)
+        if encoded_path.exists():
+            return encoded_path
+        legacy_name = (str(scope).strip() or "__default__")
+        legacy_path = root / f"{legacy_name}{suffix}"
+        if legacy_path.exists():
+            return legacy_path
+        return encoded_path
+
+    @classmethod
+    def iter_scope_paths(cls, root: Path, suffix: str) -> list[tuple[str, Path]]:
+        seen: set[str] = set()
+        items: list[tuple[str, Path]] = []
+        for path in sorted(root.glob(f"*{suffix}")):
+            storage_name = path.name[: -len(suffix)] if suffix else path.name
+            scope = cls.decode(storage_name)
+            if scope in seen:
+                continue
+            seen.add(scope)
+            items.append((scope, path))
+        return items
 
 
 def _task_bucket_from_scope(scope: str) -> str:
@@ -231,18 +290,17 @@ class Notes:
 
     @staticmethod
     def _scope_storage_name(scope: str) -> str:
-        scope_name = str(scope).strip() or "__default__"
-        return re.sub(r"[^A-Za-z0-9_.-]+", "__", scope_name)
+        return _ScopeStorageCodec.encode(scope)
 
     @classmethod
     def _scope_log_path(cls, scope: str) -> Path:
-        return NOTES_DIR / f"{cls._scope_storage_name(scope)}.md"
+        return _ScopeStorageCodec.resolve_existing_path(NOTES_DIR, scope, ".md")
 
     @staticmethod
     def _count_notes_on_disk() -> int:
         total = 0
         for path in NOTES_DIR.glob("*.md"):
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             total += sum(1 for block in text.split("\n### ") if block.strip())
         return total
 
@@ -250,7 +308,7 @@ class Notes:
     def _count_scope_notes_on_disk(cls) -> dict[str, int]:
         counts: dict[str, int] = {}
         for path in NOTES_DIR.glob("*.md"):
-            for item in cls._note_items_from_text(path.name, path.read_text()):
+            for item in cls._note_items_from_text(path.name, path.read_text(encoding="utf-8")):
                 scope = cls._extract_scope_from_note_block(item["text"])
                 if scope:
                     counts[scope] = counts.get(scope, 0) + 1
@@ -264,8 +322,9 @@ class Notes:
     @classmethod
     def _note_items_from_text(cls, file_name: str, text: str) -> list[dict[str, str]]:
         items: list[dict[str, str]] = []
-        for raw in reversed(text.split("\n### ")):
-            note = raw.strip()
+        sanitized_text = sanitize_learning_text(text)
+        for raw in reversed(sanitized_text.split("\n### ")):
+            note = sanitize_learning_text(raw).strip()
             if not note:
                 continue
             items.append({
@@ -374,7 +433,7 @@ class Notes:
         rendered_summary = self._analysis_without_text_signals(pipeline_summary, bool(text_signals))
         if rendered_summary:
             lines.extend(["", "Analysis:", "[ANALYSIS_BEGIN]", rendered_summary, "[ANALYSIS_END]"])
-        return "\n".join(lines)
+        return sanitize_learning_text("\n".join(lines))
 
     @staticmethod
     def _source_lines(ctx: dict[str, Any]) -> list[str]:
@@ -386,6 +445,7 @@ class Notes:
         source_file = str(source.get("source_file", "")).strip()
         sample_idx = source.get("sample_idx")
         task_name = str(source.get("task_name", "")).strip()
+        train_run_id = str(source.get("train_run_id", "")).strip()
         trace_id = str(ctx.get("trace_id") or source.get("trace_id") or "").strip()
 
         lines: list[str] = []
@@ -399,6 +459,8 @@ class Notes:
             lines.append(f"- Sample Index: {sample_idx}")
         if task_name:
             lines.append(f"- Task: {task_name}")
+        if train_run_id:
+            lines.append(f"- Train Run ID: {train_run_id}")
         if trace_id:
             lines.append(f"- Trace ID: {trace_id}")
             lines.append(f"- Trace Path: .timeclaw/traces/{trace_id}.jsonl")
@@ -1049,6 +1111,13 @@ class Notes:
 
     @staticmethod
     def _compact_candidate_reasoning(trace: dict[str, Any]) -> str:
+        """Render note-facing reasoning from execution-only public snippets.
+
+        New definition:
+            Notes may reuse only explicit execution-side public reasoning. They
+            must not reconstruct reasoning from raw step thoughts, because those
+            thoughts can still contain search/control-flow language.
+        """
         if "public_reasoning_snippets" in trace:
             public_snippets = trace.get("public_reasoning_snippets")
             if not isinstance(public_snippets, list):
@@ -1067,30 +1136,6 @@ class Notes:
                     rendered.append(snippet)
                 return " ".join(rendered)
             return ""
-
-        steps = trace.get("steps")
-        if isinstance(steps, list):
-            snippets: list[str] = []
-            for step in steps:
-                if not isinstance(step, dict):
-                    continue
-                raw = str(step.get("thought") or "").strip()
-                if not raw:
-                    continue
-                for part in re.split(r"(?<=[.!?])\s+|[;\n]+", raw):
-                    snippet = Notes._sanitize_candidate_reasoning(part)
-                    if not snippet:
-                        continue
-                    snippet = snippet[0].upper() + snippet[1:] if snippet else snippet
-                    if not snippet.endswith("."):
-                        snippet += "."
-                    snippets.append(snippet)
-                    if len(snippets) >= 2:
-                        break
-                if len(snippets) >= 2:
-                    break
-            if snippets:
-                return " ".join(snippets)
         return ""
 
     @staticmethod
@@ -1286,8 +1331,9 @@ class Notes:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         path = self._scope_log_path(str(scope).strip())
 
-        label = scope or f"{domain}/{task}"
-        entry = f"\n### [{timestamp}] {label} — {correct}\n{note}\n"
+        label = sanitize_learning_text(scope or f"{domain}/{task}")
+        clean_note = sanitize_learning_text(note).strip()
+        entry = sanitize_learning_text(f"\n### [{timestamp}] {label} — {correct}\n{clean_note}\n")
         with path.open("a", encoding="utf-8") as f:
             f.write(entry)
 
@@ -1299,7 +1345,7 @@ class Notes:
         matches: list[dict[str, Any]] = []
         files = sorted(NOTES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in files:
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
             for item in self._note_items_from_text(path.name, text):
                 note = item["text"]
                 parsed = DistillationAgent._parse_note_sections(note)
@@ -1338,7 +1384,7 @@ class Notes:
         for f in files:
             if len(notes) >= n:
                 break
-            for item in self._note_items_from_text(f.name, f.read_text()):
+            for item in self._note_items_from_text(f.name, f.read_text(encoding="utf-8")):
                 notes.append(item)
                 if len(notes) >= n:
                     break
@@ -1349,10 +1395,10 @@ class Notes:
         scope_name = str(scope).strip()
         if not scope_name:
             return []
-        path = NOTES_DIR / f"{scope_name}.md"
+        path = self._scope_log_path(scope_name)
         if not path.exists():
             return []
-        items = self._note_items_from_text(path.name, path.read_text())
+        items = self._note_items_from_text(path.name, path.read_text(encoding="utf-8"))
         items.reverse()
         for idx, item in enumerate(items, start=1):
             item["seq"] = idx
@@ -1448,18 +1494,18 @@ class MemoryStore:
         self._load_existing()
 
     def _load_existing(self) -> None:
-        for f in MEMORY_DIR.glob("*.json"):
+        for scope, f in _ScopeStorageCodec.iter_scope_paths(MEMORY_DIR, ".json"):
             try:
-                raw = json.loads(f.read_text())
+                raw = json.loads(f.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
                     normalized = [
-                        self._normalize_entry(f.stem, entry, idx)
+                        self._normalize_entry(scope, entry, idx)
                         for idx, entry in enumerate(raw)
                     ]
                     normalized = self._dedupe_rule_ids(normalized)
-                    self._entries[f.stem] = normalized
+                    self._entries[scope] = normalized
                     if normalized != raw:
-                        f.write_text(json.dumps(normalized, indent=2, ensure_ascii=False))
+                        f.write_text(json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8")
             except Exception:
                 pass
 
@@ -1500,15 +1546,15 @@ class MemoryStore:
                 existing_ids.add(rule_id)
                 existing_summaries.add(summary)
         self._entries[scope] = existing
-        path = MEMORY_DIR / f"{scope}.json"
-        path.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
+        path = _ScopeStorageCodec.path(MEMORY_DIR, scope, ".json")
+        path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def replace_entries(self, scope: str, entries: list[dict]) -> None:
         normalized = [self._normalize_entry(scope, entry, idx) for idx, entry in enumerate(entries)]
         normalized = self._dedupe_rule_ids(normalized)
         self._entries[scope] = normalized
-        path = MEMORY_DIR / f"{scope}.json"
-        path.write_text(json.dumps(normalized, indent=2, ensure_ascii=False))
+        path = _ScopeStorageCodec.path(MEMORY_DIR, scope, ".json")
+        path.write_text(json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def get_cross_domain_entries(self, bucket: str = "") -> list[dict]:
         if bucket:
@@ -1927,9 +1973,9 @@ class SkillsStore:
         self._load()
 
     def _load(self) -> None:
-        for f in SKILLS_DIR.glob("*.md"):
+        for scope, f in _ScopeStorageCodec.iter_scope_paths(SKILLS_DIR, ".md"):
             try:
-                self._skills[f.stem] = f.read_text()
+                self._skills[scope] = f.read_text(encoding="utf-8")
             except Exception:
                 pass
 
@@ -1941,14 +1987,14 @@ class SkillsStore:
 
     def update_skill(self, scope: str, content: str) -> None:
         self._skills[scope] = content
-        path = SKILLS_DIR / f"{scope}.md"
-        path.write_text(content)
+        path = _ScopeStorageCodec.path(SKILLS_DIR, scope, ".md")
+        path.write_text(content, encoding="utf-8")
         logger.info(f"[SKILLS] Updated SOP for {scope}")
 
     def delete_skill(self, scope: str) -> None:
         if scope in self._skills:
             del self._skills[scope]
-        path = SKILLS_DIR / f"{scope}.md"
+        path = _ScopeStorageCodec.resolve_existing_path(SKILLS_DIR, scope, ".md")
         if path.exists():
             path.unlink()
         logger.info(f"[SKILLS] Removed SOP for {scope}")
@@ -2341,6 +2387,9 @@ class DistillStateStore:
         payload.setdefault("memory_to_skills_inflight", False)
         payload.setdefault("memory_to_tools_done_fingerprint", "")
         payload.setdefault("memory_to_tools_inflight", False)
+        payload.setdefault("pending_snapshot_notes_from_seq", 0)
+        payload.setdefault("pending_snapshot_notes_to_seq", 0)
+        payload.setdefault("pending_snapshot_memory_fingerprint", "")
         return payload
 
     def update_scope(self, scope: str, **fields: Any) -> dict[str, Any]:
@@ -2477,7 +2526,7 @@ class DistillationAgent:
 
     @staticmethod
     def _scope_history_dir(scope: str) -> Path:
-        path = HISTORY_DIR / str(scope).strip()
+        path = _ScopeStorageCodec.dir(HISTORY_DIR, scope)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -2489,7 +2538,17 @@ class DistillationAgent:
         notes_to_seq: int,
         memory_fingerprint: str,
     ) -> None:
-        """Persist one scope-local MEMORY snapshot after a successful rebuild."""
+        """Persist one scope-local learning snapshot after a successful rebuild.
+
+        New definition:
+            A scope history snapshot should capture the reusable learning state
+            that would matter to future runs of that same scope at that moment,
+            not only the raw MEMORY rules. Therefore each snapshot includes:
+            - scope-local MEMORY entries
+            - scope-local tool notes
+            - scope-local skill text
+            - the current cross-domain rules for the same task bucket
+        """
         scope_name = str(scope).strip()
         if not scope_name:
             return
@@ -2498,6 +2557,19 @@ class DistillationAgent:
         snapshot_seq = int(state.get("memory_history_seq", 0) or 0) + 1
         created_at = time.time()
         entries = self.memory.get_entries(scope_name)
+        tool_notes = self.tools.get_notes(scope_name)
+        skill_content = self.skills.get_skill(scope_name)
+        bucket = _task_bucket_from_scope(scope_name)
+        cross_domain_entries = self.memory.get_cross_domain_entries(bucket) if bucket else []
+        source_notes = [
+            {
+                "seq": int(item.get("seq", 0) or 0),
+                "id": str(item.get("id", "")).strip(),
+                "text": str(item.get("text", "")),
+            }
+            for item in self.notes.get_scope_note_items(scope_name)
+            if notes_from_seq <= int(item.get("seq", 0) or 0) <= notes_to_seq
+        ]
         payload = {
             "scope": scope_name,
             "snapshot_seq": snapshot_seq,
@@ -2506,14 +2578,29 @@ class DistillationAgent:
             "notes_from_seq": int(notes_from_seq),
             "notes_to_seq": int(notes_to_seq),
             "notes_covered_count": max(0, int(notes_to_seq) - int(notes_from_seq) + 1),
+            "source_note_count": len(source_notes),
+            "source_notes": source_notes,
             "memory_fingerprint": str(memory_fingerprint or ""),
             "rule_count": len(entries),
             "entries": entries,
+            "tool_note_count": len(tool_notes),
+            "tool_notes": tool_notes,
+            "has_skill": bool(str(skill_content or "").strip()),
+            "skill_content": str(skill_content or ""),
+            "cross_domain_scope": _cross_domain_scope_for_bucket(bucket) if bucket else "",
+            "cross_domain_rule_count": len(cross_domain_entries),
+            "cross_domain_entries": cross_domain_entries,
+            "state_snapshot": {
+                "notes_total_seq": int(state.get("notes_total_seq", 0) or 0),
+                "notes_to_memory_done_seq": int(state.get("notes_to_memory_done_seq", 0) or 0),
+                "memory_to_skills_done_fingerprint": str(state.get("memory_to_skills_done_fingerprint", "") or ""),
+                "memory_to_tools_done_fingerprint": str(state.get("memory_to_tools_done_fingerprint", "") or ""),
+            },
         }
 
         scope_dir = self._scope_history_dir(scope_name)
         snapshot_path = scope_dir / f"{snapshot_seq:06d}.json"
-        snapshot_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+        snapshot_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
         manifest_path = scope_dir / "manifest.jsonl"
         manifest_row = {
@@ -2525,6 +2612,9 @@ class DistillationAgent:
             "notes_to_seq": int(notes_to_seq),
             "memory_fingerprint": str(memory_fingerprint or ""),
             "rule_count": len(entries),
+            "tool_note_count": len(tool_notes),
+            "has_skill": bool(str(skill_content or "").strip()),
+            "cross_domain_rule_count": len(cross_domain_entries),
             "path": str(snapshot_path.relative_to(MEMORY_ROOT)),
         }
         with manifest_path.open("a", encoding="utf-8") as f:
@@ -2628,16 +2718,13 @@ class DistillationAgent:
                     await self._update_scope_state(scope, notes_to_memory_inflight=False)
                     if success:
                         memory_fp = self._scope_memory_fingerprint(scope)
-                        await self._append_memory_history_snapshot(
-                            scope=scope,
-                            notes_from_seq=int(state.get("notes_to_memory_done_seq", 0) or 0) + 1,
-                            notes_to_seq=target_seq,
-                            memory_fingerprint=memory_fp,
-                        )
                         await self._update_scope_state(
                             scope,
                             notes_to_memory_done_seq=target_seq,
                             memory_fingerprint=memory_fp,
+                            pending_snapshot_notes_from_seq=int(state.get("notes_to_memory_done_seq", 0) or 0) + 1,
+                            pending_snapshot_notes_to_seq=target_seq,
+                            pending_snapshot_memory_fingerprint=memory_fp,
                         )
                         bucket = _task_bucket_from_scope(scope)
                         if bucket:
@@ -2691,6 +2778,35 @@ class DistillationAgent:
                         cleared = True
                     if cleared:
                         progressed = True
+
+                state = await self._get_scope_state(scope)
+                pending_from_seq = int(state.get("pending_snapshot_notes_from_seq", 0) or 0)
+                pending_to_seq = int(state.get("pending_snapshot_notes_to_seq", 0) or 0)
+                pending_snapshot_fp = str(state.get("pending_snapshot_memory_fingerprint", "") or "")
+                if (
+                    pending_to_seq >= pending_from_seq > 0
+                    and pending_snapshot_fp
+                    and pending_snapshot_fp == memory_fp
+                ):
+                    bucket = _task_bucket_from_scope(scope)
+                    if bucket:
+                        self._ensure_bucket_worker(bucket, force=force)
+                        bucket_task = self._bucket_workers.get(bucket)
+                        if bucket_task and not bucket_task.done():
+                            await bucket_task
+                    await self._append_memory_history_snapshot(
+                        scope=scope,
+                        notes_from_seq=pending_from_seq,
+                        notes_to_seq=pending_to_seq,
+                        memory_fingerprint=pending_snapshot_fp,
+                    )
+                    await self._update_scope_state(
+                        scope,
+                        pending_snapshot_notes_from_seq=0,
+                        pending_snapshot_notes_to_seq=0,
+                        pending_snapshot_memory_fingerprint="",
+                    )
+                    progressed = True
 
                 if not progressed:
                     break
@@ -2748,6 +2864,39 @@ class DistillationAgent:
 
     def _note_ref_count(self, refs: list[str]) -> int:
         return len(self._normalize_ref_list(refs))
+
+    def _notes_for_scope(self, scope: str) -> list[dict[str, str]]:
+        """Return scope-local note items in append order without duplicates."""
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return []
+
+        items: list[dict[str, Any]] = []
+        get_recent_items = getattr(self.notes, "get_recent_note_items", None)
+        total_notes = getattr(self.notes, "total", 0)
+        if callable(get_recent_items):
+            try:
+                items = list(get_recent_items(int(total_notes) or 10000))
+            except Exception:
+                items = []
+        if not items:
+            items = list(self.notes.get_scope_note_items(scope_name))
+        if not isinstance(items, list):
+            return []
+
+        scope_marker = f"\nScope:\n{scope_name}\n"
+        deduped: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            note_id = str(item.get("id", "")).strip()
+            text = str(item.get("text", ""))
+            if not note_id or note_id in seen_ids or not text or scope_marker not in text:
+                continue
+            seen_ids.add(note_id)
+            deduped.append({"id": note_id, "text": text})
+        return deduped
 
     def _entry_note_refs(self, entry: dict[str, Any]) -> list[str]:
         return self.memory._entry_note_refs(entry)
@@ -3830,8 +3979,8 @@ class DistillationAgent:
     async def force_distill_all(self) -> None:
         """Force a full rebuild from current notes/memory sources."""
         scopes = set()
-        for f in MEMORY_DIR.glob("*.json"):
-            scopes.add(f.stem)
+        for scope, _path in _ScopeStorageCodec.iter_scope_paths(MEMORY_DIR, ".json"):
+            scopes.add(scope)
         notes = self.notes.get_recent_notes(10000)
         for note in notes:
             scope = self._extract_scope_from_note(note)
@@ -3852,6 +4001,9 @@ class DistillationAgent:
                 memory_to_skills_inflight=False,
                 memory_to_tools_done_fingerprint="",
                 memory_to_tools_inflight=False,
+                pending_snapshot_notes_from_seq=0,
+                pending_snapshot_notes_to_seq=0,
+                pending_snapshot_memory_fingerprint="",
             )
             self._ensure_scope_worker(scope, force=True)
 
@@ -3868,18 +4020,22 @@ class DistillationAgent:
             self._ensure_bucket_worker(bucket, force=True)
         await self.distill_pending_all()
 
-    async def distill_pending_all(self) -> None:
-        """Drain all currently pending distillation work, including short tails."""
-        scopes = set()
-        for f in MEMORY_DIR.glob("*.json"):
-            scopes.add(f.stem)
-        notes = self.notes.get_recent_notes(10000)
-        for note in notes:
-            scope = self._extract_scope_from_note(note)
-            if scope:
-                scopes.add(scope)
+    @staticmethod
+    def _normalize_scope_list(scope_keys: list[str] | None) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw_scope in scope_keys or []:
+            scope = str(raw_scope).strip()
+            if not scope or scope in seen or _is_cross_domain_scope(scope):
+                continue
+            seen.add(scope)
+            ordered.append(scope)
+        return ordered
 
-        scope_list = [scope for scope in scopes if not _is_cross_domain_scope(scope)]
+    async def _distill_pending_scope_list(self, scope_list: list[str]) -> None:
+        if not scope_list:
+            return
+
         bucket_list = sorted({_task_bucket_from_scope(scope) for scope in scope_list})
 
         for scope in scope_list:
@@ -3914,6 +4070,9 @@ class DistillationAgent:
                 if memory_fp != str(state.get("memory_to_tools_done_fingerprint", "") or ""):
                     tails_left = True
                     break
+                if int(state.get("pending_snapshot_notes_to_seq", 0) or 0) > 0:
+                    tails_left = True
+                    break
 
             if tails_left:
                 continue
@@ -3928,6 +4087,26 @@ class DistillationAgent:
                     break
             if not cross_left:
                 break
+
+    async def distill_pending_scopes(self, scope_keys: list[str] | None) -> None:
+        """Drain pending distillation only for the provided non-cross-domain scopes."""
+        scope_list = self._normalize_scope_list(scope_keys)
+        await self._distill_pending_scope_list(scope_list)
+
+    async def distill_pending_all(self) -> None:
+        """Drain all currently pending distillation work, including short tails."""
+        scopes = set()
+        for scope, _path in _ScopeStorageCodec.iter_scope_paths(MEMORY_DIR, ".json"):
+            scopes.add(scope)
+        notes = self.notes.get_recent_notes(10000)
+        for note in notes:
+            scope = self._extract_scope_from_note(note)
+            if scope:
+                scopes.add(scope)
+
+        await self._distill_pending_scope_list(
+            [scope for scope in scopes if not _is_cross_domain_scope(scope)]
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -3947,6 +4126,8 @@ class HierarchicalMemory:
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
+        self._scope_commit_locks: dict[str, asyncio.Lock] = {}
+        self._scope_commit_locks_guard = asyncio.Lock()
         if enabled:
             MEMORY_ROOT.mkdir(parents=True, exist_ok=True)
             self.soul_text = load_soul()
@@ -4019,6 +4200,15 @@ class HierarchicalMemory:
             ordered.append(scope)
         return ordered
 
+    async def _get_scope_commit_lock(self, scope: str) -> asyncio.Lock:
+        scope_name = str(scope).strip()
+        async with self._scope_commit_locks_guard:
+            lock = self._scope_commit_locks.get(scope_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._scope_commit_locks[scope_name] = lock
+            return lock
+
     async def record(self, **run_context) -> None:
         if not self.enabled:
             return
@@ -4026,13 +4216,21 @@ class HierarchicalMemory:
         if not scope_keys:
             return
 
-        committed_scopes: list[str] = []
-        for scope_key in scope_keys:
-            await self.notes.add({**run_context, "scope_key": scope_key})
-            if scope_key:
-                committed_scopes.append(scope_key)
-        if committed_scopes:
-            await self.distiller.on_commit(committed_scopes)
+        commit_locks = [
+            await self._get_scope_commit_lock(scope_key)
+            for scope_key in sorted(scope_keys)
+        ]
+        async with AsyncExitStack() as lock_stack:
+            for lock in commit_locks:
+                await lock_stack.enter_async_context(lock)
+
+            committed_scopes: list[str] = []
+            for scope_key in scope_keys:
+                await self.notes.add({**run_context, "scope_key": scope_key})
+                if scope_key:
+                    committed_scopes.append(scope_key)
+            if committed_scopes:
+                await self.distiller.on_commit(committed_scopes)
 
     def get_memory(
         self, query: str, domain: str = "", task: str = "",
@@ -4103,6 +4301,10 @@ class HierarchicalMemory:
     async def distill_pending(self) -> None:
         if self.enabled and self.distiller:
             await self.distiller.distill_pending_all()
+
+    async def distill_pending_scopes(self, scope_keys: list[str] | None) -> None:
+        if self.enabled and self.distiller:
+            await self.distiller.distill_pending_scopes(scope_keys)
 
     def summary(self) -> dict[str, Any]:
         if not self.enabled:

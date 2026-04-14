@@ -83,9 +83,45 @@ class EvaluateAgainstGTTool(ClawTool):
 
     # ── Metrics per task type ────────────────────────────────────────
 
+    @staticmethod
+    def _canonical_task_type(task_type: Any) -> str:
+        """Map dataset-scoped task ids back to the evaluator's core task family.
+
+        New definition:
+            Training-time validation sometimes passes dataset-qualified task ids
+            such as ``weather_aligned_short_forecast`` or
+            ``finance_aligned_long_indicator_macd``.  Metric selection must be
+            driven by the core task family, not the dataset-qualified wrapper,
+            otherwise continuous-value tasks fall through into label-style
+            exact-match scoring.
+        """
+        text = str(task_type or "").strip().lower()
+        if not text:
+            return ""
+        if text in {
+            "forecast", "indicator", "trend", "classification", "qa", "mcqa", "correlation",
+        }:
+            return text
+        if text.endswith("_forecast"):
+            return "forecast"
+        if "_indicator_" in text or text.endswith("_indicator"):
+            return "indicator"
+        if text.endswith("_trend_past"):
+            return "trend"
+        if text.endswith("_trend") or text.endswith("_classification"):
+            return "classification"
+        if text.endswith("_mcqa"):
+            return "mcqa"
+        if text.endswith("_correlation"):
+            return "correlation"
+        if text.endswith("_qa"):
+            return "qa"
+        return text
+
     def _compute_metrics(
         self, prediction: Any, ground_truth: Any, task_type: str,
     ) -> dict[str, Any]:
+        task_type = self._canonical_task_type(task_type)
         if task_type == "forecast":
             return self._forecast_metrics(prediction, ground_truth)
         if task_type == "indicator":

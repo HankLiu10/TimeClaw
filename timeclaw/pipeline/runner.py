@@ -103,6 +103,7 @@ class PipelineRunner:
             self.memory = HierarchicalMemory(enabled=False)
         else:
             self.memory = HierarchicalMemory(enabled=True)
+        self._touched_memory_scopes: set[str] = set()
 
         self._text_backends = self.router.get_text_backends()
         self._fingerprint_extractor = FingerprintExtractor()
@@ -155,9 +156,17 @@ class PipelineRunner:
         """Gracefully stop MCP servers."""
         if not self._disable_memory:
             try:
-                await self.memory.distill_pending()
+                touched_scopes = sorted(self._touched_memory_scopes)
+                if touched_scopes:
+                    await self.memory.distill_pending_scopes(touched_scopes)
+                else:
+                    await self.memory.distill_pending()
             except Exception as e:
                 logger.warning(f"[Pipeline] Memory distill_pending during shutdown failed: {e}")
+        try:
+            await self.router.shutdown()
+        except Exception as e:
+            logger.warning(f"[Pipeline] Router shutdown failed: {e}")
         if self._mcp_manager and self._mcp_started:
             await self._mcp_manager.shutdown()
             self._mcp_started = False
@@ -309,11 +318,26 @@ class PipelineRunner:
             answer_type = result.get("answer_type", "")
             confidence = result.get("confidence")
             reasoning = result.get("reasoning", "")
+            execution_context = (
+                result.get("execution_context")
+                if isinstance(result.get("execution_context"), dict)
+                else {}
+            )
+            control_context = (
+                result.get("control_context")
+                if isinstance(result.get("control_context"), dict)
+                else {}
+            )
             execution_log = result.get("execution_log", [])
 
             prefetched_learning_analysis: dict[str, list[str]] | None = None
             prefetched_learning_summary_text = ""
             if mode == "train" and answer_type == "learning_summary":
+                if isinstance(raw_answer, dict) and execution_context:
+                    raw_answer = {
+                        **raw_answer,
+                        "execution_context": execution_context,
+                    }
                 raw_answer = self._normalize_learning_summary_answer(
                     raw_answer,
                     execution_log,
@@ -433,7 +457,9 @@ class PipelineRunner:
 
             timeline["deliver"] = {"elapsed_ms": 0}
 
-            evidence_summary = executor.evidence_log.summary()
+            evidence_summary = str(execution_context.get("evidence_summary") or "").strip()
+            if not evidence_summary:
+                evidence_summary = executor.evidence_log.summary()
             result_message = ResultMessage(
                 sender=AgentRole.SYSTEM,
                 prediction=prediction,
@@ -472,6 +498,8 @@ class PipelineRunner:
                 "answer_type": answer_type,
                 "confidence": confidence,
                 "reasoning": reasoning,
+                "execution_context": execution_context,
+                "control_context": control_context,
                 "trace_id": trace_id,
                 "timeline": timeline,
                 "total_ms": total_ms,
@@ -502,6 +530,16 @@ class PipelineRunner:
             total_ms = int((time.time() - t_start) * 1000)
             error_type = type(e).__name__
             failure_reason = "max_steps_exhausted" if isinstance(e, MaxStepsExhaustedError) else error_type
+            partial_result = getattr(e, "partial_result", None)
+            if isinstance(partial_result, dict):
+                setattr(e, "partial_result", partial_result)
+                setattr(e, "execution_log", partial_result.get("execution_log", []))
+                setattr(e, "raw_answer", partial_result.get("answer"))
+                setattr(e, "answer_type", partial_result.get("answer_type", ""))
+                setattr(e, "confidence", partial_result.get("confidence"))
+                setattr(e, "reasoning", partial_result.get("reasoning", ""))
+                setattr(e, "execution_context", partial_result.get("execution_context", {}))
+                setattr(e, "control_context", partial_result.get("control_context", {}))
             trace.end_run("failed", {
                 "trace_id": trace_id,
                 "total_ms": total_ms,
@@ -786,12 +824,13 @@ class PipelineRunner:
             best_metrics,
         )
         winner_tool_chain = list(winner_trace.get("tool_chain") or []) if winner_trace else self._select_winner_tool_chain(candidate_traces, best_metrics)
-        fallback_summary = analysis or reasoning or str(raw_answer)[:3000]
+        fallback_summary = analysis or self._execution_side_learning_summary_fallback(raw_answer)
         structured_analysis = prefetched_analysis_structured
         summary = str(prefetched_pipeline_summary or "").strip()
         if structured_analysis is None:
             structured_analysis, summary = await generate_learning_analysis(
                 scope_key=(scope_keys[0] if scope_keys else f"{domain}_{task_type}"),
+                scope_keys=scope_keys,
                 task_type=task_type,
                 domain=domain,
                 task_description=description,
@@ -836,6 +875,9 @@ class PipelineRunner:
             candidate_traces=candidate_traces,
             analysis_structured=structured_analysis,
             source_metadata=source_metadata or {},
+        )
+        self._touched_memory_scopes.update(
+            scope_keys or [f"{domain}_{task_type}"]
         )
 
     @staticmethod
@@ -993,7 +1035,11 @@ class PipelineRunner:
                             "tool_chain": tool_chain,
                             "prediction": prediction,
                             "reasoning": str(result.get("reasoning") or "").strip(),
-                            "reasoning_source": "final_reasoning" if str(result.get("reasoning") or "").strip() else "",
+                            "reasoning_source": (
+                                "execution_context"
+                                if PipelineRunner._execution_context_public_reasoning(result) is not None
+                                else ("final_reasoning" if str(result.get("reasoning") or "").strip() else "")
+                            ),
                             "steps": segment_steps,
                             "entry_index": entry_idx,
                             "_match_keys": PipelineRunner._candidate_trace_match_keys(
@@ -1006,7 +1052,12 @@ class PipelineRunner:
                                 raw_name=raw_name,
                             ),
                         }
-                        trace_payload["public_reasoning_snippets"] = PipelineRunner._public_reasoning_snippets(trace_payload)
+                        explicit_public_reasoning = PipelineRunner._execution_context_public_reasoning(result)
+                        trace_payload["public_reasoning_snippets"] = (
+                            explicit_public_reasoning
+                            if explicit_public_reasoning is not None
+                            else PipelineRunner._public_reasoning_snippets(trace_payload)
+                        )
                         traces.append(trace_payload)
                 continue
             if tool_name in {"evaluate_batch_against_gt", "batch_evaluate_against_gt"}:
@@ -1240,18 +1291,33 @@ class PipelineRunner:
         segments: list[list[dict[str, str]]] = []
         current: list[dict[str, str]] = []
         current_has_answer = False
-        for step in steps:
+        current_has_followup_after_answer = False
+        total = len(steps)
+        for idx, step in enumerate(steps):
             if not isinstance(step, dict):
                 continue
             observation = PipelineRunner._parse_json_like_payload(step.get("observation"))
             produces_answer = PipelineRunner._prediction_from_observation(observation) is not None
-            if produces_answer and current and current_has_answer:
+            has_future_substantive_step = any(
+                isinstance(future_step, dict)
+                for future_step in steps[idx + 1:total]
+            )
+            if (
+                produces_answer
+                and current
+                and current_has_answer
+                and (current_has_followup_after_answer or has_future_substantive_step)
+            ):
                 segments.append(current)
                 current = []
                 current_has_answer = False
+                current_has_followup_after_answer = False
             current.append(step)
             if produces_answer:
                 current_has_answer = True
+                current_has_followup_after_answer = False
+            elif current_has_answer:
+                current_has_followup_after_answer = True
         if current:
             segments.append(current)
         return segments
@@ -1629,6 +1695,63 @@ class PipelineRunner:
             snippets.append(cleaned)
         return snippets
 
+    @staticmethod
+    def _execution_context_public_reasoning(result: dict[str, Any]) -> list[str] | None:
+        execution_context = result.get("execution_context")
+        if not isinstance(execution_context, dict):
+            return None
+        if "public_reasoning" not in execution_context:
+            return None
+        items = execution_context.get("public_reasoning")
+        if not isinstance(items, list):
+            return []
+        cleaned_items: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            cleaned = Notes._sanitize_candidate_reasoning(str(item))
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            cleaned_items.append(cleaned)
+        return cleaned_items
+
+    @staticmethod
+    def _execution_side_learning_summary_fallback(
+        raw_answer: Any,
+        execution_context: dict[str, Any] | None = None,
+    ) -> str:
+        """Build learning-analysis fallback text from execution-side fields only.
+
+        New definition:
+            Fallback text sent into learning analysis must come from reusable
+            execution evidence (`insight`, `recommendation`,
+            `execution_context.public_reasoning`, `execution_context.evidence_summary`)
+            rather than search/control-flow-heavy final reasoning text.
+        """
+        parts: list[str] = []
+        if isinstance(raw_answer, dict):
+            for key in ("insight", "recommendation"):
+                value = raw_answer.get(key)
+                if isinstance(value, str) and value.strip():
+                    parts.append(value.strip())
+        context = execution_context if isinstance(execution_context, dict) else {}
+        public_reasoning = context.get("public_reasoning")
+        if isinstance(public_reasoning, list):
+            joined_public = "\n".join(
+                str(item).strip()
+                for item in public_reasoning
+                if str(item).strip()
+            ).strip()
+            if joined_public:
+                parts.append(joined_public)
+        evidence_summary = str(context.get("evidence_summary") or "").strip()
+        if evidence_summary:
+            parts.append(evidence_summary)
+        return "\n".join(parts).strip()[:3000]
+
     @classmethod
     def _reasoning_snippets(cls, trace: dict[str, Any]) -> list[str]:
         raw_items: list[str] = []
@@ -1659,6 +1782,22 @@ class PipelineRunner:
     @classmethod
     def _compact_candidate_reasoning(cls, trace: dict[str, Any], limit: int = 2) -> str:
         snippets: list[str] = []
+        public_snippets = trace.get("public_reasoning_snippets")
+        if isinstance(public_snippets, list):
+            for snippet in public_snippets:
+                snippet = str(snippet).strip()
+                if not snippet:
+                    continue
+                if len(snippet) > 160:
+                    snippet = snippet[:160].rstrip(" ,;:") + "..."
+                snippet = snippet[0].upper() + snippet[1:] if snippet else snippet
+                if not snippet.endswith("."):
+                    snippet += "."
+                snippets.append(snippet)
+                if len(snippets) >= limit:
+                    break
+            if snippets:
+                return " ".join(snippets)
         for snippet in cls._reasoning_snippets(trace):
             if len(snippet) > 160:
                 snippet = snippet[:160].rstrip(" ,;:") + "..."
@@ -1843,6 +1982,11 @@ class PipelineRunner:
         execution_log: list[dict[str, Any]],
     ) -> dict[str, Any]:
         base = dict(raw_answer) if isinstance(raw_answer, dict) else {}
+        execution_context = (
+            base.get("execution_context")
+            if isinstance(base.get("execution_context"), dict)
+            else {}
+        )
         insight = base.get("insight", "")
         recommendation = base.get("recommendation", "")
         if not isinstance(insight, str):
@@ -1881,8 +2025,15 @@ class PipelineRunner:
             "winner_prediction": None,
             "winner_tool_chain": [],
             "winner_metrics": {},
+            "execution_context": execution_context,
             "compared_candidates": compared_candidates,
         }
+        if not normalized["winner_tool_chain"]:
+            normalized["winner_tool_chain"] = [
+                str(tool).strip()
+                for tool in execution_context.get("tool_chain") or []
+                if str(tool).strip()
+            ]
         if winner_trace:
             normalized["winner_candidate"] = str(
                 winner_trace.get("name")
@@ -1961,14 +2112,14 @@ class PipelineRunner:
         if not winner_trace:
             return raw_answer, None, ""
 
-        fallback_summary = "\n".join(
-            text for text in (
-                str(raw_answer.get("insight") or "").strip(),
-                str(raw_answer.get("recommendation") or "").strip(),
-                str(reasoning or "").strip(),
-            )
-            if text
-        ).strip()[:3000]
+        fallback_summary = self._execution_side_learning_summary_fallback(
+            raw_answer,
+            execution_context=(
+                raw_answer.get("execution_context")
+                if isinstance(raw_answer.get("execution_context"), dict)
+                else None
+            ),
+        )
         sample_stats = self._build_sample_stats(fingerprint, profiling_results, horizon)
         winner_correct = (
             self._learning_outcome_correctness(dict(winner_trace.get("metrics") or {}))
@@ -1977,6 +2128,7 @@ class PipelineRunner:
         )
         structured_analysis, analysis_text = await generate_learning_analysis(
             scope_key=(scope_keys[0] if scope_keys else f"{domain}_{task_type}"),
+            scope_keys=scope_keys,
             task_type=task_type,
             domain=domain,
             task_description=description,
@@ -2060,7 +2212,20 @@ class PipelineRunner:
             return None
 
         winner_candidate = str(raw_answer.get("winner_candidate") or "").strip().lower()
-        winner_tool_chain = [str(tool).strip() for tool in raw_answer.get("winner_tool_chain") or [] if str(tool).strip()]
+        execution_context = (
+            raw_answer.get("execution_context")
+            if isinstance(raw_answer.get("execution_context"), dict)
+            else {}
+        )
+        winner_tool_chain = [
+            str(tool).strip()
+            for tool in (
+                raw_answer.get("winner_tool_chain")
+                or execution_context.get("tool_chain")
+                or []
+            )
+            if str(tool).strip()
+        ]
         winner_prediction = raw_answer.get("winner_prediction")
 
         name_matches: list[dict[str, Any]] = []
@@ -2183,7 +2348,14 @@ class PipelineRunner:
 
         explicit_chain = [
             str(tool).strip()
-            for tool in raw_answer.get("winner_tool_chain") or []
+            for tool in (
+                raw_answer.get("winner_tool_chain")
+                or (
+                    raw_answer.get("execution_context", {}).get("tool_chain")
+                    if isinstance(raw_answer.get("execution_context"), dict)
+                    else []
+                )
+            )
             if str(tool).strip()
         ]
         winner_chain = [

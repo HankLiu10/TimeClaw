@@ -7,6 +7,7 @@ holds shared helpers so ``pipeline_eval`` / ``train_loop`` / ``runner`` stay thi
 from timeclaw.benchmark.mtbench_support.learning_analysis import (
     generate_learning_analysis,
     render_learning_analysis_text,
+    render_learning_summary_from_analysis,
 )
 from timeclaw.benchmark.mtbench_support.sample_selection import (
     load_sample_indices,
@@ -25,6 +26,7 @@ __all__ = [
     "generate_learning_analysis",
     "load_sample_indices",
     "render_learning_analysis_text",
+    "render_learning_summary_from_analysis",
     "scope_keys_for_dataset_task",
     "select_samples_by_index",
     "select_samples_with_original_indices",

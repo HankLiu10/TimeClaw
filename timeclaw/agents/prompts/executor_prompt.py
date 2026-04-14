@@ -139,6 +139,25 @@ def build_tool_name_text(tool_names: list[str]) -> str:
             return f"{label}: {param_desc.rstrip('.')}"
         return label
 
+    def _fmt_input_contract(tool: ClawTool) -> str:
+        contract = tool.input_contract()
+        if not isinstance(contract, dict) or not contract:
+            return ""
+        parts: list[str] = []
+        artifact_types = [
+            str(item).strip()
+            for item in (contract.get("artifact_types") or [])
+            if str(item).strip()
+        ]
+        if artifact_types:
+            parts.append("artifact=" + "/".join(artifact_types))
+        min_series_channels = contract.get("min_series_channels")
+        if min_series_channels is not None:
+            parts.append(f"min_series_channels={int(min_series_channels)}")
+        if not parts:
+            return ""
+        return "Current-state preconditions: " + "; ".join(parts) + "."
+
     lines: list[str] = []
     for tool_name in tool_names:
         if tool_name in runtime_only_tools:
@@ -174,12 +193,15 @@ def build_tool_name_text(tool_names: list[str]) -> str:
                     required_args.append(_fmt_param(name, spec, required=True))
                 else:
                     optional_args.append(_fmt_param(name, spec, required=False))
+            contract_text = _fmt_input_contract(tool)
 
         arg_parts: list[str] = []
         if required_args:
             arg_parts.append("Required args: " + "; ".join(required_args))
         if optional_args:
             arg_parts.append("Optional args: " + "; ".join(optional_args))
+        if tool_name not in runtime_only_tools and contract_text:
+            arg_parts.append(contract_text)
         if not arg_parts:
             arg_parts.append("Args: none.")
         lines.append(f"- {tool_name}: {description} {' '.join(arg_parts)}")
@@ -212,9 +234,10 @@ Each turn, you see the results of all previous steps. You then decide:
 6. If you choose a tool call in this turn, stop after that tool-call JSON. Do NOT
    also assume the tool's output or append a final answer in the same turn.
 7. For task-typed final answers, do NOT invent new task content in the final step.
-   You may only finish by selecting or re-wrapping a task-valid answer that was
-   already produced by a real tool in this branch. If no tool has produced such
-   an answer yet, call another tool.
+   You may only finish by returning the exact task answer that was already
+   produced by a real tool in this branch. Do not describe packaging, JSON
+   repair, or payload wrapping. If no tool has produced such an answer yet,
+   call another tool.
 
 ## Output Format (strict JSON)
 
@@ -239,7 +262,8 @@ To call a tool:
   "tool": "tool_name",
   "args": {{"key": "value"}}
 }}
-Tool-call JSON must not include `answer`, `answer_type`, `confidence`, or `reasoning`.
+Tool-call JSON must not include `answer`, `answer_type`, `confidence`, `reasoning`,
+`execution_context`, or `control_context`.
 
 When done — you MUST include `answer` with the final result:
 {{
@@ -248,9 +272,20 @@ When done — you MUST include `answer` with the final result:
   "answer": "<the final result — array for forecast, dict for indicator, label for classification, text for QA>",
   "answer_type": "forecast | indicator | classification | qa | correlation",
   "confidence": 0.85,
-  "reasoning": "numbered step-by-step explanation focused on substantive analysis. If you directly used analysis tools yourself, include one numbered item per substantive analysis tool in order. If your top-level work was only orchestration (for example spawning candidates and comparing them), do NOT describe orchestration-only tools such as spawn_subagent or evaluate_* as steps; instead explain the candidate approaches considered, the decisive evidence, and why the winner was selected."
+  "reasoning": "numbered step-by-step explanation focused on substantive analysis. Write it as a numbered expansion of the same execution-side evidence you put in `execution_context.public_reasoning`, and reuse the same literal tool/path names there. If you directly used analysis tools yourself, include one numbered item per substantive analysis tool in order. If your top-level work was only orchestration (for example spawning candidates and comparing them), do NOT describe orchestration-only tools such as spawn_subagent or evaluate_* as steps; instead explain the candidate approaches considered, the decisive evidence, and why the winner was selected.",
+  "execution_context": {{
+    "tool_chain": ["the substantive tool chain that produced this answer"],
+    "public_reasoning": ["1-3 short reusable evidence sentences grounded in actual tool outputs or data properties"],
+    "evidence_summary": "one concise execution-side evidence summary"
+  }},
+  "control_context": {{
+    "completion_notes": "orchestration / completion notes reserved for controller or trace use; use an empty string if none"
+  }}
 }}
 Final-answer JSON must not include `tool` or `args`.
+`execution_context` is for reusable task evidence only. Do NOT put branch control,
+completion mechanics, packaging, or prompt-contract language inside it.
+`control_context` is the only place where orchestration/completion mechanics may appear.
 
 IMPORTANT: `done: true` without `answer` is INVALID. You must always provide a
 concrete answer when you intentionally finish.
@@ -271,6 +306,7 @@ REACT_FIRST_TURN = """\
 
 {task_boundary_section}\
 {execution_context_section}\
+{control_context_section}\
 {output_contract_section}\
 ## Observation
 ### Sample Fingerprint
@@ -326,6 +362,7 @@ def build_visible_tool_guidance(
             "- When you spawn branches, build them from the provided candidate slots / post-dropout visible tool subsets.\n"
             "- For each spawned branch, choose a `slot_id` whose `visible_tools` fully cover every tool named in that branch's `tools_hint`.\n"
             "- Do not assign a branch to a slot if even one hinted tool is missing from that slot's `visible_tools`.\n"
+            "- If a preferred family anchor is not visible in the chosen slot, keep `tools_hint` slot-local and put that explicit anchor in `branch_metadata.anchor`.\n"
             "- Different branches should use different slot tool subsets or path suggestions, not the same path repeated.\n"
             "- Each branch should be a short candidate path, not a full plan.\n"
         )

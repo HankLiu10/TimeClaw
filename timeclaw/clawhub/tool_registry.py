@@ -11,6 +11,9 @@ from loguru import logger
 from timeclaw.clawhub.tool_base import ClawTool, ToolCategory
 
 _TOOL_INSTANCES: dict[str, ClawTool] = {}
+_HIDDEN_TOOL_MODULES: dict[str, set[str]] = {
+    "prediction": {"checkpoint", "ensemble"},
+}
 
 
 def register_tool_instance(tool: ClawTool) -> None:
@@ -44,6 +47,11 @@ def get_function_schemas_by_category(category: ToolCategory | str) -> list[dict[
     return [t.to_function_schema() for t in list_tool_instances(category)]
 
 
+def should_expose_tool_module(category: str, modname: str) -> bool:
+    """Return whether a clawhub tool module should be exposed to agents."""
+    return modname not in _HIDDEN_TOOL_MODULES.get(category, set())
+
+
 def discover_and_register() -> int:
     """Auto-discover all tool modules under clawhub sub-packages and register them."""
     import timeclaw.clawhub as clawhub_pkg
@@ -66,9 +74,7 @@ def discover_and_register() -> int:
             for _importer, modname, _ispkg in pkgutil.iter_modules(pkg.__path__):
                 if modname.startswith("_"):
                     continue
-                # Unsupported prediction helpers: keep modules on disk for reference,
-                # but do not expose them to the agent or test suite as usable tools.
-                if sub_pkg == "prediction" and modname in {"checkpoint", "ensemble"}:
+                if not should_expose_tool_module(sub_pkg, modname):
                     continue
                 try:
                     mod = importlib.import_module(f"timeclaw.clawhub.{sub_pkg}.{modname}")

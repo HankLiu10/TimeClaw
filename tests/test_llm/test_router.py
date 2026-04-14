@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
+import pytest
+
 from timeclaw.core.config import LLMConfig, LLMModelConfig
 from timeclaw.llm.router import ModelRouter
 
@@ -69,3 +73,18 @@ class TestModelRouter:
         b_analyzer = router.get_backend("analyzer")
         assert b_manager.default_model == "model-a"
         assert b_analyzer.default_model == "model-b"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_closes_cached_backends(self):
+        router = ModelRouter()
+        backend_a = AsyncMock()
+        backend_b = AsyncMock()
+        router._backends = {
+            "manager": backend_a,
+            "executor": backend_b,
+        }
+
+        await router.shutdown()
+
+        backend_a.shutdown.assert_awaited_once()
+        backend_b.shutdown.assert_awaited_once()

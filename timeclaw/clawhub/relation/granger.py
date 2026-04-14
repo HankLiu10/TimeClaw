@@ -51,6 +51,12 @@ class GrangerCausalityTool(ClawTool):
     }
     is_stub: bool = False
 
+    def input_contract(self) -> dict[str, Any]:
+        return {
+            "artifact_types": ["series"],
+            "min_series_channels": 2,
+        }
+
     async def _run(self, ts_data: Any, **params: Any) -> Any:
         data = _to_2d(ts_data)
         if data.shape[1] < 2:
