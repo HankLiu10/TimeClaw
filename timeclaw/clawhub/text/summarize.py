@@ -84,7 +84,11 @@ class SummarizeTool(ClawTool):
                 f"Summarize the following text in at most {max_sentences} sentences. "
                 f"Return JSON with key 'summary'.\n\nText: {text[:3000]}"
             )
-            resp = await llm.complete([{"role": "user", "content": prompt}], response_format="json")
+            resp = await llm.complete(
+                [{"role": "user", "content": prompt}],
+                response_format="json",
+                reasoning_effort="none",
+            )
             if resp.parsed and "summary" in resp.parsed:
                 return {"summary": resp.parsed["summary"], "method": "llm", "n_sentences": max_sentences}
         except Exception:

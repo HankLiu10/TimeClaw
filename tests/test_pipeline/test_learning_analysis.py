@@ -206,7 +206,7 @@ def test_daily_note_display_candidate_name_combines_mismatched_name_and_tool():
         0,
     )
 
-    assert name == "timesfm2_forecast → llm_reasoning_forecast"
+    assert name == "llm_reasoning_forecast"
 
 
 def test_daily_note_omits_weakness_for_perfect_accuracy_candidate():
@@ -832,7 +832,7 @@ def test_extract_candidate_traces_from_top_level_execution_log():
     )
 
     assert len(traces) == 1
-    assert traces[0]["name"] == "chronos2_forecast"
+    assert traces[0]["name"] == "chronos2_forecast -> llm_reasoning_forecast"
     assert traces[0]["tool_chain"] == ["chronos2_forecast", "llm_reasoning_forecast"]
     assert traces[0]["prediction"] == [2.0, 3.0, 4.0]
     assert traces[0]["metrics"] == {"mae": 0.5, "rmse": 0.7}
@@ -1071,7 +1071,7 @@ def test_extract_candidate_traces_uses_primary_tool_name():
             }
         ]
     )
-    assert traces[0]["name"] == "llm_reasoning_forecast"
+    assert traces[0]["name"] == "llm_reasoning_forecast -> bound_check -> consistency_check"
 
 
 def test_extract_candidate_traces_synthesizes_step_from_tools_hint():
@@ -1200,7 +1200,7 @@ def test_daily_note_formats_scored_candidates_and_input_signals():
     assert "Flash Flood near station." in note
     assert "Cold front arrived overnight." in note
     assert "chronos2_forecast(mae=1.230, rmse=2.340)" in note
-    assert "  Reasoning: Seasonality is present." in note
+    assert "  Reasoning:" not in note
     assert "Observation:" not in note
     assert "Generation Steps:" not in note
     assert "  Prediction:" not in note
@@ -1249,12 +1249,12 @@ def test_daily_note_splits_generation_and_validation_tools():
 
     assert "Winner Tools:\n- ets_forecast\n- consistency_check" in note
     assert "  Tools: ets_forecast | Validation: consistency_check" in note
-    assert "  Reasoning: Ets_forecast produced a stable upper bound candidate." in note
+    assert "  Reasoning:" not in note
     assert "Generation Steps:" not in note
     assert "Validation Steps:" not in note
 
 
-def test_daily_note_uses_public_candidate_reasoning_without_truncation():
+def test_daily_note_uses_analysis_candidate_evidence_without_truncation():
     long_reason = (
         "Inspecting the most recent post-event regime matters here because the late-sample drift is "
         "the strongest signal in this case and using only a global summary would miss the regime break"
@@ -1263,12 +1263,19 @@ def test_daily_note_uses_public_candidate_reasoning_without_truncation():
         Notes.__new__(Notes),
         {
             "scope_key": "finance_aligned_long_forecast",
+            "analysis_structured": {
+                "candidate_evidence": [
+                    {
+                        "path": "slice -> arima_forecast",
+                        "evidence": [long_reason],
+                    }
+                ]
+            },
             "candidate_traces": [
                 {
                     "name": "slice_path",
                     "tool_chain": ["slice", "arima_forecast"],
                     "metrics": {"mae": 1.0, "rmse": 1.2},
-                    "public_reasoning_snippets": [long_reason],
                     "steps": [
                         {
                             "tool": "slice",
@@ -1285,7 +1292,7 @@ def test_daily_note_uses_public_candidate_reasoning_without_truncation():
     assert "would miss the regime break." in note
 
 
-def test_daily_note_does_not_recover_reasoning_from_raw_steps_without_public_snippets():
+def test_daily_note_omits_candidate_reasoning_without_analysis_candidate_evidence():
     note = Notes._build_note(  # type: ignore[misc]
         Notes.__new__(Notes),
         {
@@ -1312,6 +1319,33 @@ def test_daily_note_does_not_recover_reasoning_from_raw_steps_without_public_sni
     assert "Reasoning:" not in note
 
 
+def test_daily_note_ignores_public_reasoning_when_analysis_candidate_evidence_missing():
+    note = Notes._build_note(  # type: ignore[misc]
+        Notes.__new__(Notes),
+        {
+            "scope_key": "finance_aligned_long_forecast",
+            "candidate_traces": [
+                {
+                    "name": "slice_path",
+                    "tool_chain": ["slice", "arima_forecast"],
+                    "metrics": {"mae": 1.0, "rmse": 1.2},
+                    "public_reasoning_snippets": [
+                        "This path stayed close to the late-sample regime break.",
+                    ],
+                    "steps": [
+                        {
+                            "tool": "slice",
+                            "observation": {"window": [1, 2, 3]},
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert "Reasoning:" not in note
+
+
 def test_notes_compact_candidate_reasoning_respects_explicit_empty_public_snippets():
     trace = {
         "public_reasoning_snippets": [],
@@ -1326,12 +1360,13 @@ def test_notes_compact_candidate_reasoning_respects_explicit_empty_public_snippe
     assert Notes._compact_candidate_reasoning(trace) == ""
 
 
-def test_learning_analysis_candidate_prompt_uses_public_reasoning_not_raw_thought():
+def test_learning_analysis_candidate_prompt_uses_real_steps_not_public_reasoning():
     prompt = learning_analysis_mod._candidate_prompt_block(
         [
             {
                 "name": "llm_reasoning_qa",
                 "tool_chain": ["llm_reasoning_qa"],
+                "prediction": "C",
                 "public_reasoning_snippets": [
                     "llm_reasoning_qa matched the timing mismatch in option C",
                 ],
@@ -1346,9 +1381,47 @@ def test_learning_analysis_candidate_prompt_uses_public_reasoning_not_raw_though
         ]
     )
 
-    assert "Execution evidence: llm_reasoning_qa matched the timing mismatch in option C" in prompt
+    assert "Prediction: C" in prompt
+    assert "Execution evidence:" not in prompt
+    assert 'tool=llm_reasoning_qa; observation={"answer": "C"}' in prompt
     assert "thought=" not in prompt
     assert "next step" not in prompt
+
+
+def test_learning_analysis_normalizes_candidate_evidence_by_canonical_path():
+    payload = learning_analysis_mod._normalize_analysis_payload(
+        {
+            "text_signals": [],
+            "sample_conditions": ["short horizon"],
+            "winner_evidence": ["llm_reasoning_qa matched the task framing"],
+            "failure_signals": [],
+            "reusable_rule": ["When the article and options align, prefer direct QA."],
+            "candidate_evidence": [
+                {
+                    "path": "slot_0 :: llm_reasoning_qa",
+                    "evidence": [
+                        "The real tool output for this branch was the option label C.",
+                        "llm_reasoning_qa matched the timing mismatch in option C.",
+                    ],
+                }
+            ],
+        },
+        [
+            {
+                "name": "llm_reasoning_qa",
+                "candidate_key": "top_level::0 :: llm_reasoning_qa",
+                "tool_chain": ["llm_reasoning_qa"],
+            }
+        ],
+    )
+
+    assert payload is not None
+    assert payload["candidate_evidence"] == [
+        {
+            "path": "llm_reasoning_qa",
+            "evidence": ["llm_reasoning_qa matched the timing mismatch in option C"],
+        }
+    ]
 
 
 def test_text_signals_rank_sentences_by_task_relevance():
@@ -2141,3 +2214,44 @@ async def test_run_rejects_non_numeric_forecast_payload(monkeypatch):
     )
 
     assert result["gate_accepted"] is False
+
+
+def test_extract_candidate_traces_matches_indicator_batch_metrics_after_task_canonicalization():
+    traces = PipelineRunner._extract_candidate_traces(
+        [
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": [101.5, 102.0],
+                            "execution_log": [
+                                {
+                                    "tool": "compute_bollinger",
+                                    "observation": {"forecast": [101.5, 102.0]},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                "tool": "evaluate_batch_against_gt",
+                "observation": {
+                    "results": [
+                        {
+                            "name": "compute_bollinger",
+                            "prediction": [101.5, 102.0],
+                            "metrics": {"upper_bb_mae": 0.2},
+                        }
+                    ]
+                },
+            },
+        ],
+        task_type="indicator",
+        indicator_output_keys=["upper_bb"],
+    )
+
+    assert traces[0]["prediction"] == {"upper_bb": [101.5, 102.0]}
+    assert traces[0]["metrics"] == {"upper_bb_mae": 0.2}

@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -119,6 +120,29 @@ def test_update_scope_counts_and_tool_prompt_respect_canonical_scope(tmp_path, m
     assert "finance_indicator" not in json.dumps(tool_notes)
 
 
+def test_tool_prompt_for_scope_does_not_drop_notes_after_fixed_top_k(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hm, "SOUL_FILE", tmp_path / "missing_SOUL.md")
+
+    memory = hm.HierarchicalMemory(enabled=True)
+    scope = "weather_aligned_long_trend"
+    tool_names = [f"tool_{idx:02d}" for idx in range(20)]
+    memory.tools.update(
+        scope,
+        {tool_name: f"note for {tool_name}" for tool_name in tool_names},
+    )
+    memory.tools.record_scope_usage(
+        scope,
+        {tool_name: len(tool_names) - idx for idx, tool_name in enumerate(tool_names)},
+    )
+
+    tool_notes = memory.get_tool_notes(scope_keys=[scope])
+
+    assert list(tool_notes.keys()) == tool_names
+    for tool_name in tool_names:
+        assert f"note for {tool_name}" in tool_notes[tool_name]
+
+
 def test_daily_note_filters_framework_tools_from_visible_tool_chain():
     note = hm.Notes()._build_note(
         {
@@ -235,6 +259,9 @@ def test_daily_note_includes_candidate_summary_and_sample_stats():
                     "name": "chronos2_forecast",
                     "metrics": {"mae": 1.0},
                     "tool_chain": ["chronos2_forecast"],
+                    "public_reasoning_snippets": [
+                        "daily cycle is stable"
+                    ],
                     "steps": [
                         {
                             "tool": "chronos2_forecast",
@@ -385,24 +412,41 @@ async def test_force_distill_all_discovers_canonical_scope_headers(tmp_path, mon
     seen_memory_scopes = []
     seen_skill_scopes = []
 
-    async def fake_notes_to_memory(scope: str) -> bool:
+    async def fake_notes_to_memory(scope: str, *, target_seq: int | None = None, force: bool = False) -> bool:
+        assert isinstance(target_seq, (int, type(None)))
+        assert isinstance(force, bool)
         seen_memory_scopes.append(scope)
-        return False
+        memory.memory.replace_entries(
+            scope,
+            [
+                {
+                    "rule_id": f"{scope}::001",
+                    "kind": "domain_heuristic",
+                    "summary": f"Use {scope} heuristic.",
+                    "conditions": [],
+                    "preferred_tools": [],
+                    "avoid_tools": [],
+                    "rationale": "",
+                    "evidence": {"sample_refs": []},
+                }
+            ],
+        )
+        return True
 
     async def fake_memory_to_skills(scope: str) -> bool:
         seen_skill_scopes.append(scope)
-        return False
+        return True
 
     async def fake_memory_to_cross_domain(bucket: str) -> bool:
-        return False
+        return True
 
-    async def fake_notes_to_tools(scope: str) -> bool:
-        return False
+    async def fake_memory_to_tools(scope: str) -> bool:
+        return True
 
     monkeypatch.setattr(memory.distiller, "maybe_distill_notes_to_memory", fake_notes_to_memory)
     monkeypatch.setattr(memory.distiller, "maybe_distill_memory_to_skills", fake_memory_to_skills)
     monkeypatch.setattr(memory.distiller, "maybe_distill_memory_to_cross_domain", fake_memory_to_cross_domain)
-    monkeypatch.setattr(memory.distiller, "maybe_distill_notes_to_tools", fake_notes_to_tools)
+    monkeypatch.setattr(memory.distiller, "maybe_distill_memory_to_tools", fake_memory_to_tools)
 
     await memory.distiller.force_distill_all()
 
@@ -412,3 +456,43 @@ async def test_force_distill_all_discovers_canonical_scope_headers(tmp_path, mon
         "finance_aligned_long_indicator_upper_bb",
     }
     assert set(seen_skill_scopes) == set(seen_memory_scopes)
+
+
+@pytest.mark.asyncio
+async def test_force_distill_all_finishes_when_notes_to_memory_succeeds_with_empty_memory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(hm, "SOUL_FILE", tmp_path / "missing_SOUL.md")
+
+    memory = hm.HierarchicalMemory(enabled=True)
+
+    await memory.record(
+        domain="weather",
+        task="forecast",
+        scope_keys=["weather_aligned_short_forecast"],
+        description="forecast sample",
+        predicted="[1,2,3]",
+        ground_truth="[1,2,3]",
+        correct=True,
+        tool_chain=["seasonal_baseline"],
+    )
+
+    async def fake_notes_to_memory(scope: str, *, target_seq: int | None = None, force: bool = False) -> bool:
+        assert scope == "weather_aligned_short_forecast"
+        memory.memory.replace_entries(scope, [])
+        return True
+
+    async def fake_memory_to_skills(scope: str) -> bool:
+        return True
+
+    async def fake_memory_to_cross_domain(bucket: str) -> bool:
+        return True
+
+    async def fake_memory_to_tools(scope: str) -> bool:
+        return True
+
+    monkeypatch.setattr(memory.distiller, "maybe_distill_notes_to_memory", fake_notes_to_memory)
+    monkeypatch.setattr(memory.distiller, "maybe_distill_memory_to_skills", fake_memory_to_skills)
+    monkeypatch.setattr(memory.distiller, "maybe_distill_memory_to_cross_domain", fake_memory_to_cross_domain)
+    monkeypatch.setattr(memory.distiller, "maybe_distill_memory_to_tools", fake_memory_to_tools)
+
+    await asyncio.wait_for(memory.distiller.force_distill_all(), timeout=3.0)

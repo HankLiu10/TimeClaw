@@ -23,6 +23,15 @@ def test_label_metrics_accepts_json_string_prediction():
     assert metrics["correct"] is True
 
 
+def test_label_metrics_does_not_treat_shared_prefix_as_correct_for_correlation_labels():
+    metrics = EvaluateAgainstGTTool._label_metrics(
+        "Moderate Positive Correlation",
+        "Moderate Negative Correlation",
+    )
+    assert metrics["accuracy"] == 0.0
+    assert metrics["correct"] is False
+
+
 def test_forecast_metrics_returns_type_error_for_non_numeric_prediction():
     metrics = EvaluateAgainstGTTool._forecast_metrics(
         "Unable to compute the 24-value ARIMA forecast array",

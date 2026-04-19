@@ -328,12 +328,7 @@ def _summarize_trace_value(value: Any, *, limit: int = 220) -> Any:
     return _preview_text(value, limit)
 
 
-def _summarize_response(parsed: Any, text: str, tool_calls: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    if tool_calls:
-        return {
-            "kind": "tool_calls",
-            "tool_calls": _json_safe(tool_calls),
-        }
+def _summarize_response(parsed: Any, text: str) -> dict[str, Any]:
     if parsed is not None:
         summary = {
             "kind": "parsed",
@@ -453,16 +448,14 @@ def llm_call(
     response: Any,
     *,
     response_format: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> None:
     """Log an LLM call — focus on the decision, not the raw prompt."""
     resp_parsed = None
-    resp_tool_calls = []
     resp_usage = {}
     resp_text = ""
     if hasattr(response, "parsed"):
         resp_parsed = response.parsed
-    if hasattr(response, "tool_calls"):
-        resp_tool_calls = response.tool_calls or []
     if hasattr(response, "usage"):
         resp_usage = response.usage or {}
     if hasattr(response, "text"):
@@ -474,18 +467,19 @@ def llm_call(
     _record_event("llm_call", {
         "caller": caller,
         "response_format": response_format,
+        "reasoning_effort": reasoning_effort,
         "usage": resp_usage,
         "prompt": _summarize_messages_with_refs(messages),
-        "response": _summarize_response(resp_parsed, resp_text, resp_tool_calls),
+        "response": _summarize_response(resp_parsed, resp_text),
     })
     if _full_dump:
         _record_full_dump("llm_call_full", {
             "caller": caller,
             "messages": messages,
             "response_format": response_format,
+            "reasoning_effort": reasoning_effort,
             "response_text": resp_text,
             "response_parsed": resp_parsed,
-            "response_tool_calls": resp_tool_calls,
             "usage": resp_usage,
         })
 
@@ -513,19 +507,14 @@ def llm_call(
         parts.append("")
         parts.append("【LLM 原始返回】:")
         parts.append(f"  {resp_text}")
-        if resp_tool_calls:
-            parts.append("【LLM Tool Calls】:")
-            parts.append(f"  {json.dumps(resp_tool_calls, ensure_ascii=False)}")
         parts.append(f"{_THIN_SEP}")
         logger.info("\n".join(parts))
     else:
-        if resp_tool_calls:
-            decision = _smart_trunc(resp_tool_calls, 2000)
-        else:
-            decision_source = resp_parsed if resp_parsed is not None else resp_text
-            decision = _extract_llm_decision(decision_source)
+        decision_source = resp_parsed if resp_parsed is not None else resp_text
+        decision = _extract_llm_decision(decision_source)
+        effort_text = f", effort={reasoning_effort}" if reasoning_effort else ""
         logger.info(
-            f"[{caller}] LLM 返回 (tokens: {tokens_in} in / {tokens_out} out):\n"
+            f"[{caller}] LLM 返回 (tokens: {tokens_in} in / {tokens_out} out{effort_text}):\n"
             f"    {decision}"
         )
 

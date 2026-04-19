@@ -12,13 +12,21 @@ import re
 from pathlib import Path
 from typing import Any
 
+import httpx
 from loguru import logger
 from pydantic import BaseModel, Field
 
 from timeclaw.core import trace_logger as trace
 
 _MAX_RETRIES = 5
-_RETRY_BASE_DELAY = 2.0
+_RETRY_DELAYS_SECONDS = (2.0, 8.0, 32.0, 128.0)
+_DEFAULT_REASONING_EFFORT = object()
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    """Return the configured retry delay for a 0-based retry attempt."""
+    idx = max(0, min(int(attempt), len(_RETRY_DELAYS_SECONDS) - 1))
+    return float(_RETRY_DELAYS_SECONDS[idx])
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -30,10 +38,10 @@ def _is_retryable(exc: Exception) -> bool:
 
 
 def _is_empty(resp: "LLMResponse | None") -> bool:
-    """True if response has no usable content (text or tool calls)."""
+    """True if response has no usable content."""
     if resp is None:
         return True
-    return not resp.text and not resp.tool_calls
+    return not resp.text
 
 
 class LLMResponse(BaseModel):
@@ -41,7 +49,6 @@ class LLMResponse(BaseModel):
 
     text: str | None = None
     parsed: dict[str, Any] | list | None = None
-    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     model: str = ""
     usage: dict[str, int] = Field(default_factory=dict)
     raw: Any = None
@@ -63,6 +70,7 @@ class LLMBackend:
         azure_api_base: str | None = None,
         azure_api_key: str | None = None,
         azure_api_version: str | None = None,
+        reasoning_effort: str | None = None,
     ):
         import os
 
@@ -77,6 +85,7 @@ class LLMBackend:
         self.azure_api_base = azure_api_base
         self.azure_api_key = azure_api_key
         self.azure_api_version = azure_api_version or "2024-12-01-preview"
+        self.reasoning_effort = (reasoning_effort.strip() if reasoning_effort else None) or None
 
         if api_key and api_base:
             base_no_v1 = api_base.rstrip("/")
@@ -110,7 +119,10 @@ class LLMBackend:
         client = getattr(self, "_oai_client", None)
         if client is None:
             return
-        await client.close()
+        if hasattr(client, "aclose"):
+            await client.aclose()
+        else:
+            await client.close()
         self._oai_client = None
 
     @staticmethod
@@ -291,22 +303,37 @@ class LLMBackend:
             converted.append(spec)
         return converted
 
+    def _responses_endpoint(self) -> str:
+        base_url = str(self.api_base or "").rstrip("/")
+        return f"{base_url}/responses"
+
     def _get_openai_client(self):
-        """Lazily create a shared AsyncOpenAI client for proxy calls."""
+        """Lazily create a shared proxy HTTP client for OpenAI-compatible calls.
+
+        New definition:
+            We intentionally avoid the OpenAI SDK client here for proxy-mode
+            ``openai/`` models because some gateways block the SDK's default
+            client fingerprint (notably its ``User-Agent`` / ``x-stainless-*``
+            headers). A plain ``httpx`` client with minimal headers is accepted
+            by the same proxy for the same payload.
+        """
         if not hasattr(self, "_oai_client") or self._oai_client is None:
-            from openai import AsyncOpenAI
-            self._oai_client = AsyncOpenAI(
-                api_key=self.api_key,
-                base_url=self.api_base,
+            self._oai_client = httpx.AsyncClient(
                 timeout=self.timeout,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
             )
         return self._oai_client
 
     async def _call_native_openai(
         self, call_kwargs: dict[str, Any], model_label: str,
         response_format: str | None, messages: list[dict[str, Any]],
+        reasoning_effort: str | None = None,
     ) -> LLMResponse | None:
-        """Call via the native ``openai`` SDK Responses API."""
+        """Call the proxy's Responses API without the OpenAI SDK fingerprint."""
         client = self._get_openai_client()
 
         raw_model = call_kwargs["model"]
@@ -326,24 +353,40 @@ class LLMBackend:
         text_cfg = self._responses_text_config(response_format)
         if text_cfg:
             oai_kwargs["text"] = text_cfg
+        # Only pass effort: OpenAI does not expose raw reasoning tokens; reasoning
+        # *summaries* in output require an explicit reasoning.summary request — we omit it.
+        if reasoning_effort:
+            oai_kwargs["reasoning"] = {"effort": reasoning_effort}
 
         for attempt in range(_MAX_RETRIES):
             try:
-                response = await client.responses.create(**oai_kwargs)
+                http_response = await client.post(self._responses_endpoint(), json=oai_kwargs)
+                if http_response.status_code >= 400:
+                    raise RuntimeError(http_response.text.strip() or f"HTTP {http_response.status_code}")
+                try:
+                    response = http_response.json()
+                except json.JSONDecodeError:
+                    response = http_response.text
                 parsed = self._parse_response(response, model_label)
                 if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
+                    delay = _retry_delay_seconds(attempt)
                     logger.warning(
                         f"LLM {model_label} attempt {attempt+1}: empty response, "
-                        f"retrying in {_RETRY_BASE_DELAY * (2 ** attempt):.1f}s..."
+                        f"retrying in {delay:.1f}s..."
                     )
-                    await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+                    await asyncio.sleep(delay)
                     continue
-                trace.llm_call(model_label, messages, parsed,
-                               response_format=response_format)
+                trace.llm_call(
+                    model_label,
+                    messages,
+                    parsed,
+                    response_format=response_format,
+                    reasoning_effort=reasoning_effort,
+                )
                 return parsed
             except Exception as e:
                 if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    delay = _retry_delay_seconds(attempt)
                     logger.warning(
                         f"LLM {model_label} attempt {attempt+1} failed "
                         f"(retryable): {e}. Retrying in {delay:.1f}s..."
@@ -359,21 +402,17 @@ class LLMBackend:
         oai_kwargs_stream = {**oai_kwargs, "stream": True}
         stream = await client.chat.completions.create(**oai_kwargs_stream)
         content_parts: list[str] = []
-        tool_calls_agg: list[Any] = []
         async for chunk in stream:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
             if delta.content:
                 content_parts.append(delta.content)
-            if getattr(delta, "tool_calls", None):
-                tool_calls_agg.extend(delta.tool_calls)
 
         class _Msg:
             def __init__(self):
                 self.content = "".join(content_parts)
                 self.role = "assistant"
-                self.tool_calls = tool_calls_agg or None
 
         class _Choice:
             def __init__(self):
@@ -391,27 +430,38 @@ class LLMBackend:
     async def _call_with_retry(
         self, call_kwargs: dict[str, Any], model_label: str,
         response_format: str | None, messages: list[dict[str, Any]],
+        reasoning_effort: str | None = None,
     ) -> LLMResponse | None:
         """Execute a litellm call with automatic retry on transient errors."""
         import litellm
 
+        effective_kwargs = dict(call_kwargs)
+        if reasoning_effort and str(call_kwargs.get("model", "")).startswith(("openai/", "azure/")):
+            effective_kwargs["reasoning_effort"] = reasoning_effort
+
         for attempt in range(_MAX_RETRIES):
             try:
-                response = await litellm.acompletion(**call_kwargs)
+                response = await litellm.acompletion(**effective_kwargs)
                 parsed = self._parse_response(response, model_label)
                 if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
+                    delay = _retry_delay_seconds(attempt)
                     logger.warning(
                         f"LLM {model_label} attempt {attempt+1}: empty response, "
-                        f"retrying in {_RETRY_BASE_DELAY * (2 ** attempt):.1f}s..."
+                        f"retrying in {delay:.1f}s..."
                     )
-                    await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+                    await asyncio.sleep(delay)
                     continue
-                trace.llm_call(model_label, messages, parsed,
-                               response_format=response_format)
+                trace.llm_call(
+                    model_label,
+                    messages,
+                    parsed,
+                    response_format=response_format,
+                    reasoning_effort=reasoning_effort,
+                )
                 return parsed
             except Exception as e:
                 if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                    delay = _retry_delay_seconds(attempt)
                     logger.warning(
                         f"LLM {model_label} attempt {attempt+1} failed "
                         f"(retryable): {e}. Retrying in {delay:.1f}s..."
@@ -426,10 +476,17 @@ class LLMBackend:
         messages: list[dict[str, Any]],
         model: str | None = None,
         response_format: str | None = None,
+        reasoning_effort: str | None | object = _DEFAULT_REASONING_EFFORT,
         **kwargs: Any,
     ) -> LLMResponse:
         """Send a completion request. Retries on transient errors, then falls back."""
         target_model = model or self.default_model
+        if reasoning_effort is _DEFAULT_REASONING_EFFORT:
+            effective_reasoning_effort = self.reasoning_effort
+        else:
+            effective_reasoning_effort = (
+                str(reasoning_effort).strip() if reasoning_effort is not None else None
+            ) or None
         call_kwargs = self._build_kwargs(messages, target_model, response_format, **kwargs)
 
         caller = (
@@ -440,7 +497,7 @@ class LLMBackend:
 
         try:
             result = await caller(
-                call_kwargs, target_model, response_format, messages)
+                call_kwargs, target_model, response_format, messages, effective_reasoning_effort)
             if result is not None:
                 return result
         except Exception as e:
@@ -451,112 +508,12 @@ class LLMBackend:
                 try:
                     result = await caller(
                         call_kwargs, self.fallback_model + " (fallback)",
-                        response_format, messages)
+                        response_format, messages, effective_reasoning_effort)
                     if result is not None:
                         return result
                 except Exception as e2:
                     logger.error(f"Fallback also failed: {e2}")
         return LLMResponse(text=None, model=target_model)
-
-    async def complete_with_tools(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        model: str | None = None,
-        **kwargs: Any,
-    ) -> LLMResponse:
-        """Send a completion request with function calling / tool use."""
-        target_model = model or self.default_model
-
-        if self._use_native_openai(target_model):
-            return await self._call_native_openai_tools(
-                messages, tools, target_model, **kwargs)
-
-        import litellm
-
-        call_kwargs = self._build_kwargs(messages, target_model, **kwargs)
-        call_kwargs["tools"] = tools
-
-        for attempt in range(_MAX_RETRIES):
-            try:
-                response = await litellm.acompletion(**call_kwargs)
-                parsed = self._parse_response(response, target_model)
-                self._hydrate_textual_tool_calls(parsed, tools)
-                trace.llm_call(target_model, messages, parsed, response_format="tool_call")
-                return parsed
-            except Exception as e:
-                if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        f"Tool call {target_model} attempt {attempt+1} "
-                        f"(retryable): {e}. Retrying in {delay:.1f}s..."
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                logger.warning(f"Tool call to {target_model} failed: {e}")
-                if self.fallback_model and target_model != self.fallback_model:
-                    call_kwargs["model"] = self.fallback_model
-                    try:
-                        response = await litellm.acompletion(**call_kwargs)
-                        parsed = self._parse_response(response, self.fallback_model)
-                        self._hydrate_textual_tool_calls(parsed, tools)
-                        trace.llm_call(self.fallback_model, messages, parsed, response_format="tool_call")
-                        return parsed
-                    except Exception as e2:
-                        logger.error(f"Fallback tool call also failed: {e2}")
-                return LLMResponse(text=None, model=target_model)
-        return LLMResponse(text=None, model=target_model)
-
-    async def _call_native_openai_tools(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        model: str,
-        **kwargs: Any,
-    ) -> LLMResponse:
-        """Tool-calling via the native OpenAI SDK Responses API."""
-        client = self._get_openai_client()
-        raw_model = model[len("openai/"):] if model.startswith("openai/") else model
-
-        oai_kwargs: dict[str, Any] = {
-            "model": raw_model,
-            "tools": self._chat_tools_to_responses_tools(tools),
-            "tool_choice": kwargs.get("tool_choice"),
-            "max_output_tokens": kwargs.get("max_tokens", self.max_tokens),
-        }
-        instructions, input_items = self._messages_to_responses_request(messages)
-        oai_kwargs["input"] = input_items
-        if instructions:
-            oai_kwargs["instructions"] = instructions
-        if oai_kwargs["tool_choice"] is None:
-            oai_kwargs.pop("tool_choice")
-
-        for attempt in range(_MAX_RETRIES):
-            try:
-                response = await client.responses.create(**oai_kwargs)
-                parsed = self._parse_response(response, model)
-                self._hydrate_textual_tool_calls(parsed, tools)
-                if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
-                    logger.warning(
-                        f"Tool call {model} attempt {attempt+1}: empty response, "
-                        f"retrying in {_RETRY_BASE_DELAY * (2 ** attempt):.1f}s..."
-                    )
-                    await asyncio.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
-                    continue
-                trace.llm_call(model, messages, parsed, response_format="tool_call")
-                return parsed
-            except Exception as e:
-                if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
-                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        f"Tool call {model} attempt {attempt+1} "
-                        f"(retryable): {e}. Retrying in {delay:.1f}s..."
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                logger.warning(f"Tool call to {model} failed: {e}")
-                return LLMResponse(text=None, model=model)
-        return LLMResponse(text=None, model=model)
 
     def _build_kwargs(
         self,
@@ -592,67 +549,6 @@ class LLMBackend:
             call_kwargs["response_format"] = {"type": "json_object"}
         call_kwargs.update(kwargs)
         return call_kwargs
-
-    @staticmethod
-    def _tool_names_from_specs(tools: list[dict[str, Any]]) -> list[str]:
-        names: list[str] = []
-        for spec in tools or []:
-            if not isinstance(spec, dict):
-                continue
-            fn = spec.get("function")
-            if not isinstance(fn, dict):
-                continue
-            name = str(fn.get("name") or "").strip()
-            if name:
-                names.append(name)
-        return names
-
-    @staticmethod
-    def _recover_textual_tool_call(
-        text: str | None,
-        *,
-        allowed_tool_names: list[str],
-    ) -> list[dict[str, Any]]:
-        raw = str(text or "").strip()
-        if not raw:
-            return []
-
-        for name in sorted(allowed_tool_names, key=len, reverse=True):
-            if not raw.startswith(name):
-                continue
-            suffix = raw[len(name):].lstrip()
-            if not suffix or suffix[0] not in "{[":
-                continue
-            try:
-                decoder = json.JSONDecoder()
-                arguments, end = decoder.raw_decode(suffix)
-            except Exception:
-                continue
-            trailing = suffix[end:].strip()
-            if trailing:
-                return []
-            if not isinstance(arguments, dict):
-                return []
-            return [{"name": name, "arguments": arguments}]
-        return []
-
-    @classmethod
-    def _hydrate_textual_tool_calls(
-        cls,
-        response: LLMResponse,
-        tools: list[dict[str, Any]],
-    ) -> None:
-        if response.tool_calls:
-            return
-        recovered = cls._recover_textual_tool_call(
-            response.text,
-            allowed_tool_names=cls._tool_names_from_specs(tools),
-        )
-        if not recovered:
-            return
-        response.tool_calls = recovered
-        if response.parsed is None:
-            response.parsed = recovered[0]["arguments"]
 
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any] | list | None:
@@ -780,13 +676,48 @@ class LLMBackend:
         if isinstance(response, str):
             return LLMBackend._parse_responses_sse_string(response, model)
 
+        if isinstance(response, dict) and "output" in response and "choices" not in response:
+            output_items = response.get("output")
+            if output_items is None:
+                logger.warning(
+                    f"Empty output from {model}: "
+                    f"{response.get('error') or response.get('detail')}"
+                )
+                return LLMResponse(text=None, model=model, raw=response)
+
+            text_parts: list[str] = []
+            for item in output_items or []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").strip() != "message":
+                    continue
+                for content in item.get("content") or []:
+                    if not isinstance(content, dict):
+                        continue
+                    if str(content.get("type") or "").strip() == "output_text":
+                        text_value = str(content.get("text") or "").strip()
+                        if text_value:
+                            text_parts.append(text_value)
+
+            text = "\n".join(part for part in text_parts if part).strip()
+            if not text:
+                text = str(response.get("output_text") or "").strip()
+            parsed = LLMBackend._extract_json(text) if text else None
+            usage = LLMBackend._usage_to_dict(response.get("usage"))
+            return LLMResponse(
+                text=text or None,
+                parsed=parsed,
+                model=model,
+                usage=usage,
+                raw=response,
+            )
+
         if not getattr(response, "choices", None) and hasattr(response, "output"):
             output_items = getattr(response, "output", None)
             if output_items is None:
                 logger.warning(f"Empty output from {model}: {getattr(response, 'error', None) or getattr(response, 'detail', None)}")
                 return LLMResponse(text=None, model=model, raw=response)
             text_parts: list[str] = []
-            tool_calls: list[dict[str, Any]] = []
             for item in output_items or []:
                 item_type = getattr(item, "type", None)
                 if item_type == "message":
@@ -797,18 +728,6 @@ class LLMBackend:
                             if text_value:
                                 text_parts.append(str(text_value))
                     continue
-                if item_type == "function_call":
-                    args = getattr(item, "arguments", None)
-                    parsed_args: Any = args
-                    if isinstance(args, str):
-                        try:
-                            parsed_args = json.loads(args)
-                        except json.JSONDecodeError:
-                            parsed_args = args
-                    tool_calls.append({
-                        "name": getattr(item, "name", ""),
-                        "arguments": parsed_args,
-                    })
 
             text = "\n".join(part for part in text_parts if part).strip()
             if not text and output_items is not None and hasattr(response, "output_text"):
@@ -820,7 +739,6 @@ class LLMBackend:
             return LLMResponse(
                 text=text or None,
                 parsed=parsed,
-                tool_calls=tool_calls,
                 model=model,
                 usage=usage,
                 raw=response,
@@ -835,18 +753,6 @@ class LLMBackend:
 
         parsed = LLMBackend._extract_json(text) if text else None
 
-        tool_calls_raw = getattr(message, "tool_calls", None) or []
-        tool_calls = []
-        for tc in tool_calls_raw:
-            fn = tc.function
-            args = fn.arguments
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    pass
-            tool_calls.append({"name": fn.name, "arguments": args})
-
         usage = {}
         if hasattr(response, "usage") and response.usage:
             usage = LLMBackend._usage_to_dict(response.usage)
@@ -854,7 +760,6 @@ class LLMBackend:
         return LLMResponse(
             text=text,
             parsed=parsed,
-            tool_calls=tool_calls,
             model=model,
             usage=usage,
             raw=response,
@@ -864,7 +769,6 @@ class LLMBackend:
     def _parse_responses_sse_string(raw: str, model: str) -> LLMResponse:
         """Parse a proxy-degraded Responses SSE transcript into LLMResponse."""
         text_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
         usage: dict[str, Any] = {}
         completed_response: dict[str, Any] | None = None
 
@@ -898,19 +802,6 @@ class LLMBackend:
                             if text_value:
                                 text_parts.append(text_value)
                     continue
-                if item_type == "function_call":
-                    args = item.get("arguments")
-                    parsed_args: Any = args
-                    if isinstance(args, str):
-                        try:
-                            parsed_args = json.loads(args)
-                        except json.JSONDecodeError:
-                            parsed_args = args
-                    tool_calls.append({
-                        "name": str(item.get("name") or ""),
-                        "arguments": parsed_args,
-                    })
-                    continue
 
             if event_name == "response.completed":
                 response_payload = data_json.get("response")
@@ -922,7 +813,7 @@ class LLMBackend:
 
         text = "\n".join(part for part in text_parts if part).strip() or None
         parsed = LLMBackend._extract_json(text) if text else None
-        if text is None and not tool_calls:
+        if text is None:
             logger.warning(
                 f"Empty SSE output from {model}: "
                 f"{(completed_response or {}).get('error') or (completed_response or {}).get('detail')}"
@@ -930,7 +821,6 @@ class LLMBackend:
         return LLMResponse(
             text=text,
             parsed=parsed,
-            tool_calls=tool_calls,
             model=model,
             usage=usage,
             raw=raw,

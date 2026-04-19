@@ -39,6 +39,7 @@ from timeclaw.benchmark.mtbench_adapter import (
     datasets_with_benchmark_tasks,
     expanded_benchmark_task_specs,
 )
+from timeclaw.benchmark import mtbench_prompts as prompts
 from timeclaw.benchmark.mtbench_support import (
     build_task_description,
     expand_dataset_tasks,
@@ -47,7 +48,10 @@ from timeclaw.benchmark.mtbench_support import (
     select_samples_with_original_indices,
 )
 from timeclaw.core.config import TimeClawConfig
+from timeclaw.core.confidence import coerce_confidence
+from timeclaw.core.candidate_labels import canonical_candidate_label, canonicalize_candidate_mentions
 from timeclaw.core import trace_logger as trace
+from timeclaw.core.learning_text import sanitize_learning_evidence_text
 from timeclaw.pipeline.runner import PipelineRunner
 from timeclaw.benchmark.baseline_eval import (
     _weather_trend_3way_label,
@@ -71,6 +75,164 @@ def _task_train_checkpoint_path(ds_name: str, task: str) -> Path:
 
 def _task_note_view_path(ds_name: str, task: str) -> Path:
     return TRAIN_RESULTS_DIR / f"train_notes_{ds_name}__{task}.md"
+
+
+def _pipeline_task_for_task_name(task: str) -> str:
+    """Map dataset-facing train task ids to the runner's core task type."""
+    return {
+        "mcqa": "qa",
+        "trend": "classification",
+        "trend_past": "classification",
+        "indicator_macd": "indicator",
+        "indicator_upper_bb": "indicator",
+    }.get(str(task or "").strip(), str(task or "").strip())
+
+
+def _train_result_task_context(result: dict[str, Any]) -> tuple[str, list[str]]:
+    """Resolve task-aware candidate extraction context from a train-result row."""
+    task_name = str(result.get("task") or "").strip()
+    pipeline_task = str(result.get("pipeline_task") or "").strip() or _pipeline_task_for_task_name(task_name)
+    scope_keys = result.get("scope_keys") if isinstance(result.get("scope_keys"), list) else None
+    domain = str(result.get("domain") or "").strip()
+    indicator_output_keys = PipelineRunner._indicator_output_keys(
+        scope_keys,
+        domain,
+        pipeline_task,
+    )
+    return pipeline_task, indicator_output_keys
+
+
+def _match_correlation_label(prediction: str) -> str | None:
+    """Canonicalize the official 5-way finance correlation label space."""
+    lowered = str(prediction or "").strip().lower()
+    if not lowered:
+        return None
+    explicit = {
+        "strong positive correlation": "Strong Positive Correlation",
+        "moderate positive correlation": "Moderate Positive Correlation",
+        "no correlation": "No Correlation",
+        "moderate negative correlation": "Moderate Negative Correlation",
+        "strong negative correlation": "Strong Negative Correlation",
+    }
+    if lowered in explicit:
+        return explicit[lowered]
+    for short, full in (
+        ("strong positive", "Strong Positive Correlation"),
+        ("strong negative", "Strong Negative Correlation"),
+        ("moderate positive", "Moderate Positive Correlation"),
+        ("moderate negative", "Moderate Negative Correlation"),
+        ("no correlation", "No Correlation"),
+        ("weak", "No Correlation"),
+        ("none", "No Correlation"),
+    ):
+        if short in lowered:
+            return full
+    return None
+
+
+def _match_finance_trend_label(prediction: str) -> str | None:
+    """Canonicalize the official 5-bucket finance trend label space."""
+    lowered = str(prediction or "").strip().lower()
+    if not lowered:
+        return None
+    explicit = {
+        "<-4%": "<-4%",
+        "-2% ~ -4%": "-2% ~ -4%",
+        "-2% ~ +2%": "-2% ~ +2%",
+        "+2% ~ +4%": "+2% ~ +4%",
+        ">+4%": ">+4%",
+    }
+    if lowered in explicit:
+        return explicit[lowered]
+    compact = lowered.replace(" ", "")
+    compact_map = {
+        "<-4%": "<-4%",
+        "-2%~-4%": "-2% ~ -4%",
+        "-2%~+2%": "-2% ~ +2%",
+        "+2%~+4%": "+2% ~ +4%",
+        ">+4%": ">+4%",
+    }
+    return compact_map.get(compact)
+
+
+def _canonicalize_train_task_prediction(
+    prediction: Any,
+    *,
+    task_name: str,
+    dataset_name: str = "",
+    domain: str = "",
+    pipeline_task: str = "",
+    indicator_output_keys: list[str] | None = None,
+) -> Any:
+    """Canonicalize benchmark-facing predictions into the task's label space.
+
+    New definition:
+        Training-summary candidate comparison should only compare predictions
+        that live in the benchmark task's real answer space. Intermediate tool
+        outputs like ``up``/``down`` may still be useful evidence, but they are
+        not valid final candidates for a bucketed finance-trend task.
+    """
+    task_name = str(task_name or "").strip()
+    dataset_name = str(dataset_name or "").strip()
+    domain = str(domain or "").strip()
+    pipeline_task = str(pipeline_task or "").strip()
+
+    if pipeline_task == "indicator" or task_name.startswith("indicator"):
+        return PipelineRunner._canonicalize_task_prediction(
+            prediction,
+            task_type="indicator",
+            indicator_output_keys=indicator_output_keys,
+        )
+
+    if task_name == "mcqa":
+        if not isinstance(prediction, str):
+            return None
+        letter = prompts.extract_mcqa_letter(prediction)
+        return letter or None
+
+    if task_name == "correlation":
+        if not isinstance(prediction, str):
+            return None
+        return _match_correlation_label(prediction)
+
+    if task_name in {"trend", "trend_past"}:
+        if not isinstance(prediction, str):
+            return None
+        if task_name == "trend_past" or domain == "weather" or dataset_name.startswith("weather_"):
+            return prompts.parse_weather_trend_output(prediction)
+        return _match_finance_trend_label(prediction)
+
+    return prediction
+
+
+def _normalize_train_candidate_traces(
+    candidate_traces: list[dict[str, Any]],
+    *,
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Keep only candidates whose predictions belong to the task answer space."""
+    task_name = str(result.get("task") or "").strip()
+    dataset_name = str(result.get("dataset_name") or result.get("dataset") or "").strip()
+    domain = str(result.get("domain") or "").strip()
+    pipeline_task, indicator_output_keys = _train_result_task_context(result)
+    normalized: list[dict[str, Any]] = []
+    for trace_payload in candidate_traces:
+        if not isinstance(trace_payload, dict):
+            continue
+        canonical_prediction = _canonicalize_train_task_prediction(
+            trace_payload.get("prediction"),
+            task_name=task_name,
+            dataset_name=dataset_name,
+            domain=domain,
+            pipeline_task=pipeline_task,
+            indicator_output_keys=indicator_output_keys,
+        )
+        if trace_payload.get("prediction") is not None and canonical_prediction is None:
+            continue
+        normalized_trace = dict(trace_payload)
+        normalized_trace["prediction"] = canonical_prediction
+        normalized.append(normalized_trace)
+    return normalized
 
 
 def _load_checkpoint_rows(path: Path) -> list[dict[str, Any]]:
@@ -112,7 +274,10 @@ def _normalize_train_result_row(row: dict[str, Any]) -> dict[str, Any]:
         ``train_results`` rows should always expose the same locating fields at
         the top level, even if older checkpoints were written before those
         aliases existed. This keeps filtering, retrying, and winner-chain
-        analysis stable across historical and newly appended samples.
+        analysis stable across historical and newly appended samples. Failed
+        legacy learning-summary rows are also re-normalized from their stored
+        ``execution_log`` so stale winner metadata and leaked learning text do
+        not persist forever after a bug fix.
     """
     normalized = dict(row)
 
@@ -134,6 +299,108 @@ def _normalize_train_result_row(row: dict[str, Any]) -> dict[str, Any]:
         normalized["idx"] = idx_int
         normalized["abs_idx"] = idx_int
 
+    answer_type = str(normalized.get("answer_type") or "").strip()
+    status = str(normalized.get("status") or "completed").strip()
+    raw_answer = normalized.get("raw_answer")
+    execution_log = normalized.get("execution_log")
+    skip_learning_summary_renormalize = bool(
+        row.pop("_skip_learning_summary_renormalize", False)
+    )
+
+    if (
+        answer_type == "learning_summary"
+        and isinstance(raw_answer, dict)
+        and isinstance(execution_log, list)
+    ):
+        if skip_learning_summary_renormalize:
+            normalized_raw_answer = raw_answer
+        else:
+            try:
+                normalized_raw_answer = PipelineRunner._normalize_learning_summary_answer(
+                    raw_answer,
+                    execution_log,
+                    task_type=str(normalized.get("pipeline_task") or "").strip() or _pipeline_task_for_task_name(normalized.get("task", "")),
+                    indicator_output_keys=PipelineRunner._indicator_output_keys(
+                        normalized.get("scope_keys") if isinstance(normalized.get("scope_keys"), list) else None,
+                        str(normalized.get("domain") or "").strip(),
+                        str(normalized.get("pipeline_task") or "").strip() or _pipeline_task_for_task_name(normalized.get("task", "")),
+                    ),
+                )
+            except Exception:
+                normalized_raw_answer = raw_answer
+        normalized["raw_answer"] = normalized_raw_answer
+        normalized["raw_answer_preview"] = _sanitize_learning_artifact_preview(
+            normalized_raw_answer,
+            limit=500,
+        )
+        if status == "completed":
+            normalized["learning_insight"] = normalized_raw_answer.get("insight")
+            normalized["learning_recommendation"] = normalized_raw_answer.get("recommendation")
+        else:
+            normalized["learning_insight"] = None
+            normalized["learning_recommendation"] = None
+
+    if answer_type == "learning_summary" and isinstance(normalized.get("raw_answer"), dict):
+        normalized_raw_answer = normalized["raw_answer"]
+        if isinstance(normalized_raw_answer.get("execution_context"), dict):
+            normalized["execution_context"] = dict(normalized_raw_answer.get("execution_context") or {})
+        winner_state = str(normalized_raw_answer.get("winner_state") or "").strip().lower()
+        normalized["winner_state"] = winner_state or None
+        summary_kind = str(normalized_raw_answer.get("summary_kind") or "").strip()
+        normalized["summary_kind"] = summary_kind or None
+        normalized_raw_answer["insight"] = canonicalize_candidate_mentions(
+            normalized_raw_answer.get("insight")
+        ).strip()
+        normalized_raw_answer["recommendation"] = canonicalize_candidate_mentions(
+            normalized_raw_answer.get("recommendation")
+        ).strip()
+        normalized["winner_candidate"] = canonical_candidate_label(
+            candidate_key=normalized_raw_answer.get("winner_candidate"),
+            tool_chain=normalized_raw_answer.get("winner_tool_chain"),
+        )
+        normalized["winner_prediction"] = normalized_raw_answer.get("winner_prediction")
+        winner_metrics = normalized_raw_answer.get("winner_metrics")
+        normalized["winner_metrics"] = (
+            dict(winner_metrics)
+            if isinstance(winner_metrics, dict)
+            else {}
+        )
+        compared_candidates: list[dict[str, Any]] = []
+        raw_compared = normalized_raw_answer.get("compared_candidates")
+        if isinstance(raw_compared, list):
+            for item in raw_compared:
+                if not isinstance(item, dict):
+                    continue
+                metrics = item.get("metrics")
+                compared_candidates.append({
+                    "name": canonical_candidate_label(
+                        name=item.get("name"),
+                        tool_chain=item.get("tool_chain"),
+                    ),
+                    "tool_chain": _filter_train_result_tool_chain(item.get("tool_chain")),
+                    "prediction": item.get("prediction"),
+                    "metrics": dict(metrics) if isinstance(metrics, dict) else {},
+                })
+        normalized["compared_candidates"] = compared_candidates
+        # Backfill legacy top-level fields from the normalized learning summary so
+        # downstream readers do not see empty `prediction` / `metrics` / `learning_summary`
+        # while the winner-aligned fields are populated under the newer schema.
+        normalized["learning_summary"] = dict(normalized_raw_answer)
+        winner_prediction = normalized.get("winner_prediction")
+        winner_metrics = normalized.get("winner_metrics")
+        if winner_prediction is not None:
+            normalized["prediction"] = winner_prediction
+            normalized["metrics"] = (
+                dict(winner_metrics)
+                if isinstance(winner_metrics, dict) and winner_metrics
+                else {}
+            )
+            normalized["has_prediction"] = True
+        else:
+            normalized["prediction"] = None
+            normalized["metrics"] = None
+            normalized["has_prediction"] = False
+
     substantive_tool_chain = _extract_train_result_tool_chain(normalized)
     if substantive_tool_chain:
         normalized["tool_chain"] = substantive_tool_chain
@@ -143,9 +410,89 @@ def _normalize_train_result_row(row: dict[str, Any]) -> dict[str, Any]:
             normalized.get("winner_tool_chain")
         )
 
+    if answer_type == "learning_summary" and isinstance(normalized.get("raw_answer"), dict):
+        normalized_raw_answer = normalized["raw_answer"]
+        if str(normalized_raw_answer.get("winner_state") or "").strip().lower() == "none":
+            normalized["winner_state"] = "none"
+            normalized["winner_candidate"] = ""
+            normalized["winner_prediction"] = None
+            normalized["winner_metrics"] = {}
+            normalized["tool_chain"] = []
+            normalized["winner_tool_chain"] = []
+            normalized["has_prediction"] = False
+            normalized["prediction"] = None
+            normalized["metrics"] = None
+            normalized["gate_accepted"] = False
+            normalized["gate"] = "FAIL"
+            rejections = [
+                str(item).strip()
+                for item in (normalized.get("gate_rejections") or [])
+                if str(item).strip()
+            ]
+            execution_context = (
+                normalized_raw_answer.get("execution_context")
+                if isinstance(normalized_raw_answer.get("execution_context"), dict)
+                else None
+            )
+            if execution_context is not None:
+                execution_context["tool_chain"] = []
+                execution_context["public_reasoning"] = []
+                execution_context["evidence_summary"] = ""
+
+    normalized["tools_run"] = _count_train_result_tools_run(normalized)
+    substantive_tool_chain = list(normalized.get("tool_chain") or [])
+
     train_run_id = str(normalized.get("train_run_id") or "").strip()
     if train_run_id:
         normalized["train_run_id"] = train_run_id
+
+    for key in (
+        "learning_insight",
+        "learning_recommendation",
+        "reasoning_preview",
+        "raw_answer_preview",
+        "evidence_summary_preview",
+    ):
+        if key in normalized:
+            value = normalized.get(key)
+            if value is None:
+                normalized[key] = None
+            else:
+                normalized[key] = canonicalize_candidate_mentions(value).strip()
+
+    should_rebuild_trace = isinstance(execution_log, list)
+    if should_rebuild_trace or not isinstance(normalized.get("trace"), dict):
+        trace_payload = _build_train_result_trace_payload(
+            normalized,
+            substantive_tool_chain=substantive_tool_chain,
+        )
+        if trace_payload:
+            normalized["trace"] = trace_payload
+
+    if answer_type == "learning_summary" and str(normalized.get("winner_state") or "").strip().lower() == "none":
+        candidate_traces = (
+            normalized.get("trace", {}).get("candidate_traces")
+            if isinstance(normalized.get("trace"), dict)
+            else []
+        )
+        has_candidate_prediction = any(
+            isinstance(trace_payload, dict) and trace_payload.get("prediction") is not None
+            for trace_payload in (candidate_traces or [])
+        )
+        normalized["has_candidate_prediction"] = has_candidate_prediction
+        rejection_reason = (
+            "no validated winner"
+            if has_candidate_prediction
+            else "no candidate prediction"
+        )
+        rejections = [
+            str(item).strip()
+            for item in (normalized.get("gate_rejections") or [])
+            if str(item).strip() and str(item).strip() != "prediction is None"
+        ]
+        if rejection_reason not in rejections:
+            rejections.append(rejection_reason)
+        normalized["gate_rejections"] = rejections
 
     return normalized
 
@@ -235,81 +582,21 @@ def _sanitize_learning_artifact_preview(value: Any, limit: int | None = 400) -> 
     # Split those inline steps first so banned control-flow phrases only drop
     # the affected step instead of erasing the whole preview.
     text = re.sub(r"(?<!^)\s+(?=\d+\.\s)", "\n", text.strip())
-    hard_banned_markers = (
-        "spawn_subagent",
-        "evaluate_against_gt",
-        "evaluate_batch_against_gt",
-        "batch_evaluate_against_gt",
-    )
-    full_line_banned_markers = (
-        "current branch state confirms",
-        "available from a real tool result",
-        "returned unchanged as the final",
-        "may be returned unchanged",
-        "corrected final answer",
-        "repaired summary",
-        "retained in the branch",
-    )
-    soft_banned_markers = (
-        "execution context",
-        "assigned path",
-        "before finishing",
-        "task-valid",
-        "learning mode",
-        "training mode",
-        "branch comparison",
-        "most efficient next step",
-        "most efficient way",
-        "most direct next step",
-        "available from a real tool result",
-        "returned unchanged as the final",
-        "may be returned unchanged",
-        "current branch state confirms",
-        "corrected final answer",
-        "repaired summary",
-        "retained in the branch",
-    )
     cleaned_lines: list[str] = []
-    soft_phrase_patterns = (
-        (r"(?i)\btask-valid\s+", ""),
-        (r"(?i)\bcurrent branch state confirms(?: that)?\b", ""),
-        (r"(?i)\bavailable from a real tool result\b", ""),
-        (r"(?i)\breturned unchanged as the final\b", ""),
-        (r"(?i)\bmay be returned unchanged\b", ""),
-        (r"(?i)\bbefore finishing\b", ""),
-        (r"(?i)\bexecution context\b", ""),
-        (r"(?i)\bassigned path\b", ""),
-        (r"(?i)\blearning mode\b", ""),
-        (r"(?i)\btraining mode\b", ""),
-        (r"(?i)\bbranch comparison\b", ""),
-        (r"(?i)\bmost efficient next step\b", ""),
-        (r"(?i)\bmost efficient way\b", ""),
-        (r"(?i)\bmost direct next step\b", ""),
-        (r"(?i)\bcorrected final answer\b", ""),
-        (r"(?i)\brepaired summary\b", ""),
-        (r"(?i)\bretained in the branch\b", ""),
-    )
     for line in text.splitlines():
-        lower = line.lower()
-        if any(marker in lower for marker in hard_banned_markers):
-            continue
-        if any(marker in lower for marker in full_line_banned_markers):
-            continue
-        cleaned_line = line
-        for pattern, repl in soft_phrase_patterns:
-            cleaned_line = re.sub(pattern, repl, cleaned_line)
-        cleaned_line = re.sub(r"\s+", " ", cleaned_line).strip()
-        cleaned_line = re.sub(r"[ ,;\-]+$", "", cleaned_line)
+        prefix_match = re.match(r"^(\d+\.\s+)(.*)$", line.strip())
+        prefix = prefix_match.group(1) if prefix_match else ""
+        body = prefix_match.group(2) if prefix_match else line
+        cleaned_line = str(body).strip()
+        if (
+            cleaned_line
+            and body.rstrip().endswith((".", "!", "?", ":"))
+            and not cleaned_line.endswith((".", "!", "?", ":"))
+        ):
+            cleaned_line += body.rstrip()[-1]
         if cleaned_line:
-            cleaned_lines.append(cleaned_line)
+            cleaned_lines.append(f"{prefix}{cleaned_line}".strip())
     cleaned = "\n".join(cleaned_lines).strip()
-    lower_cleaned = cleaned.lower()
-    if any(marker in lower_cleaned for marker in hard_banned_markers):
-        return ""
-    if any(marker in lower_cleaned for marker in full_line_banned_markers):
-        return ""
-    if any(marker in lower_cleaned for marker in soft_banned_markers):
-        return ""
     if limit is None or len(cleaned) <= limit:
         return cleaned
     return cleaned[:limit] + f"... [{len(cleaned)} chars]"
@@ -331,7 +618,12 @@ def _extract_train_result_reasoning_preview(
     execution_log = result.get("execution_log", [])
     raw_answer = result.get("raw_answer")
     if isinstance(execution_log, list) and execution_log:
-        candidate_traces = PipelineRunner._extract_candidate_traces(execution_log)
+        task_type, indicator_output_keys = _train_result_task_context(result)
+        candidate_traces = PipelineRunner._extract_candidate_traces(
+            execution_log,
+            task_type=task_type,
+            indicator_output_keys=indicator_output_keys,
+        )
         if candidate_traces:
             evaluated_metrics = [
                 trace.get("metrics")
@@ -454,6 +746,36 @@ def _filter_train_result_tool_chain(chain: list[Any] | tuple[Any, ...] | None) -
     return out
 
 
+def _count_train_result_tools_run(result: dict[str, Any]) -> int:
+    """Count substantive tools actually executed for one train-result row.
+
+    New definition:
+        ``train_results.tools_run`` counts substantive executed tools from the
+        row's execution log. It is not the winner path length. Legacy rows that
+        have no execution log fall back to their stored substantive tool chain.
+    """
+    execution_log = result.get("execution_log")
+    if isinstance(execution_log, list) and execution_log:
+        task_type, indicator_output_keys = _train_result_task_context(result)
+        candidate_traces = PipelineRunner._extract_candidate_traces(
+            execution_log,
+            task_type=task_type,
+            indicator_output_keys=indicator_output_keys,
+        )
+        if candidate_traces:
+            return sum(
+                len(_filter_train_result_tool_chain(trace.get("tool_chain")))
+                for trace in candidate_traces
+                if isinstance(trace, dict)
+            )
+        return len(_filter_train_result_tool_chain([
+            entry.get("tool")
+            for entry in execution_log
+            if isinstance(entry, dict)
+        ]))
+    return len(_filter_train_result_tool_chain(result.get("tool_chain")))
+
+
 def _extract_train_result_tool_chain(result: dict[str, Any]) -> list[str]:
     """Return the substantive winner chain for train_results rows.
 
@@ -467,7 +789,35 @@ def _extract_train_result_tool_chain(result: dict[str, Any]) -> list[str]:
         New row: ``["hurst_exponent", "timesfm2_forecast"]``
     """
     raw_answer = result.get("raw_answer")
+    execution_log = result.get("execution_log", [])
+    task_type, indicator_output_keys = _train_result_task_context(result)
+    candidate_traces = (
+        PipelineRunner._extract_candidate_traces(
+            execution_log,
+            task_type=task_type,
+            indicator_output_keys=indicator_output_keys,
+        )
+        if isinstance(execution_log, list) and execution_log
+        else []
+    )
+    evaluated_metrics = [
+        trace.get("metrics")
+        for trace in candidate_traces
+        if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
+    ]
+    best_metrics = PipelineRunner._select_best_metrics(evaluated_metrics)
     if isinstance(raw_answer, dict):
+        if str(raw_answer.get("winner_state") or "").strip().lower() == "none":
+            return []
+        if candidate_traces:
+            winner_trace, _winner_source = PipelineRunner._resolve_learning_summary_winner_trace(
+                raw_answer,
+                candidate_traces,
+                best_metrics,
+            )
+            resolved_chain = _filter_train_result_tool_chain((winner_trace or {}).get("tool_chain"))
+            if resolved_chain:
+                return resolved_chain
         execution_context = (
             raw_answer.get("execution_context")
             if isinstance(raw_answer.get("execution_context"), dict)
@@ -476,7 +826,14 @@ def _extract_train_result_tool_chain(result: dict[str, Any]) -> list[str]:
         winner_chain = _filter_train_result_tool_chain(
             raw_answer.get("winner_tool_chain") or execution_context.get("tool_chain")
         )
-        if winner_chain:
+        if winner_chain and (
+            not candidate_traces
+            or any(
+                _filter_train_result_tool_chain(trace.get("tool_chain")) == winner_chain
+                for trace in candidate_traces
+                if isinstance(trace, dict)
+            )
+        ):
             return winner_chain
 
     execution_context = (
@@ -490,22 +847,15 @@ def _extract_train_result_tool_chain(result: dict[str, Any]) -> list[str]:
     if winner_chain:
         return winner_chain
 
-    execution_log = result.get("execution_log", [])
-    if isinstance(execution_log, list) and execution_log:
-        candidate_traces = PipelineRunner._extract_candidate_traces(execution_log)
-        evaluated_metrics = [
-            trace.get("metrics")
-            for trace in candidate_traces
-            if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
-        ]
-        best_metrics = PipelineRunner._select_best_metrics(evaluated_metrics)
+    if candidate_traces:
+        no_validated_winner = PipelineRunner._all_binary_scored_candidates_failed(candidate_traces)
         winner_chain = _filter_train_result_tool_chain(
             PipelineRunner._select_winner_tool_chain(candidate_traces, best_metrics)
         )
         if winner_chain:
             return winner_chain
 
-        for trace in candidate_traces:
+        for trace in ([] if no_validated_winner else candidate_traces):
             if not isinstance(trace, dict):
                 continue
             trace_chain = _filter_train_result_tool_chain(trace.get("tool_chain"))
@@ -549,7 +899,12 @@ def _build_train_result_evidence_preview(
             return trace_preview
         return _sanitize_learning_artifact_preview(raw_summary, limit=400)
 
-    candidate_traces = PipelineRunner._extract_candidate_traces(execution_log)
+    task_type, indicator_output_keys = _train_result_task_context(result)
+    candidate_traces = PipelineRunner._extract_candidate_traces(
+        execution_log,
+        task_type=task_type,
+        indicator_output_keys=indicator_output_keys,
+    )
     if not candidate_traces:
         return _sanitize_learning_artifact_preview(raw_summary, limit=400)
 
@@ -564,9 +919,27 @@ def _build_train_result_evidence_preview(
         candidate_traces,
         best_metrics,
     )
+    no_validated_winner = PipelineRunner._all_binary_scored_candidates_failed(candidate_traces)
     winner_prediction = (winner_trace or {}).get("prediction")
     if winner_prediction is None and isinstance(raw_answer, dict):
         winner_prediction = raw_answer.get("winner_prediction")
+    exact_match = _select_train_result_preview_trace_by_chain(
+        candidate_traces,
+        substantive_tool_chain,
+        winner_prediction=winner_prediction,
+    )
+
+    if exact_match is not None:
+        preview = _format_train_result_evidence_preview_from_steps(exact_match.get("steps"))
+        if _preview_has_substantive_step_detail(preview):
+            return preview
+        trace_preview = _build_train_result_evidence_preview_from_trace(
+            trace_id=str(result.get("trace_id") or "").strip(),
+            substantive_tool_chain=substantive_tool_chain,
+        )
+        if trace_preview:
+            return trace_preview
+        return preview
 
     winner_chain = _filter_train_result_tool_chain((winner_trace or {}).get("tool_chain"))
     if winner_trace is not None and (
@@ -583,24 +956,7 @@ def _build_train_result_evidence_preview(
             return trace_preview
         return preview
 
-    exact_match = _select_train_result_preview_trace_by_chain(
-        candidate_traces,
-        substantive_tool_chain,
-        winner_prediction=winner_prediction,
-    )
-    if exact_match is not None:
-        preview = _format_train_result_evidence_preview_from_steps(exact_match.get("steps"))
-        if _preview_has_substantive_step_detail(preview):
-            return preview
-        trace_preview = _build_train_result_evidence_preview_from_trace(
-            trace_id=str(result.get("trace_id") or "").strip(),
-            substantive_tool_chain=substantive_tool_chain,
-        )
-        if trace_preview:
-            return trace_preview
-        return preview
-
-    if winner_trace is None:
+    if winner_trace is None and not no_validated_winner:
         for trace in candidate_traces:
             if not isinstance(trace, dict):
                 continue
@@ -886,6 +1242,18 @@ def _recover_failed_result_from_trace(trace_id: str | None) -> dict[str, Any]:
 
     recovered: dict[str, Any] = {}
     last_done_payload: dict[str, Any] = {}
+
+    def _capture_done_payload(parsed: Any) -> None:
+        nonlocal last_done_payload
+        if not isinstance(parsed, dict):
+            return
+        if parsed.get("done") is not True:
+            return
+        answer_type = str(parsed.get("answer_type") or "").strip()
+        if not answer_type:
+            return
+        last_done_payload = parsed
+
     try:
         for raw_line in trace_path.read_text().splitlines():
             raw_line = raw_line.strip()
@@ -908,10 +1276,7 @@ def _recover_failed_result_from_trace(trace_id: str | None) -> dict[str, Any]:
                     parsed = json.loads(content)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(parsed, dict):
-                    continue
-                if parsed.get("done") is True and parsed.get("answer_type"):
-                    last_done_payload = parsed
+                _capture_done_payload(parsed)
                 continue
 
             if event == "run_end":
@@ -925,7 +1290,7 @@ def _recover_failed_result_from_trace(trace_id: str | None) -> dict[str, Any]:
                 {
                     "answer_type": str(last_done_payload.get("answer_type") or "").strip(),
                     "raw_answer": last_done_payload.get("answer"),
-                    "confidence": last_done_payload.get("confidence"),
+                    "confidence": coerce_confidence(last_done_payload.get("confidence")),
                     "reasoning": str(last_done_payload.get("reasoning") or "").strip(),
                     "execution_context": (
                         last_done_payload.get("execution_context")
@@ -945,7 +1310,320 @@ def _recover_failed_result_from_trace(trace_id: str | None) -> dict[str, Any]:
     return recovered
 
 
-def _build_failed_result_payload(exc: Exception, recovered: dict[str, Any]) -> dict[str, Any]:
+def _trace_path_for_id(trace_id: str | None) -> Path | None:
+    trace_name = str(trace_id or "").strip()
+    if not trace_name:
+        return None
+    trace_path = Path(".timeclaw/traces") / f"{trace_name}.jsonl"
+    if not trace_path.exists():
+        return None
+    return trace_path
+
+
+def _compact_train_result_trace_step(step: Any) -> dict[str, Any] | None:
+    if not isinstance(step, dict):
+        return None
+    tool = str(step.get("tool") or "").strip()
+    raw_observation = step.get("observation")
+    parsed_observation = PipelineRunner._parse_json_like_payload(raw_observation)
+    preview_source = parsed_observation if parsed_observation not in (None, "") else _trace_preview_text(raw_observation)
+    observation = _preview_value(preview_source, limit=240).strip()
+    if not tool and not observation:
+        return None
+    compact: dict[str, Any] = {}
+    if tool:
+        compact["tool"] = tool
+    if observation:
+        compact["observation"] = observation
+    return compact
+
+
+def _compact_train_result_candidate_trace(trace: Any) -> dict[str, Any] | None:
+    if not isinstance(trace, dict):
+        return None
+
+    compact: dict[str, Any] = {}
+    name = canonical_candidate_label(
+        candidate_key=trace.get("candidate_key"),
+        name=trace.get("name"),
+        tool_chain=trace.get("tool_chain"),
+    )
+    if name:
+        compact["name"] = name
+    candidate_key = str(trace.get("candidate_key") or "").strip()
+    if candidate_key:
+        compact["candidate_key"] = candidate_key
+
+    tool_chain = _filter_train_result_tool_chain(trace.get("tool_chain"))
+    if tool_chain:
+        compact["tool_chain"] = tool_chain
+
+    if trace.get("prediction") is not None:
+        compact["prediction"] = trace.get("prediction")
+
+    metrics = trace.get("metrics")
+    if isinstance(metrics, dict) and metrics:
+        compact["metrics"] = metrics
+
+    snippets_source = trace.get("public_reasoning_snippets")
+    snippets = snippets_source if isinstance(snippets_source, list) else PipelineRunner._public_reasoning_snippets(trace)
+    cleaned_snippets = [
+        cleaned
+        for item in snippets
+        for cleaned in [str(item).strip()]
+        if cleaned
+    ]
+    if cleaned_snippets:
+        compact["public_reasoning"] = cleaned_snippets
+
+    compact_steps = [
+        compact_step
+        for step in (trace.get("steps") if isinstance(trace.get("steps"), list) else [])
+        for compact_step in [_compact_train_result_trace_step(step)]
+        if compact_step
+    ]
+    if compact_steps:
+        compact["steps"] = compact_steps
+
+    return compact or None
+
+
+def _merge_train_result_summary_candidates(
+    result: dict[str, Any],
+    candidate_traces: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Align trace-facing candidates with the repaired row-level summary."""
+    normalized_candidates = _normalize_train_candidate_traces(
+        candidate_traces,
+        result=result,
+    )
+    deduped_execution = PipelineRunner._dedupe_candidate_traces_by_path(normalized_candidates)
+    raw_answer = result.get("raw_answer")
+    raw_compared = (
+        raw_answer.get("compared_candidates")
+        if isinstance(raw_answer, dict)
+        else None
+    )
+    if not isinstance(raw_compared, list) or not raw_compared:
+        return deduped_execution
+
+    merged: list[dict[str, Any]] = []
+    for item in raw_compared:
+        if not isinstance(item, dict):
+            continue
+        tool_chain = _filter_train_result_tool_chain(item.get("tool_chain"))
+        prediction = _canonicalize_train_task_prediction(
+            item.get("prediction"),
+            task_name=str(result.get("task") or "").strip(),
+            dataset_name=str(result.get("dataset_name") or result.get("dataset") or "").strip(),
+            domain=str(result.get("domain") or "").strip(),
+            pipeline_task=str(result.get("pipeline_task") or "").strip(),
+            indicator_output_keys=_train_result_task_context(result)[1],
+        )
+        if item.get("prediction") is not None and prediction is None:
+            continue
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+
+        matched_trace: dict[str, Any] | None = None
+        for trace in deduped_execution:
+            if not isinstance(trace, dict):
+                continue
+            trace_chain = _filter_train_result_tool_chain(trace.get("tool_chain"))
+            if trace_chain != tool_chain:
+                continue
+            if prediction is not None and trace.get("prediction") == prediction:
+                matched_trace = trace
+                break
+            if matched_trace is None:
+                matched_trace = trace
+
+        merged_trace = dict(matched_trace or {})
+        merged_trace["name"] = canonical_candidate_label(
+            name=item.get("name"),
+            candidate_key=item.get("name"),
+            tool_chain=tool_chain,
+        )
+        merged_trace["candidate_key"] = str(
+            merged_trace.get("candidate_key")
+            or item.get("name")
+            or canonical_candidate_label(tool_chain=tool_chain)
+            or ""
+        ).strip()
+        merged_trace["tool_chain"] = tool_chain
+        merged_trace["prediction"] = prediction
+        merged_trace["metrics"] = dict(metrics)
+        merged.append(merged_trace)
+    return merged
+
+
+def _recover_train_result_trace_payload_from_file(trace_id: str | None) -> dict[str, Any]:
+    trace_path = _trace_path_for_id(trace_id)
+    if trace_path is None:
+        return {}
+
+    payload: dict[str, Any] = {
+        "trace_id": trace_path.stem,
+        "trace_path": str(trace_path),
+    }
+    last_done_payload: dict[str, Any] | None = None
+    run_end_payload: dict[str, Any] | None = None
+
+    try:
+        for raw_line in trace_path.read_text().splitlines():
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            record = json.loads(raw_line)
+            event = str(record.get("event") or "").strip()
+            body = record.get("payload") or {}
+            if not isinstance(body, dict):
+                continue
+
+            if event == "content_block":
+                if str(body.get("kind") or "").strip() != "prompt_message/assistant":
+                    continue
+                content = str(body.get("content") or "").strip()
+                if not content.startswith("{"):
+                    continue
+                try:
+                    parsed = json.loads(content)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict) and parsed.get("answer_type"):
+                    last_done_payload = parsed
+                continue
+
+            if event == "run_end":
+                run_end_payload = {
+                    "status": str(body.get("status") or "").strip(),
+                    "error": str(body.get("error") or "").strip(),
+                    "error_type": str(body.get("error_type") or "").strip(),
+                    "failure_reason": str(body.get("failure_reason") or "").strip(),
+                }
+    except (OSError, json.JSONDecodeError):
+        return payload
+
+    if last_done_payload:
+        compact_done: dict[str, Any] = {
+            "answer_type": str(last_done_payload.get("answer_type") or "").strip(),
+        }
+        answer = last_done_payload.get("answer")
+        if answer is not None:
+            compact_done["answer"] = answer
+        execution_context = last_done_payload.get("execution_context")
+        if isinstance(execution_context, dict) and execution_context:
+            compact_done["execution_context"] = execution_context
+        control_context = last_done_payload.get("control_context")
+        if isinstance(control_context, dict) and control_context:
+            compact_done["control_context"] = control_context
+        payload["last_done_payload"] = compact_done
+    if run_end_payload:
+        payload["run_end"] = run_end_payload
+    return payload
+
+
+def _build_train_result_trace_payload(
+    result: dict[str, Any],
+    *,
+    substantive_tool_chain: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build direct debug evidence for one train_results row.
+
+    New definition:
+        ``train_results.trace`` is a compact, row-local trace artifact. It
+        keeps the stable locator (`trace_id`, `trace_path`) plus the resolved
+        candidate paths and winner path, so debugging does not require opening
+        the raw `.jsonl` trace file first.
+    """
+    trace_id = str(result.get("trace_id") or "").strip()
+    trace_path = _trace_path_for_id(trace_id)
+    payload: dict[str, Any] = {}
+    if trace_id:
+        payload["trace_id"] = trace_id
+    if trace_path is not None:
+        payload["trace_path"] = str(trace_path)
+
+    execution_log = result.get("execution_log")
+    if not isinstance(execution_log, list) or not execution_log:
+        recovered_payload = _recover_train_result_trace_payload_from_file(trace_id)
+        if recovered_payload:
+            payload.update(recovered_payload)
+        return payload
+
+    task_type, indicator_output_keys = _train_result_task_context(result)
+    candidate_traces = PipelineRunner._extract_candidate_traces(
+        execution_log,
+        task_type=task_type,
+        indicator_output_keys=indicator_output_keys,
+    )
+    candidate_traces = _normalize_train_candidate_traces(
+        candidate_traces,
+        result=result,
+    )
+    PipelineRunner._propagate_metrics_across_equivalent_predictions(candidate_traces)
+    summary_candidate_traces = _merge_train_result_summary_candidates(
+        result,
+        candidate_traces,
+    )
+    compact_candidates = [
+        compact_trace
+        for trace in summary_candidate_traces
+        for compact_trace in [_compact_train_result_candidate_trace(trace)]
+        if compact_trace
+    ]
+    if compact_candidates:
+        payload["candidate_traces"] = compact_candidates
+
+    raw_answer = result.get("raw_answer")
+    evaluated_metrics = [
+        trace.get("metrics")
+        for trace in summary_candidate_traces
+        if isinstance(trace, dict) and isinstance(trace.get("metrics"), dict) and trace.get("metrics")
+    ]
+    best_metrics = PipelineRunner._select_best_metrics(evaluated_metrics)
+    winner_trace, winner_source = PipelineRunner._resolve_learning_summary_winner_trace(
+        raw_answer if isinstance(raw_answer, dict) else {},
+        summary_candidate_traces,
+        best_metrics,
+    )
+    winner_prediction = raw_answer.get("winner_prediction") if isinstance(raw_answer, dict) else None
+    resolved_tool_chain = list(substantive_tool_chain or _extract_train_result_tool_chain(result))
+    no_validated_winner = PipelineRunner._all_binary_scored_candidates_failed(summary_candidate_traces)
+    winner_chain = _filter_train_result_tool_chain((winner_trace or {}).get("tool_chain"))
+    if resolved_tool_chain and (winner_trace is None or winner_chain != resolved_tool_chain):
+        exact_match = _select_train_result_preview_trace_by_chain(
+            summary_candidate_traces,
+            resolved_tool_chain,
+            winner_prediction=winner_prediction,
+        )
+        if exact_match is not None:
+            winner_trace = exact_match
+            winner_source = "tool_chain"
+    if winner_trace is None and summary_candidate_traces and not no_validated_winner:
+        winner_trace = summary_candidate_traces[0]
+        winner_source = "first_candidate"
+
+    compact_winner = _compact_train_result_candidate_trace(winner_trace)
+    if compact_winner:
+        payload["winner_trace"] = compact_winner
+    if winner_source:
+        payload["winner_trace_source"] = winner_source
+
+    recovered_payload = _recover_train_result_trace_payload_from_file(trace_id)
+    run_end = recovered_payload.get("run_end")
+    if isinstance(run_end, dict) and run_end:
+        payload["run_end"] = run_end
+
+    return payload
+
+
+def _build_failed_result_payload(
+    exc: BaseException,
+    recovered: dict[str, Any],
+    *,
+    task_type: str = "",
+    indicator_output_keys: list[str] | None = None,
+) -> dict[str, Any]:
     """Merge direct exception payloads with trace fallback for failed samples.
 
     New definition:
@@ -990,9 +1668,47 @@ def _build_failed_result_payload(exc: Exception, recovered: dict[str, Any]) -> d
         getattr(exc, "control_context", None),
         recovered.get("control_context"),
     ) or {}
+    answer_type = str(
+        _pick(
+            partial.get("answer_type"),
+            getattr(exc, "answer_type", None),
+            recovered.get("answer_type"),
+            "",
+        ) or ""
+    )
+
+    if answer_type == "learning_summary" and isinstance(raw_answer, dict):
+        recovered_raw_answer = recovered.get("raw_answer")
+        if isinstance(recovered_raw_answer, dict):
+            merged_raw_answer = dict(recovered_raw_answer)
+            merged_raw_answer.update(raw_answer)
+            raw_answer = merged_raw_answer
+        try:
+            raw_answer = PipelineRunner._normalize_learning_summary_answer(
+                raw_answer,
+                execution_log if isinstance(execution_log, list) else [],
+                task_type=task_type,
+                indicator_output_keys=indicator_output_keys,
+            )
+        except Exception:
+            pass
+        if (
+            isinstance(raw_answer, dict)
+            and not str(raw_answer.get("summary_kind") or "").strip()
+            and not str(raw_answer.get("winner_candidate") or "").strip()
+            and not _filter_train_result_tool_chain(raw_answer.get("winner_tool_chain"))
+            and raw_answer.get("winner_prediction") is None
+        ):
+            raw_answer = dict(raw_answer)
+            raw_answer["summary_kind"] = "failure_summary"
+            raw_answer["winner_state"] = "none"
+            raw_answer["winner_candidate"] = ""
+            raw_answer["winner_prediction"] = None
+            raw_answer["winner_tool_chain"] = []
+            raw_answer["winner_metrics"] = {}
 
     return {
-        "answer_type": str(_pick(partial.get("answer_type"), getattr(exc, "answer_type", None), recovered.get("answer_type"), "") or ""),
+        "answer_type": answer_type,
         "execution_log": execution_log if isinstance(execution_log, list) else [],
         "prediction": _pick(partial.get("prediction"), raw_answer),
         "status": str(getattr(exc, "failure_reason", "") or "error"),
@@ -1002,12 +1718,69 @@ def _build_failed_result_payload(exc: Exception, recovered: dict[str, Any]) -> d
         "trace_id": getattr(exc, "trace_id", None),
         "total_ms": getattr(exc, "total_ms", 0),
         "raw_answer": raw_answer,
-        "confidence": _pick(partial.get("confidence"), getattr(exc, "confidence", None), recovered.get("confidence")),
+        "confidence": coerce_confidence(
+            _pick(partial.get("confidence"), getattr(exc, "confidence", None), recovered.get("confidence"))
+        ),
         "reasoning": str(_pick(partial.get("reasoning"), getattr(exc, "reasoning", None), recovered.get("reasoning"), "") or ""),
         "execution_context": execution_context if isinstance(execution_context, dict) else {},
         "control_context": control_context if isinstance(control_context, dict) else {},
         "trace_recovered": bool(recovered.get("trace_recovered", False)),
     }
+
+
+async def _run_pipeline_train_call_with_timeout(
+    awaitable: Any,
+    *,
+    timeout_s: float,
+) -> tuple[bool, Any]:
+    """Run one pipeline call and preserve trace metadata when the timeout fires.
+
+    New definition:
+        A train-loop timeout should still keep the cancelled pipeline run's
+        `trace_id` and any recoverable trace evidence. `asyncio.wait_for()`
+        drops that context by default, so we wrap the call in an explicit task,
+        cancel it ourselves, and then await the cancellation result once.
+    """
+    async def _capture_outcome() -> tuple[bool, Any]:
+        try:
+            return True, await awaitable
+        except BaseException as e:  # noqa: BLE001 - the caller needs the original exception object
+            return False, e
+
+    task = asyncio.create_task(_capture_outcome())
+    done, _pending = await asyncio.wait({task}, timeout=timeout_s)
+    if task in done:
+        completed, payload = await task
+        if completed:
+            return True, payload
+        raise payload
+
+    if not done:
+        task.cancel()
+        cancelled_exc: BaseException | None = None
+        try:
+            completed, payload = await task
+            if not completed and isinstance(payload, BaseException):
+                cancelled_exc = payload
+        except BaseException as e:  # noqa: BLE001 - we need trace metadata from cancellation
+            cancelled_exc = e
+
+        timeout_exc = asyncio.TimeoutError("pipeline run timed out")
+        setattr(timeout_exc, "trace_id", getattr(cancelled_exc, "trace_id", None))
+        setattr(timeout_exc, "total_ms", getattr(cancelled_exc, "total_ms", 0))
+        setattr(timeout_exc, "error_type", "TimeoutError")
+        setattr(timeout_exc, "failure_reason", "timeout")
+        partial_result = getattr(cancelled_exc, "partial_result", None)
+        if isinstance(partial_result, dict):
+            setattr(timeout_exc, "partial_result", partial_result)
+            setattr(timeout_exc, "execution_log", partial_result.get("execution_log", []))
+            setattr(timeout_exc, "raw_answer", partial_result.get("answer"))
+            setattr(timeout_exc, "answer_type", partial_result.get("answer_type", ""))
+            setattr(timeout_exc, "confidence", partial_result.get("confidence"))
+            setattr(timeout_exc, "reasoning", partial_result.get("reasoning", ""))
+            setattr(timeout_exc, "execution_context", partial_result.get("execution_context", {}))
+            setattr(timeout_exc, "control_context", partial_result.get("control_context", {}))
+        return False, timeout_exc
 
 
 def _build_train_result_row(
@@ -1030,7 +1803,20 @@ def _build_train_result_row(
         no longer needs an immediate second hop into traces.
     """
     raw_answer = result.get("raw_answer")
-    learning_summary = raw_answer if isinstance(raw_answer, dict) else {}
+    gt = _extract_ground_truth(sample, task)
+    if isinstance(raw_answer, dict):
+        raw_answer = _repair_learning_summary_with_ground_truth(
+            raw_answer=raw_answer,
+            execution_log=result.get("execution_log", []),
+            ground_truth=gt,
+            task_type=pipeline_task,
+            indicator_output_keys=_indicator_output_keys_for_task(task),
+        )
+    learning_summary = (
+        raw_answer
+        if str(result.get("status") or "completed") == "completed" and isinstance(raw_answer, dict)
+        else {}
+    )
     sample_ref = f"{ds_name}:{sample.file}:{sample_idx}:{task}"
     substantive_tool_chain = _extract_train_result_tool_chain(result)
 
@@ -1055,7 +1841,7 @@ def _build_train_result_row(
         "gate_accepted": result.get("gate_accepted"),
         "gate_rejections": list(result.get("gate_rejections", [])),
         "confidence": result.get("confidence"),
-        "tools_run": len(substantive_tool_chain),
+        "tools_run": _count_train_result_tools_run(result),
         "tool_chain": substantive_tool_chain,
         "winner_tool_chain": list(substantive_tool_chain),
         "total_ms": result.get("total_ms", 0),
@@ -1074,8 +1860,51 @@ def _build_train_result_row(
             result,
             substantive_tool_chain,
         ),
+        "trace": _build_train_result_trace_payload(
+            result,
+            substantive_tool_chain=substantive_tool_chain,
+        ),
+        "_skip_learning_summary_renormalize": (
+            str(result.get("answer_type") or "") == "learning_summary"
+            and isinstance(raw_answer, dict)
+        ),
     }
     return _normalize_train_result_row(row)
+
+
+def _indicator_output_keys_for_task(task: str) -> list[str]:
+    if task == "indicator_macd":
+        return ["macd"]
+    if task == "indicator_upper_bb":
+        return ["upper_bb"]
+    return []
+
+
+def _repair_learning_summary_with_ground_truth(
+    *,
+    raw_answer: dict[str, Any],
+    execution_log: Any,
+    ground_truth: Any,
+    task_type: str,
+    indicator_output_keys: list[str] | None = None,
+) -> dict[str, Any]:
+    """Delegate GT-backed learning-summary repair to the shared runner logic.
+
+    New definition:
+        Train-result rows, in-run memory writes, and any later checkpoint
+        normalization must all use the same GT-repair implementation. This
+        wrapper keeps the train loop on the shared `PipelineRunner` path so the
+        winner is not resolved differently in different persistence layers.
+    """
+    if not isinstance(raw_answer, dict) or not isinstance(execution_log, list):
+        return raw_answer
+    return PipelineRunner._repair_learning_summary_with_ground_truth(
+        raw_answer,
+        execution_log,
+        ground_truth=ground_truth,
+        task_type=task_type,
+        indicator_output_keys=indicator_output_keys,
+    )
 
 
 # ── Ground truth extraction ──────────────────────────────────────────
@@ -1177,14 +2006,7 @@ async def _process_one_sample(
                 else None
             )
 
-            task_type_map = {
-                "mcqa": "qa",
-                "trend": "classification",
-                "trend_past": "classification",
-                "indicator_macd": "indicator",
-                "indicator_upper_bb": "indicator",
-            }
-            pipeline_task = task_type_map.get(task, task)
+            pipeline_task = _pipeline_task_for_task_name(task)
 
             try:
                 scope_keys = scope_keys_for_dataset_task(ds_name, task)
@@ -1198,7 +2020,7 @@ async def _process_one_sample(
                     "domain": sample.domain,
                     "train_run_id": train_run_id,
                 }
-                result = await asyncio.wait_for(
+                completed, payload = await _run_pipeline_train_call_with_timeout(
                     pipeline.run(
                         data=sample.input_window,
                         task_type=pipeline_task,
@@ -1211,23 +2033,38 @@ async def _process_one_sample(
                         ground_truth=gt,
                         source_metadata=source_metadata,
                     ),
-                    timeout=1200,
+                    timeout_s=1200,
                 )
-            except asyncio.TimeoutError:
-                logger.warning(f"[TrainLoop] {ds_name}[{sample_idx}] {task}: timeout")
-                result = {
-                    "answer_type": "",
-                    "execution_log": [],
-                    "prediction": None,
-                    "status": "timeout",
-                    "error_type": "TimeoutError",
-                    "failure_reason": "timeout",
-                }
+                if completed:
+                    result = payload
+                else:
+                    logger.warning(f"[TrainLoop] {ds_name}[{sample_idx}] {task}: timeout")
+                    trace_id = getattr(payload, "trace_id", None)
+                    recovered = _recover_failed_result_from_trace(trace_id)
+                    result = _build_failed_result_payload(
+                        payload,
+                        recovered,
+                        task_type=pipeline_task,
+                        indicator_output_keys=PipelineRunner._indicator_output_keys(
+                            scope_keys,
+                            sample.domain,
+                            pipeline_task,
+                        ),
+                    )
             except Exception as e:
                 logger.error(f"[TrainLoop] {ds_name}[{sample_idx}] {task}: {e}")
                 trace_id = getattr(e, "trace_id", None)
                 recovered = _recover_failed_result_from_trace(trace_id)
-                result = _build_failed_result_payload(e, recovered)
+                result = _build_failed_result_payload(
+                    e,
+                    recovered,
+                    task_type=pipeline_task,
+                    indicator_output_keys=PipelineRunner._indicator_output_keys(
+                        scope_keys,
+                        sample.domain,
+                        pipeline_task,
+                    ),
+                )
 
             results.append(_build_train_result_row(
                 ds_name=ds_name,
@@ -1267,14 +2104,7 @@ async def _process_one_task_sample(
         else None
     )
 
-    task_type_map = {
-        "mcqa": "qa",
-        "trend": "classification",
-        "trend_past": "classification",
-        "indicator_macd": "indicator",
-        "indicator_upper_bb": "indicator",
-    }
-    pipeline_task = task_type_map.get(task, task)
+    pipeline_task = _pipeline_task_for_task_name(task)
 
     if task_sem is not None:
         await task_sem.acquire()
@@ -1292,7 +2122,7 @@ async def _process_one_task_sample(
     try:
         async with sem:
             try:
-                result = await asyncio.wait_for(
+                completed, payload = await _run_pipeline_train_call_with_timeout(
                     pipeline.run(
                         data=sample.input_window,
                         task_type=pipeline_task,
@@ -1305,23 +2135,38 @@ async def _process_one_task_sample(
                         ground_truth=gt,
                         source_metadata=source_metadata,
                     ),
-                    timeout=1200,
+                    timeout_s=1200,
                 )
-            except asyncio.TimeoutError:
-                logger.warning(f"[TrainLoop] {ds_name}[{sample_idx}] {task}: timeout")
-                result = {
-                    "answer_type": "",
-                    "execution_log": [],
-                    "prediction": None,
-                    "status": "timeout",
-                    "error_type": "TimeoutError",
-                    "failure_reason": "timeout",
-                }
+                if completed:
+                    result = payload
+                else:
+                    logger.warning(f"[TrainLoop] {ds_name}[{sample_idx}] {task}: timeout")
+                    trace_id = getattr(payload, "trace_id", None)
+                    recovered = _recover_failed_result_from_trace(trace_id)
+                    result = _build_failed_result_payload(
+                        payload,
+                        recovered,
+                        task_type=pipeline_task,
+                        indicator_output_keys=PipelineRunner._indicator_output_keys(
+                            scope_keys,
+                            sample.domain,
+                            pipeline_task,
+                        ),
+                    )
             except Exception as e:
                 logger.error(f"[TrainLoop] {ds_name}[{sample_idx}] {task}: {e}")
                 trace_id = getattr(e, "trace_id", None)
                 recovered = _recover_failed_result_from_trace(trace_id)
-                result = _build_failed_result_payload(e, recovered)
+                result = _build_failed_result_payload(
+                    e,
+                    recovered,
+                    task_type=pipeline_task,
+                    indicator_output_keys=PipelineRunner._indicator_output_keys(
+                        scope_keys,
+                        sample.domain,
+                        pipeline_task,
+                    ),
+                )
 
         return _build_train_result_row(
             ds_name=ds_name,
@@ -1637,8 +2482,13 @@ async def run_train_loop(
         train_run_id=train_run_id,
         started_at=started_at,
         finished_at=time.time(),
-        all_results=all_results,
-        run_rows_by_task=run_rows_by_task,
+        max_samples=max_samples,
+        concurrency=concurrency,
+        per_task_concurrency=per_task_concurrency,
+        indicator_concurrency=indicator_concurrency,
+        merge_checkpoint=merge_checkpoint,
+        current_run_results=all_results,
+        current_run_task_rows_by_key=merged_rows_by_ds_task,
         note_view_paths=note_view_paths,
     )
     _write_json_atomically(TRAIN_RUN_MANIFEST_PATH, manifest)
@@ -1677,24 +2527,95 @@ def _write_json_atomically(path: Path, payload: Any) -> None:
     tmp_path.replace(path)
 
 
-def _save_train_summary(summary: dict[str, Any]) -> None:
-    _write_json_atomically(TRAIN_SUMMARY_PATH, summary)
+def _load_active_task_rows_by_key() -> dict[tuple[str, str], list[dict[str, Any]]]:
+    active_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for path in sorted(TRAIN_RESULTS_DIR.glob("train_*.json")):
+        if path.name in {"train_summary.json", "train_run_manifest.json"}:
+            continue
+        rows = _load_checkpoint_rows(path)
+        if not rows:
+            continue
+        first = rows[0]
+        ds_name = str(first.get("dataset_name") or first.get("dataset") or "").strip()
+        task = str(first.get("task") or "").strip()
+        if not ds_name or not task:
+            continue
+        active_rows[(ds_name, task)] = rows
+    return active_rows
+
+
+def _build_active_train_summary() -> dict[str, Any]:
+    dataset_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for (ds_name, _task), rows in _load_active_task_rows_by_key().items():
+        dataset_rows[ds_name].extend(rows)
+    summary: dict[str, Any] = {}
+    for ds_name, rows in sorted(dataset_rows.items()):
+        summary[ds_name] = {
+            "total": len(rows),
+            "summary": _summarize_results(rows),
+        }
+    return summary
+
+
+def _save_train_summary(summary: dict[str, Any] | None = None) -> None:
+    active_summary = _build_active_train_summary()
+    _write_json_atomically(TRAIN_SUMMARY_PATH, active_summary or dict(summary or {}))
 
 
 def _render_note_block(note_text: str) -> str:
-    stripped = str(note_text or "").strip()
+    stripped = canonicalize_candidate_mentions(note_text).strip()
     if not stripped:
         return ""
     return stripped if stripped.startswith("### [") else f"### {stripped}"
+
+
+def _note_train_run_id(note_text: str) -> str:
+    text = str(note_text or "")
+    if not text:
+        return ""
+    match = re.search(r"^\s*-\s*Train Run ID:\s*(.+?)\s*$", text, flags=re.MULTILINE)
+    return str(match.group(1) if match else "").strip()
 
 
 def _note_matches_run(note_text: str, *, train_run_id: str, sample_refs: set[str]) -> bool:
     text = str(note_text or "")
     if not text:
         return False
-    if train_run_id and f"- Train Run ID: {train_run_id}" in text:
-        return True
+    note_run_id = _note_train_run_id(text)
+    if train_run_id:
+        return note_run_id == train_run_id
     return any(sample_ref and f"- Sample Ref: {sample_ref}" in text for sample_ref in sample_refs)
+
+
+def _split_rendered_note_blocks(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    matches = list(re.finditer(r"(?m)^###\s", raw))
+    if not matches:
+        block = _render_note_block(raw)
+        return [block] if block else []
+    blocks: list[str] = []
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
+        block = _render_note_block(raw[start:end])
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def _note_sample_ref(note_text: str) -> str:
+    match = re.search(r"^\s*-\s*Sample Ref:\s*(.+?)\s*$", str(note_text or ""), flags=re.MULTILINE)
+    return str(match.group(1) if match else "").strip()
+
+
+def _note_sample_index(note_text: str) -> int:
+    match = re.search(r"^\s*-\s*Sample Index:\s*(\d+)\s*$", str(note_text or ""), flags=re.MULTILINE)
+    try:
+        return int(match.group(1)) if match else 10**9
+    except (TypeError, ValueError):
+        return 10**9
 
 
 def _export_train_note_views(
@@ -1709,14 +2630,14 @@ def _export_train_note_views(
         return exports
 
     for (ds_name, task), rows in sorted(run_rows_by_task.items()):
-        sample_refs = {
+        touched_sample_refs = {
             str(row.get("sample_ref") or "").strip()
             for row in rows
             if isinstance(row, dict) and str(row.get("sample_ref") or "").strip()
         }
-        if not sample_refs:
+        if not touched_sample_refs:
             continue
-        blocks: list[str] = []
+        current_blocks_by_ref: dict[str, str] = {}
         seen: set[str] = set()
         for scope in scope_keys_for_dataset_task(ds_name, task):
             for item in notes.get_scope_note_items(scope):
@@ -1725,18 +2646,42 @@ def _export_train_note_views(
                 if note_id in seen or not _note_matches_run(
                     note_text,
                     train_run_id=train_run_id,
-                    sample_refs=sample_refs,
+                    sample_refs=touched_sample_refs,
                 ):
                     continue
                 block = _render_note_block(note_text)
                 if not block:
                     continue
                 seen.add(note_id)
-                blocks.append(block)
-        if not blocks:
-            continue
+                sample_ref = _note_sample_ref(block)
+                if sample_ref:
+                    current_blocks_by_ref[sample_ref] = block
+
         path = _task_note_view_path(ds_name, task)
-        path.write_text("\n\n".join(blocks).rstrip() + "\n", encoding="utf-8")
+        existing_blocks = _split_rendered_note_blocks(path.read_text(encoding="utf-8")) if path.exists() else []
+        merged_blocks: list[str] = []
+        replaced_refs: set[str] = set()
+        for block in existing_blocks:
+            sample_ref = _note_sample_ref(block)
+            if sample_ref and sample_ref in touched_sample_refs:
+                replaced_refs.add(sample_ref)
+                replacement = current_blocks_by_ref.get(sample_ref)
+                if replacement:
+                    merged_blocks.append(replacement)
+                continue
+            merged_blocks.append(block)
+        pending_new = [
+            block
+            for sample_ref, block in current_blocks_by_ref.items()
+            if sample_ref and sample_ref not in replaced_refs
+        ]
+        pending_new.sort(key=lambda block: (_note_sample_index(block), _note_sample_ref(block)))
+        merged_blocks.extend(pending_new)
+        if not merged_blocks:
+            if path.exists():
+                path.unlink()
+            continue
+        path.write_text("\n\n".join(merged_blocks).rstrip() + "\n", encoding="utf-8")
         exports[f"{ds_name}::{task}"] = str(path)
     return exports
 
@@ -1746,18 +2691,25 @@ def _build_run_manifest(
     train_run_id: str,
     started_at: float,
     finished_at: float,
-    all_results: dict[str, Any],
-    run_rows_by_task: dict[tuple[str, str], list[dict[str, Any]]],
+    max_samples: int | None = None,
+    concurrency: int | None = None,
+    per_task_concurrency: int | None = None,
+    indicator_concurrency: int | None = None,
+    merge_checkpoint: bool = False,
+    current_run_results: dict[str, Any],
+    current_run_task_rows_by_key: dict[tuple[str, str], list[dict[str, Any]]],
     note_view_paths: dict[str, str],
 ) -> dict[str, Any]:
+    active_summary = _build_active_train_summary()
+    active_task_rows_by_key = _load_active_task_rows_by_key()
     tasks: dict[str, Any] = {}
-    for (ds_name, task), rows in sorted(run_rows_by_task.items()):
+    for (ds_name, task), rows in sorted(active_task_rows_by_key.items()):
         status_counts: dict[str, int] = defaultdict(int)
         failed_sample_refs: list[str] = []
         for row in rows:
             status = str(row.get("status") or "")
             status_counts[status] = status_counts.get(status, 0) + 1
-            if status and status != "completed":
+            if _row_counts_as_failed_sample_ref(row):
                 failed_sample_refs.append(str(row.get("sample_ref") or ""))
         task_key = f"{ds_name}::{task}"
         tasks[task_key] = {
@@ -1765,8 +2717,9 @@ def _build_run_manifest(
             "task": task,
             "rows": len(rows),
             "status_counts": dict(status_counts),
+            "aligned_counts": _aligned_train_counts(rows),
             "failed_sample_refs": failed_sample_refs,
-            "note_view_path": note_view_paths.get(task_key, ""),
+            "note_view_path": note_view_paths.get(task_key, str(_task_note_view_path(ds_name, task)) if _task_note_view_path(ds_name, task).exists() else ""),
             "result_path": str(_task_train_checkpoint_path(ds_name, task)),
         }
     return {
@@ -1774,21 +2727,146 @@ def _build_run_manifest(
         "started_at": started_at,
         "finished_at": finished_at,
         "elapsed_s": round(max(0.0, finished_at - started_at), 3),
-        "dataset_summary": all_results,
+        "max_samples": max_samples,
+        "concurrency": concurrency,
+        "per_task_concurrency": per_task_concurrency,
+        "indicator_concurrency": indicator_concurrency,
+        "merge_checkpoint": merge_checkpoint,
+        "dataset_summary": active_summary,
+        "current_run_dataset_summary": current_run_results,
+        "current_run_task_keys": [
+            f"{ds_name}::{task}"
+            for (ds_name, task) in sorted(current_run_task_rows_by_key.keys())
+        ],
+        "partial_run": bool(
+            active_summary != current_run_results
+            or set(active_task_rows_by_key.keys()) != set(current_run_task_rows_by_key.keys())
+        ),
         "tasks": tasks,
     }
 
 
+def _row_counts_as_failed_sample_ref(row: dict[str, Any]) -> bool:
+    """Classify rows that should surface in manifest-level failure references.
+
+    New definition:
+        `failed_sample_refs` must include both execution failures
+        (`status != completed`) and semantic failures that finished running but
+        still produced an unusable training outcome, such as `gate=FAIL` or
+        `winner_state=none`.
+    """
+    status = str(row.get("status") or "").strip()
+    if status and status != "completed":
+        return True
+    if row.get("gate_accepted") is False:
+        return True
+    answer_type = str(row.get("answer_type") or "").strip()
+    winner_state = str(row.get("winner_state") or "").strip().lower()
+    if answer_type == "learning_summary" and winner_state == "none":
+        return True
+    return False
+
+
 def _summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
-    by_task: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "learning_summaries": 0})
+    by_task: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "count": 0,
+            "learning_summaries": 0,
+            "aligned_counts": _aligned_train_counts([]),
+            "__rows__": [],
+        }
+    )
 
     for r in results:
         task = r.get("task", "unknown")
         by_task[task]["count"] += 1
-        if r.get("answer_type") == "learning_summary":
+        if r.get("status") == "completed" and r.get("answer_type") == "learning_summary":
             by_task[task]["learning_summaries"] += 1
+        by_task[task]["__rows__"].append(r)
+
+    for task_summary in by_task.values():
+        task_summary["aligned_counts"] = _aligned_train_counts(task_summary.get("__rows__", []))
+        task_summary.pop("__rows__", None)
 
     return dict(by_task)
+
+
+def _aligned_train_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Build an explicit training stats glossary for one task's rows.
+
+    New definition:
+        ``aligned_counts`` separates execution health from learning quality.
+        These counts must not be inferred from one another.
+
+    Examples:
+        - ``execution_completed_n`` answers "how many rows ran to completion?"
+        - ``gate_pass_n`` answers "how many completed rows passed the quality gate?"
+        - ``validated_winner_n`` answers "how many learning summaries selected a
+          grounded winner path?"
+        - ``continuous_scored_n`` answers "how many winner rows have graded
+          metrics only (forecast/indicator style), so they are neither binary OK
+          nor binary FAIL?"
+    """
+    counts = {
+        "execution_total_n": 0,
+        "execution_completed_n": 0,
+        "execution_failed_n": 0,
+        "prediction_emitted_n": 0,
+        "gate_pass_n": 0,
+        "gate_fail_n": 0,
+        "learning_summary_n": 0,
+        "validated_winner_n": 0,
+        "no_winner_n": 0,
+        "binary_correct_n": 0,
+        "binary_incorrect_n": 0,
+        "continuous_scored_n": 0,
+    }
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        counts["execution_total_n"] += 1
+
+        status = str(row.get("status") or "").strip()
+        answer_type = str(row.get("answer_type") or "").strip()
+        winner_state = str(row.get("winner_state") or "").strip().lower()
+        winner_metrics = row.get("winner_metrics")
+        if not isinstance(winner_metrics, dict):
+            raw_answer = row.get("raw_answer")
+            if isinstance(raw_answer, dict) and isinstance(raw_answer.get("winner_metrics"), dict):
+                winner_metrics = dict(raw_answer.get("winner_metrics") or {})
+            else:
+                winner_metrics = {}
+        correctness = PipelineRunner._learning_outcome_correctness(winner_metrics)
+
+        if status == "completed":
+            counts["execution_completed_n"] += 1
+        elif status:
+            counts["execution_failed_n"] += 1
+
+        if bool(row.get("has_prediction")):
+            counts["prediction_emitted_n"] += 1
+
+        if row.get("gate_accepted") is True:
+            counts["gate_pass_n"] += 1
+        elif row.get("gate_accepted") is False:
+            counts["gate_fail_n"] += 1
+
+        if status == "completed" and answer_type == "learning_summary":
+            counts["learning_summary_n"] += 1
+            if winner_state == "selected":
+                if correctness is True:
+                    counts["validated_winner_n"] += 1
+                    counts["binary_correct_n"] += 1
+                elif correctness is False:
+                    counts["binary_incorrect_n"] += 1
+                elif winner_metrics:
+                    counts["validated_winner_n"] += 1
+                    counts["continuous_scored_n"] += 1
+            elif winner_state == "none":
+                counts["no_winner_n"] += 1
+
+    return counts
 
 
 async def main() -> None:

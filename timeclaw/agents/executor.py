@@ -23,7 +23,10 @@ from timeclaw.clawhub.tool_base import ToolResult
 from timeclaw.clawhub.tool_registry import get_tool_instance
 from timeclaw.core import trace_logger as trace
 from timeclaw.core.agent_base import AgentBase
+from timeclaw.core.confidence import coerce_confidence
 from timeclaw.core.evidence import EvidenceEntry
+from timeclaw.core.indicator_answers import canonical_indicator_key, canonicalize_indicator_answer
+from timeclaw.core.learning_text import sanitize_learning_evidence_text
 from timeclaw.core.message import AgentRole
 from timeclaw.core.tea_protocol import TaskEnvelope
 
@@ -35,16 +38,14 @@ MIN_TRAINING_CANDIDATES = 2
 SUBAGENT_TIMEOUT_SECONDS = 120
 MAX_JSON_JUDGE_ATTEMPTS = 2
 MAX_TERMINAL_REPAIR_ATTEMPTS = 3
+MAX_NON_ACTION_SELF_CORRECTIONS_PER_STEP = 2
+MAX_DECISION_RECOVERY_EXHAUSTIONS_PER_STEP = 2
 _ORCHESTRATION_ONLY_TOOLS = frozenset({
     "spawn_subagent",
     "evaluate_against_gt",
     "evaluate_batch_against_gt",
     "batch_evaluate_against_gt",
 })
-_DECISION_TOOL_CALL = "emit_tool_call"
-_DECISION_SPAWN = "emit_spawn_subagent"
-_DECISION_EVALUATE = "emit_evaluate_call"
-_DECISION_FINISH = "emit_final_answer"
 
 
 class MaxStepsExhaustedError(RuntimeError):
@@ -67,6 +68,30 @@ class MaxStepsExhaustedError(RuntimeError):
         )
         if sub_agent_idx is not None:
             detail = f"{self.agent_kind} {sub_agent_idx} exhausted max steps without producing a finalized answer"
+        super().__init__(detail)
+
+
+class DecisionOutputExhaustedError(RuntimeError):
+    """Raised when decision delivery keeps failing before any new evidence is gathered."""
+
+    def __init__(
+        self,
+        *,
+        agent_kind: str,
+        failure_reason: str,
+        sub_agent_idx: int | None = None,
+        partial_result: dict[str, Any] | None = None,
+    ) -> None:
+        self.agent_kind = str(agent_kind)
+        self.failure_reason = str(failure_reason)
+        self.sub_agent_idx = sub_agent_idx
+        self.partial_result = dict(partial_result or {})
+        detail = f"{self.agent_kind} failed before gathering new evidence: {self.failure_reason}"
+        if sub_agent_idx is not None:
+            detail = (
+                f"{self.agent_kind} {sub_agent_idx} failed before gathering new evidence: "
+                f"{self.failure_reason}"
+            )
         super().__init__(detail)
 
 
@@ -112,6 +137,22 @@ class ExecutorAgent(AgentBase):
         ]
 
     @classmethod
+    def _parse_memory_tool_chains(cls, value: str) -> list[list[str]]:
+        chains: list[list[str]] = []
+        for raw_chain in str(value or "").split("||"):
+            chain = [
+                token
+                for token in (
+                    item.strip()
+                    for item in raw_chain.split("->")
+                )
+                if token and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", token)
+            ]
+            if chain:
+                chains.append(chain)
+        return chains
+
+    @classmethod
     def _extract_train_path_priors(
         cls,
         memory_text: str,
@@ -122,19 +163,20 @@ class ExecutorAgent(AgentBase):
             if not line.startswith("- "):
                 continue
             fields = cls._parse_memory_entry_fields(line)
-            preferred = cls._parse_memory_tool_list(fields.get("Prefer", ""))
-            if not preferred:
+            preferred_paths = cls._parse_memory_tool_chains(fields.get("Prefer Path", ""))
+            if not preferred_paths:
                 continue
             support_match = re.search(
                 r"(\d+)\s+note\(s\)",
                 str(fields.get("Evidence", "")).strip(),
             )
             support = int(support_match.group(1)) if support_match else 0
-            priors.append({
-                "path": preferred,
-                "support": support,
-                "summary": fields.get("Rule", ""),
-            })
+            for preferred in preferred_paths:
+                priors.append({
+                    "path": preferred,
+                    "support": support,
+                    "summary": fields.get("Rule", ""),
+                })
         return priors
 
     @classmethod
@@ -152,11 +194,11 @@ class ExecutorAgent(AgentBase):
                 lines.append(line)
                 continue
             fields = cls._parse_memory_entry_fields(stripped)
-            if "Prefer" not in fields and "Avoid" not in fields:
+            if "Prefer Path" not in fields and "Avoid Path" not in fields:
                 lines.append(line)
                 continue
             kept_parts: list[str] = []
-            for key in ("Rule", "When", "Why", "Evidence"):
+            for key in ("Rule", "When", "Prefer", "Avoid", "Why", "Evidence"):
                 value = fields.get(key)
                 if value:
                     kept_parts.append(f"{key}: {value}")
@@ -316,7 +358,7 @@ class ExecutorAgent(AgentBase):
             )
             title_line = (
                 "Training First-Spawn Prior:\n"
-                f"- Historical preferred branch family: {', '.join(tools)}.\n"
+                f"- Historical preferred branch path: {' -> '.join(tools)}.\n"
             )
         elif support_tools and not anchor_tools:
             guide_line = (
@@ -328,7 +370,7 @@ class ExecutorAgent(AgentBase):
             )
             title_line = (
                 "Training First-Spawn Prior:\n"
-                f"- Historical preferred support family for branch design: {', '.join(tools)}.\n"
+                f"- Historical preferred support path for branch design: {' -> '.join(tools)}.\n"
             )
         elif len(anchor_tools) > 1:
             guide_line = (
@@ -340,7 +382,7 @@ class ExecutorAgent(AgentBase):
             )
             title_line = (
                 "Training First-Spawn Prior:\n"
-                f"- Historical preferred tool family for branch design: {', '.join(tools)}.\n"
+                f"- Historical preferred branch path for design: {' -> '.join(tools)}.\n"
             )
         elif anchor_tools:
             guide_line = (
@@ -350,7 +392,7 @@ class ExecutorAgent(AgentBase):
             )
             title_line = (
                 "Training First-Spawn Prior:\n"
-                f"- Historical preferred branch anchor: {', '.join(tools)}.\n"
+                f"- Historical preferred branch path: {' -> '.join(tools)}.\n"
             )
         else:
             guide_line = (
@@ -361,7 +403,7 @@ class ExecutorAgent(AgentBase):
             )
             title_line = (
                 "Training First-Spawn Prior:\n"
-                f"- Historical preferred direct reasoning path: {', '.join(tools)}.\n"
+                f"- Historical preferred direct reasoning path: {' -> '.join(tools)}.\n"
             )
         return (
             title_line
@@ -696,13 +738,18 @@ class ExecutorAgent(AgentBase):
         )
 
         tool_names_text = executor_prompt.build_tool_name_text(candidates)
+        selected_tool_note_keys = self._selected_tool_note_keys(
+            perception.get("tool_notes", {}),
+            candidates,
+            task_type,
+        )
         tool_notes_section = self._build_tool_notes_section(
             perception.get("tool_notes", {}),
             candidates,
             task_type,
         )
 
-        # SOUL (fixed) + MEMORY (per-scope + cross_domain) → system prompt
+        # SOUL (fixed) + injectable per-scope MEMORY → system prompt
         system_memory = ""
         soul = perception.get("soul_prompt", "")
         raw_memory = perception.get("memory_l2", "")
@@ -768,6 +815,15 @@ class ExecutorAgent(AgentBase):
             "tool_notes_section": tool_notes_section,
             "skills_section": skills_section,
             "system_memory": system_memory,
+            "memory_audit": {
+                "soul_text": soul,
+                "memory_text": mem,
+                "system_memory_text": system_memory,
+                "skills_text": skills_section,
+                "tool_notes_section": tool_notes_section,
+                "tool_note_keys": selected_tool_note_keys,
+                "tool_note_count": len(selected_tool_note_keys),
+            },
             "train_path_priors": train_path_priors,
             "modality_hint": modality_hint,
             "profiling_section": profiling_section,
@@ -801,6 +857,7 @@ class ExecutorAgent(AgentBase):
         execution_log: list[dict[str, Any]] = []
         current_data = data
         current_series_state = self._initial_series_state(current_data)
+        series_sources = self._initial_series_sources(current_data, current_series_state)
         last_tool_result: Any = None
         accepted_answer: Any = None
         norm_inverse: dict[str, Any] | None = None
@@ -833,16 +890,65 @@ class ExecutorAgent(AgentBase):
             else plan["task_type"]
         )
 
-        first_user = executor_prompt.REACT_FIRST_TURN.format(
-            task_prompt=plan.get("task_description", ""),
-            task_boundary_section=self._render_prompt_section(
-                "Task Boundary",
-                self._build_task_boundary_section(
-                    plan["task_type"],
-                    horizon=plan.get("horizon"),
-                    indicator_output_keys=plan.get("indicator_output_keys", []),
+        task_boundary_section = self._render_prompt_section(
+            "Task Boundary",
+            self._build_task_boundary_section(
+                plan["task_type"],
+                horizon=plan.get("horizon"),
+                indicator_output_keys=plan.get("indicator_output_keys", []),
+            ),
+        )
+        execution_context_section = self._render_prompt_section(
+            "Execution Context",
+            "",
+        )
+        control_context_section = self._render_prompt_section(
+            "Control Context",
+            self._join_prompt_sections(
+                self._build_action_state_section(
+                    state="need_evidence",
+                    required_final_type=expected_final_type,
+                    execution_log=execution_log,
+                ),
+                self._build_train_spawn_prior_section(
+                    plan.get("train_spawn_prior_path", []),
+                ) if is_train else "",
+                plan.get("subagent_slot_section", ""),
+            ),
+        )
+        output_contract_section = self._render_prompt_section(
+            "Output Contract",
+            self._build_main_output_contract_section(
+                task_type=plan["task_type"],
+                horizon=plan.get("horizon"),
+                is_train=is_train,
+                defer_learning_record=defer_learning_record,
+                indicator_output_keys=plan.get("indicator_output_keys", []),
+                allow_finish_current_turn=self._main_finish_allowed_this_turn(
+                    execution_log=execution_log,
+                    plan=plan,
                 ),
             ),
+        )
+        support_section = self._render_prompt_section(
+            "Support",
+            self._join_prompt_sections(
+                plan.get("reanalysis_section", ""),
+                plan.get("tool_notes_section", ""),
+                plan.get("skills_section", ""),
+            ),
+        )
+        decision_section = self._build_decision_section(
+            allow_finish=self._main_finish_allowed_this_turn(
+                execution_log=execution_log,
+                plan=plan,
+            ),
+            spawn_available="spawn_subagent" in candidates,
+        )
+
+        first_user = executor_prompt.REACT_FIRST_TURN.format(
+            task_prompt=plan.get("task_description", ""),
+            task_boundary_section=task_boundary_section,
             fingerprint=self._format_prompt_payload(
                 self._prepare_prompt_fingerprint(
                     plan["fingerprint"],
@@ -851,55 +957,31 @@ class ExecutorAgent(AgentBase):
                 limit=5000,
             ),
             profiling_section=plan.get("profiling_section", ""),
-            execution_context_section=self._render_prompt_section(
-                "Execution Context",
-                "",
-            ),
-            control_context_section=self._render_prompt_section(
-                "Control Context",
-                self._join_prompt_sections(
-                    self._build_action_state_section(
-                        state="need_evidence",
-                        required_final_type=expected_final_type,
-                        execution_log=execution_log,
-                    ),
-                    self._build_train_spawn_prior_section(
-                        plan.get("train_spawn_prior_path", []),
-                    ) if is_train else "",
-                    plan.get("subagent_slot_section", ""),
-                ),
-            ),
-            output_contract_section=self._render_prompt_section(
-                "Output Contract",
-                self._build_main_output_contract_section(
-                    task_type=plan["task_type"],
-                    horizon=plan.get("horizon"),
-                    is_train=is_train,
-                    defer_learning_record=defer_learning_record,
-                    indicator_output_keys=plan.get("indicator_output_keys", []),
-                    allow_finish_current_turn=self._main_finish_allowed_this_turn(
-                        execution_log=execution_log,
-                        plan=plan,
-                    ),
-                ),
-            ),
-            support_section=self._render_prompt_section(
-                "Support",
-                self._join_prompt_sections(
-                    plan.get("reanalysis_section", ""),
-                    plan.get("tool_notes_section", ""),
-                    plan.get("skills_section", ""),
-                ),
-            ),
-            decision_section=self._build_decision_section(
-                allow_finish=self._main_finish_allowed_this_turn(
-                    execution_log=execution_log,
-                    plan=plan,
-                ),
-                spawn_available="spawn_subagent" in candidates,
-            ),
+            execution_context_section=execution_context_section,
+            control_context_section=control_context_section,
+            output_contract_section=output_contract_section,
+            support_section=support_section,
+            decision_section=decision_section,
             tool_names=plan["tool_names"],
         )
+
+        base_control_context = self._normalize_control_context({
+            "completion_notes": "",
+            "audit": self._build_control_context_audit(
+                memory_injected=plan.get("memory_audit"),
+                prompt_sections=[
+                    self._build_prompt_section_audit(name="system_prompt", text=system_prompt),
+                    self._build_prompt_section_audit(name="first_user", text=first_user),
+                    self._build_prompt_section_audit(name="task_boundary_section", text=task_boundary_section),
+                    self._build_prompt_section_audit(name="execution_context_section", text=execution_context_section),
+                    self._build_prompt_section_audit(name="control_context_section", text=control_context_section),
+                    self._build_prompt_section_audit(name="output_contract_section", text=output_contract_section),
+                    self._build_prompt_section_audit(name="support_section", text=support_section),
+                    self._build_prompt_section_audit(name="decision_section", text=decision_section),
+                ],
+            ),
+        })
+        accepted_control_context = base_control_context
 
         conversation: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
@@ -1025,104 +1107,305 @@ class ExecutorAgent(AgentBase):
                 ).strip(),
             })
 
-            decision_conversation = conversation
-            if repair_delivery_mode:
-                decision_conversation = self._build_clean_repair_delivery_conversation(
-                    expected_type=expected_final_type,
-                    task_type=plan["task_type"],
-                    task_description=plan.get("task_description", ""),
-                    execution_log=execution_log,
-                    recoverable_final=recoverable_answer or recoverable_final,
-                    feedback_messages=repair_delivery_feedback_messages,
-                    horizon=plan.get("horizon"),
-                    indicator_output_keys=plan.get("indicator_output_keys", []),
-                )
-            response, decision = await self._request_structured_decision(
-                decision_conversation,
-                allow_tool_call=not repair_delivery_mode,
-                allow_finish=allow_finish,
-                ordinary_tool_names=ordinary_tool_names,
-                evaluate_tool_names=evaluate_tool_names,
-                spawn_available=spawn_available,
-                fallback_thought="LLM parse failed",
-                finish_mode=(
-                    "learning_summary"
-                    if is_train
-                    else "task"
-                ),
-            )
-            # GT sanitisation: after the LLM has seen and analysed the
-            # evaluate_against_gt result (this step), strip the ground_truth
-            # values from the tool observation so subsequent steps can't see them.
-            if _gt_obs_idx is not None:
-                self._sanitise_gt_observation(conversation, _gt_obs_idx)
-                _gt_obs_idx = None
-
-            thought = decision.get("thought", "")
-            is_done = decision.get("done", False)
-            parse_failed = bool(decision.get("_parse_failed"))
-
-            if parse_failed and step < MAX_REACT_STEPS:
-                invalid_json_msg = self._invalid_json_self_correction_message(thought)
+            response = None
+            decision: dict[str, Any] = {}
+            thought = ""
+            is_done = False
+            advance_to_next_step = False
+            non_action_self_corrections = 0
+            decision_recovery_exhaustions = 0
+            while True:
+                decision_conversation = conversation
                 if repair_delivery_mode:
-                    repair_delivery_feedback_messages = [invalid_json_msg]
-                trace.agent_step("executor", f"react_step_{step}", {
-                    "self_correction": True,
-                    "reason": "invalid_json_response",
-                    "thought": thought,
-                    "response_preview": self._decision_response_preview(response),
-                })
-                conversation.append({
-                    "role": "user",
-                    "content": invalid_json_msg,
-                })
-                skip_generic_turn_prompt_once = True
-                continue
-
-            conversation.append({
-                "role": "assistant",
-                "content": self._decision_to_conversation_text(decision),
-            })
-
-            if not self._has_structured_thought(thought) and step < MAX_REACT_STEPS:
-                structured_thought_msg = (
-                    "Self-correction: your `thought` must explicitly include "
-                    "`Reason:` and `Action:`. Please continue "
-                    "with the required structure."
+                    decision_conversation = self._build_clean_repair_delivery_conversation(
+                        expected_type=expected_final_type,
+                        task_type=plan["task_type"],
+                        task_description=plan.get("task_description", ""),
+                        execution_log=execution_log,
+                        recoverable_final=recoverable_answer or recoverable_final,
+                        feedback_messages=repair_delivery_feedback_messages,
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                    )
+                response, decision = await self._request_structured_decision(
+                    decision_conversation,
+                    allow_tool_call=not repair_delivery_mode,
+                    allow_finish=allow_finish,
+                    ordinary_tool_names=ordinary_tool_names,
+                    evaluate_tool_names=evaluate_tool_names,
+                    spawn_available=spawn_available,
+                    fallback_thought="LLM parse failed",
+                    finish_mode=(
+                        "learning_summary"
+                        if is_train
+                        else "task"
+                    ),
                 )
-                if repair_delivery_mode:
-                    repair_delivery_feedback_messages = [structured_thought_msg]
-                trace.agent_step("executor", f"react_step_{step}", {
-                    "self_correction": True,
-                    "reason": "unstructured_or_unparsed_response",
-                    "parsed_type": type(response.parsed).__name__,
-                    "parsed_is_dict": isinstance(response.parsed, dict),
-                    "thought": thought,
-                    "response_preview": self._decision_response_preview(response),
-                })
-                conversation.append({
-                    "role": "user",
-                    "content": structured_thought_msg,
-                })
-                skip_generic_turn_prompt_once = True
+                # GT sanitisation: after the LLM has seen and analysed the
+                # evaluate_against_gt result (this step), strip the ground_truth
+                # values from the tool observation so subsequent steps can't see them.
+                if _gt_obs_idx is not None:
+                    self._sanitise_gt_observation(conversation, _gt_obs_idx)
+                    _gt_obs_idx = None
+
+                thought = decision.get("thought", "")
+                is_done = decision.get("done", False)
+                parse_failed = bool(decision.get("_parse_failed"))
+
+                if parse_failed:
+                    invalid_json_msg = self._invalid_json_self_correction_message(thought)
+                    if repair_delivery_mode:
+                        repair_delivery_feedback_messages = [invalid_json_msg]
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "self_correction": True,
+                        "reason": "invalid_json_response",
+                        "thought": thought,
+                        "response_preview": self._decision_response_preview(response),
+                        "same_step_retry": (
+                            non_action_self_corrections < MAX_NON_ACTION_SELF_CORRECTIONS_PER_STEP
+                        ),
+                    })
+                    conversation.append({
+                        "role": "user",
+                        "content": invalid_json_msg,
+                    })
+                    skip_generic_turn_prompt_once = True
+                    if non_action_self_corrections < MAX_NON_ACTION_SELF_CORRECTIONS_PER_STEP:
+                        non_action_self_corrections += 1
+                        continue
+                    if decision_recovery_exhaustions < MAX_DECISION_RECOVERY_EXHAUSTIONS_PER_STEP:
+                        decision_recovery_exhaustions += 1
+                        non_action_self_corrections = 0
+                        continue
+                    if repair_delivery_mode:
+                        recoverable_decision = self._decision_from_recoverable_final(
+                            self._recoverable_failure_record(
+                                expected_type=expected_final_type,
+                                task_type=plan["task_type"],
+                                execution_log=execution_log,
+                                horizon=plan.get("horizon"),
+                                indicator_output_keys=plan.get("indicator_output_keys", []),
+                            ),
+                            thought=(
+                                "Reason: Repair delivery still has a fully execution-grounded final "
+                                "payload available, so another formatting retry would not add new "
+                                "evidence. Action: Finish with that recovered payload unchanged."
+                            ),
+                        )
+                        if recoverable_decision is not None:
+                            decision = recoverable_decision
+                            thought = str(decision.get("thought") or thought)
+                            is_done = True
+                            break
+                    failure_reason = "decision_parse_exhausted"
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "self_correction": True,
+                        "reason": failure_reason,
+                        "thought": thought,
+                        "response_preview": self._decision_response_preview(response),
+                    })
+                    raise DecisionOutputExhaustedError(
+                        agent_kind="executor",
+                        failure_reason=failure_reason,
+                        partial_result=self._failure_partial_result(
+                            expected_type=expected_final_type,
+                            task_type=plan["task_type"],
+                            execution_log=execution_log,
+                            horizon=plan.get("horizon"),
+                            indicator_output_keys=plan.get("indicator_output_keys", []),
+                            recoverable_final=recoverable_answer or recoverable_final,
+                            failure_reason=failure_reason,
+                        ),
+                    )
+
+                if not parse_failed:
+                    conversation.append({
+                        "role": "assistant",
+                        "content": self._decision_to_conversation_text(decision),
+                    })
+
+                if not self._has_structured_thought(thought):
+                    structured_thought_msg = (
+                        "Self-correction: your `thought` must explicitly include "
+                        "`Reason:` and `Action:`. Please continue "
+                        "with the required structure."
+                    )
+                    if repair_delivery_mode:
+                        repair_delivery_feedback_messages = [structured_thought_msg]
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "self_correction": True,
+                        "reason": "unstructured_or_unparsed_response",
+                        "parsed_type": type(response.parsed).__name__,
+                        "parsed_is_dict": isinstance(response.parsed, dict),
+                        "thought": thought,
+                        "response_preview": self._decision_response_preview(response),
+                        "same_step_retry": (
+                            non_action_self_corrections < MAX_NON_ACTION_SELF_CORRECTIONS_PER_STEP
+                        ),
+                    })
+                    conversation.append({
+                        "role": "user",
+                        "content": structured_thought_msg,
+                    })
+                    skip_generic_turn_prompt_once = True
+                    if non_action_self_corrections < MAX_NON_ACTION_SELF_CORRECTIONS_PER_STEP:
+                        non_action_self_corrections += 1
+                        continue
+                    if decision_recovery_exhaustions < MAX_DECISION_RECOVERY_EXHAUSTIONS_PER_STEP:
+                        decision_recovery_exhaustions += 1
+                        non_action_self_corrections = 0
+                        continue
+                    if repair_delivery_mode:
+                        recoverable_decision = self._decision_from_recoverable_final(
+                            self._recoverable_failure_record(
+                                expected_type=expected_final_type,
+                                task_type=plan["task_type"],
+                                execution_log=execution_log,
+                                horizon=plan.get("horizon"),
+                                indicator_output_keys=plan.get("indicator_output_keys", []),
+                            ),
+                            thought=(
+                                "Reason: Repair delivery already has an execution-grounded final "
+                                "payload, and repeated formatting retries are no longer changing "
+                                "the evidence. Action: Finish with that recovered payload."
+                            ),
+                        )
+                        if recoverable_decision is not None:
+                            decision = recoverable_decision
+                            thought = str(decision.get("thought") or thought)
+                            is_done = True
+                            break
+                    failure_reason = "decision_format_exhausted"
+                    trace.agent_step("executor", f"react_step_{step}", {
+                        "self_correction": True,
+                        "reason": failure_reason,
+                        "thought": thought,
+                        "response_preview": self._decision_response_preview(response),
+                    })
+                    raise DecisionOutputExhaustedError(
+                        agent_kind="executor",
+                        failure_reason=failure_reason,
+                        partial_result=self._failure_partial_result(
+                            expected_type=expected_final_type,
+                            task_type=plan["task_type"],
+                            execution_log=execution_log,
+                            horizon=plan.get("horizon"),
+                            indicator_output_keys=plan.get("indicator_output_keys", []),
+                            recoverable_final=recoverable_answer or recoverable_final,
+                            failure_reason=failure_reason,
+                        ),
+                    )
+
+                tool_name = str(decision.get("tool") or "").strip()
+                tool_args = decision.get("args", {})
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+                    decision["args"] = tool_args
+
+                if (
+                    not is_done
+                    and tool_name == "spawn_subagent"
+                    and not repair_delivery_mode
+                ):
+                    prepared_spawn_tasks, spawn_validation_reason, spawn_validation_detail = (
+                        self._prepare_main_spawn_subagent_tasks(
+                            tool_args=tool_args,
+                            execution_log=execution_log,
+                            plan=plan,
+                            is_train=is_train,
+                            needs_more_candidates=needs_more_candidates,
+                        )
+                    )
+                    if spawn_validation_detail:
+                        trace.agent_step("executor", f"react_step_{step}", {
+                            "thought": thought,
+                            "tool": "spawn_subagent",
+                            "self_correction": True,
+                            "reason": spawn_validation_reason or "invalid_subagent_slots",
+                            "detail": spawn_validation_detail,
+                            "same_step_retry": (
+                                non_action_self_corrections < MAX_NON_ACTION_SELF_CORRECTIONS_PER_STEP
+                            ),
+                        })
+                        conversation.append({"role": "user", "content": spawn_validation_detail})
+                        skip_generic_turn_prompt_once = True
+                        if non_action_self_corrections < MAX_NON_ACTION_SELF_CORRECTIONS_PER_STEP:
+                            non_action_self_corrections += 1
+                            continue
+                        if decision_recovery_exhaustions < MAX_DECISION_RECOVERY_EXHAUSTIONS_PER_STEP:
+                            decision_recovery_exhaustions += 1
+                            non_action_self_corrections = 0
+                            continue
+                        failure_reason = str(
+                            spawn_validation_reason or "invalid_subagent_slots_exhausted"
+                        )
+                        raise DecisionOutputExhaustedError(
+                            agent_kind="executor",
+                            failure_reason=failure_reason,
+                            partial_result=self._failure_partial_result(
+                                expected_type=expected_final_type,
+                                task_type=plan["task_type"],
+                                execution_log=execution_log,
+                                horizon=plan.get("horizon"),
+                                indicator_output_keys=plan.get("indicator_output_keys", []),
+                                recoverable_final=recoverable_answer or recoverable_final,
+                                failure_reason=failure_reason,
+                            ),
+                        )
+                    decision["_prepared_spawn_tasks"] = list(prepared_spawn_tasks or [])
+                break
+
+            if advance_to_next_step:
                 continue
 
             if is_done:
+                repair_record = (
+                    recoverable_answer if isinstance(recoverable_answer, dict) and recoverable_answer
+                    else recoverable_final if isinstance(recoverable_final, dict) and recoverable_final
+                    else None
+                )
                 agent_answer = decision.get("answer")
                 agent_answer_type = decision.get("answer_type", "")
                 agent_confidence = decision.get("confidence")
-                agent_reasoning = decision.get("reasoning", thought)
+                agent_reasoning = self._coerce_reasoning_text(decision.get("reasoning", thought))
                 agent_execution_context = self._normalize_execution_context(
                     decision.get("execution_context"),
                     execution_log=execution_log,
                 )
+                if (
+                    repair_delivery_mode
+                    and isinstance(repair_record, dict)
+                    and not any(
+                        agent_execution_context.get(key)
+                        for key in ("tool_chain", "public_reasoning", "evidence_summary")
+                    )
+                ):
+                    agent_execution_context = self._normalize_execution_context(
+                        repair_record.get("execution_context"),
+                        execution_log=execution_log,
+                    )
+                if (
+                    repair_delivery_mode
+                    and isinstance(repair_record, dict)
+                    and not agent_reasoning
+                ):
+                    agent_reasoning = self._coerce_reasoning_text(
+                        repair_record.get("reasoning", thought)
+                    )
                 agent_reasoning = self._normalize_reasoning_for_reuse(
                     agent_reasoning,
                     execution_log,
                     agent_execution_context,
                 )
-                agent_control_context = self._normalize_control_context(
-                    decision.get("control_context")
+                repair_base_control_context = base_control_context
+                if repair_delivery_mode and isinstance(repair_record, dict):
+                    repair_base_control_context = self._merge_control_context(
+                        base_control_context,
+                        repair_record.get("control_context"),
+                    )
+                agent_control_context = self._merge_control_context(
+                    repair_base_control_context,
+                    decision.get("control_context"),
                 )
                 is_train = plan.get("_mode") == "train"
                 deferred_learning_record = bool(plan.get("_defer_learning_record", False))
@@ -1249,7 +1532,18 @@ class ExecutorAgent(AgentBase):
                         logger.info(
                             "[Executor] Self-correction: training main agent returned task-typed final answer, retrying"
                         )
-                        conversation.append({"role": "user", "content": correction_msg})
+                        recoverable_learning_summary = self._recoverable_learning_summary_record_from_execution_log(
+                            execution_log=execution_log,
+                            task_type=plan["task_type"],
+                            horizon=plan.get("horizon"),
+                            indicator_output_keys=plan.get("indicator_output_keys", []),
+                        )
+                        if recoverable_learning_summary is not None:
+                            recoverable_final = recoverable_learning_summary
+                            repair_delivery_mode = True
+                            repair_delivery_feedback_messages = [correction_msg]
+                        else:
+                            conversation.append({"role": "user", "content": correction_msg})
                         trace.agent_step("executor", f"react_step_{step}", {
                             "thought": thought,
                             "done": True,
@@ -1268,30 +1562,70 @@ class ExecutorAgent(AgentBase):
                     continue
 
                 if learning_summary_required and not self._is_valid_learning_summary_answer(agent_answer):
-                    correction_msg = self._learning_summary_validation_message(agent_answer)
-                    if step < MAX_REACT_STEPS:
+                    recoverable_learning_summary = self._recoverable_learning_summary_record_from_execution_log(
+                        execution_log=execution_log,
+                        task_type=plan["task_type"],
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                    )
+                    if recoverable_learning_summary is not None:
                         logger.info(
-                            "[Executor] Self-correction: malformed learning_summary payload, retrying"
+                            "[Executor] Normalized malformed learning_summary from execution log"
                         )
-                        conversation.append({"role": "user", "content": correction_msg})
+                        agent_answer = recoverable_learning_summary.get("answer")
+                        agent_answer_type = str(
+                            recoverable_learning_summary.get("answer_type") or agent_answer_type
+                        )
+                        agent_confidence = recoverable_learning_summary.get("confidence")
+                        agent_reasoning = self._coerce_reasoning_text(
+                            recoverable_learning_summary.get("reasoning", agent_reasoning)
+                        )
+                        agent_execution_context = self._normalize_execution_context(
+                            recoverable_learning_summary.get("execution_context"),
+                            execution_log=execution_log,
+                        )
+                        agent_control_context = self._merge_control_context(
+                            agent_control_context,
+                            recoverable_learning_summary.get("control_context"),
+                        )
                         trace.agent_step("executor", f"react_step_{step}", {
                             "thought": thought,
                             "done": True,
                             "self_correction": True,
-                            "reason": "invalid_learning_summary_payload",
+                            "reason": "normalized_invalid_learning_summary_from_execution_log",
+                            "answer_type": agent_answer_type,
+                            "answer_python_type": type(agent_answer).__name__,
+                        })
+                    if not self._is_valid_learning_summary_answer(agent_answer):
+                        correction_msg = self._learning_summary_validation_message(agent_answer)
+                        if step < MAX_REACT_STEPS:
+                            logger.info(
+                                "[Executor] Self-correction: malformed learning_summary payload, retrying"
+                            )
+                            if recoverable_learning_summary is not None:
+                                recoverable_final = recoverable_learning_summary
+                                repair_delivery_mode = True
+                                repair_delivery_feedback_messages = [correction_msg]
+                            else:
+                                conversation.append({"role": "user", "content": correction_msg})
+                            trace.agent_step("executor", f"react_step_{step}", {
+                                "thought": thought,
+                                "done": True,
+                                "self_correction": True,
+                                "reason": "invalid_learning_summary_payload",
+                                "answer_type": agent_answer_type,
+                                "answer_python_type": type(agent_answer).__name__,
+                            })
+                            continue
+                        trace.agent_step("executor", f"react_step_{step}", {
+                            "thought": thought,
+                            "done": True,
+                            "self_correction": True,
+                            "reason": "invalid_learning_summary_payload_at_last_step",
                             "answer_type": agent_answer_type,
                             "answer_python_type": type(agent_answer).__name__,
                         })
                         continue
-                    trace.agent_step("executor", f"react_step_{step}", {
-                        "thought": thought,
-                        "done": True,
-                        "self_correction": True,
-                        "reason": "invalid_learning_summary_payload_at_last_step",
-                        "answer_type": agent_answer_type,
-                        "answer_python_type": type(agent_answer).__name__,
-                    })
-                    continue
 
                 # Self-correction: if the declared answer_type doesn't match
                 # the requested task_type and we have steps remaining, ask the
@@ -1432,6 +1766,19 @@ class ExecutorAgent(AgentBase):
                         horizon=plan.get("horizon"),
                         indicator_output_keys=plan.get("indicator_output_keys", []),
                         require_tool_use=(plan.get("_mode") != "train"),
+                    )
+                if solve_ready_current and not learning_summary_allowed:
+                    agent_execution_context = self._recoverable_execution_context_from_trace(
+                        tool_chain=self._reasoning_substantive_tool_chain(execution_log),
+                        answer=agent_answer,
+                        reasoning=agent_reasoning,
+                        execution_context=agent_execution_context,
+                        execution_log=execution_log,
+                    )
+                    agent_reasoning = self._normalize_reasoning_for_reuse(
+                        agent_reasoning,
+                        execution_log,
+                        agent_execution_context,
                     )
                 if solve_ready_current:
                     recoverable_answer = self._recoverable_final_record(
@@ -1588,91 +1935,30 @@ class ExecutorAgent(AgentBase):
                         "error": "not_available_in_mode",
                     })
                     continue
-                used_slot_ids: set[int] = set()
-                spawn_rounds = 0
-                for entry in execution_log:
-                    if not isinstance(entry, dict) or entry.get("tool") != "spawn_subagent":
-                        continue
-                    spawn_rounds += 1
-                    output = entry.get("output") or []
-                    if isinstance(output, dict):
-                        output = output.get("results") or []
-                    for item in output:
-                        if not isinstance(item, dict):
-                            continue
-                        result = item.get("result") or {}
-                        slot_id = result.get("slot_id")
-                        if isinstance(slot_id, int):
-                            used_slot_ids.add(slot_id)
-                spawn_min_tasks = 0
                 if is_train:
                     if needs_more_candidates:
                         pending_spawn_requirement = True
-                    spawn_min_tasks = MIN_TRAINING_CANDIDATES
-                slot_error = self._validate_spawn_subagent_tasks(
-                    tool_args.get("tasks", []),
-                    plan.get("subagent_slots", []),
-                    min_tasks=spawn_min_tasks,
-                    disallowed_slot_ids=used_slot_ids if is_train and spawn_rounds > 0 else None,
-                )
-                if slot_error:
-                    conversation.append({"role": "user", "content": slot_error})
-                    trace.agent_step("executor", f"react_step_{step}", {
-                        "thought": thought,
-                        "tool": "spawn_subagent",
-                        "self_correction": True,
-                        "reason": "invalid_subagent_slots",
-                        "detail": slot_error,
-                    })
-                    continue
-                normalized_tasks, normalize_error = self._normalize_spawn_tasks(
-                    tool_args.get("tasks", []),
-                    plan=plan,
-                )
-                if normalize_error:
-                    conversation.append({"role": "user", "content": normalize_error})
-                    trace.agent_step("executor", f"react_step_{step}", {
-                        "thought": thought,
-                        "tool": "spawn_subagent",
-                        "self_correction": True,
-                        "reason": "non_distinct_subagent_paths_after_dropout",
-                        "detail": normalize_error,
-                    })
-                    continue
-                if is_train and spawn_rounds == 0:
-                    prior_mix_error = self._validate_first_spawn_prior_mix(
-                        normalized_tasks,
-                        prior_path=plan.get("train_spawn_prior_path", []),
+                normalized_tasks = decision.get("_prepared_spawn_tasks")
+                if not isinstance(normalized_tasks, list):
+                    normalized_tasks, spawn_validation_reason, spawn_validation_detail = (
+                        self._prepare_main_spawn_subagent_tasks(
+                            tool_args=tool_args,
+                            execution_log=execution_log,
+                            plan=plan,
+                            is_train=is_train,
+                            needs_more_candidates=needs_more_candidates,
+                        )
                     )
-                    if prior_mix_error:
-                        conversation.append({"role": "user", "content": prior_mix_error})
+                    if spawn_validation_detail:
+                        conversation.append({"role": "user", "content": spawn_validation_detail})
                         trace.agent_step("executor", f"react_step_{step}", {
                             "thought": thought,
                             "tool": "spawn_subagent",
                             "self_correction": True,
-                            "reason": "first_spawn_prior_mix_missing",
-                            "detail": prior_mix_error,
-                            "prior_path": plan.get("train_spawn_prior_path", []),
+                            "reason": spawn_validation_reason or "invalid_subagent_slots",
+                            "detail": spawn_validation_detail,
                         })
                         continue
-                if len(normalized_tasks) < max(1, spawn_min_tasks):
-                    detail = (
-                        "Self-correction: after deriving advisory paths from the selected "
-                        "slots' visible tools, only "
-                        f"{len(normalized_tasks)} distinct branch(es) remain. Choose more "
-                        "distinct `slot_id`s so this spawn round keeps enough different paths."
-                    )
-                    conversation.append({"role": "user", "content": detail})
-                    trace.agent_step("executor", f"react_step_{step}", {
-                        "thought": thought,
-                        "tool": "spawn_subagent",
-                        "self_correction": True,
-                        "reason": "insufficient_distinct_subagent_paths_after_dropout",
-                        "requested_tasks": len(tool_args.get("tasks", [])),
-                        "normalized_tasks": len(normalized_tasks),
-                        "min_tasks": max(1, spawn_min_tasks),
-                    })
-                    continue
                 sub_results = await self._spawn_subagents(
                     {"tasks": normalized_tasks}, plan, envelope,
                 )
@@ -1714,10 +2000,27 @@ class ExecutorAgent(AgentBase):
                 })
                 continue
 
-            runtime_incompatibility_msg = self._tool_runtime_incompatibility_message(
-                tool_name,
+            selected_data, selected_state, selected_source_ref, source_error = self._resolve_series_source(
+                tool_args.get("source_ref"),
                 current_data=current_data,
                 current_series_state=current_series_state,
+                series_sources=series_sources,
+            )
+            if source_error:
+                conversation.append({"role": "user", "content": source_error})
+                trace.agent_step("executor", f"react_step_{step}", {
+                    "thought": thought,
+                    "tool": tool_name,
+                    "self_correction": True,
+                    "reason": "unknown_source_ref",
+                    "source_ref": tool_args.get("source_ref"),
+                })
+                continue
+
+            runtime_incompatibility_msg = self._tool_runtime_incompatibility_message(
+                tool_name,
+                current_data=selected_data,
+                current_series_state=selected_state,
             )
             if runtime_incompatibility_msg:
                 conversation.append({"role": "user", "content": runtime_incompatibility_msg})
@@ -1726,6 +2029,7 @@ class ExecutorAgent(AgentBase):
                     "tool": tool_name,
                     "self_correction": True,
                     "reason": "runtime_incompatible_tool",
+                    "source_ref": selected_source_ref,
                 })
                 continue
 
@@ -1871,7 +2175,7 @@ class ExecutorAgent(AgentBase):
 
             pre_tool_series_state = dict(current_series_state)
             result = await self._execute_tool(
-                tool_name, tool_args, current_data, text_data, images,
+                tool_name, tool_args, selected_data, text_data, images,
             )
 
             success = result is not None and result.success
@@ -1892,6 +2196,12 @@ class ExecutorAgent(AgentBase):
                         downstream_data=downstream_data,
                         previous_series_state=pre_tool_series_state,
                         tool_args=tool_args,
+                    )
+                    self._register_series_source(
+                        series_sources,
+                        ref=self._series_source_ref_for_step(step, tool_name),
+                        data=downstream_data,
+                        state=current_series_state,
                     )
             else:
                 error_msg = result.error if result else "tool not found"
@@ -1923,6 +2233,10 @@ class ExecutorAgent(AgentBase):
                 "content": self._build_state_update_message(
                     current_series_state=current_series_state,
                     latest_artifact_state=latest_artifact_state,
+                    accessible_series_sources=self._series_source_prompt_payload(
+                        series_sources=series_sources,
+                        current_series_state=current_series_state,
+                    ),
                     task_answer_status=self._task_answer_status(
                         task_type=plan["task_type"],
                         candidate=observation_payload,
@@ -1947,6 +2261,7 @@ class ExecutorAgent(AgentBase):
                 "output": result.data if success else None,
                 "observation": observation_payload,
                 "thought": thought,
+                "source_ref": selected_source_ref,
             }
             redundancy_status = self._latest_redundancy_status(
                 task_type=plan["task_type"],
@@ -1962,6 +2277,10 @@ class ExecutorAgent(AgentBase):
                 "content": self._build_state_update_message(
                     current_series_state=current_series_state,
                     latest_artifact_state=latest_artifact_state,
+                    accessible_series_sources=self._series_source_prompt_payload(
+                        series_sources=series_sources,
+                        current_series_state=current_series_state,
+                    ),
                     task_answer_status=self._task_answer_status(
                         task_type=plan["task_type"],
                         candidate=observation_payload,
@@ -2033,188 +2352,240 @@ class ExecutorAgent(AgentBase):
                 plan.get("_mode") == "train"
                 and not bool(plan.get("_defer_learning_record", False))
             )
-            terminal_valid = False
-            for terminal_attempt in range(MAX_TERMINAL_REPAIR_ATTEMPTS):
-                terminal_decision = await self._request_terminal_path_review(
-                    expected_type=expected_final_type,
+            training_contract_satisfied = (
+                not learning_summary_required
+                or self._training_completion_contract_satisfied(
+                    execution_log,
                     task_type=plan["task_type"],
-                    task_description=plan.get("task_description", ""),
-                    execution_log=execution_log,
-                    trace_phase="act_terminal_self_correction",
-                    feedback_messages=terminal_feedback_messages,
                     horizon=plan.get("horizon"),
                     indicator_output_keys=plan.get("indicator_output_keys", []),
-                    recoverable_final=recoverable_answer or recoverable_final,
                 )
-                terminal_answer = terminal_decision.get("answer")
-                terminal_answer_type = terminal_decision.get("answer_type", "")
-                terminal_reasoning = terminal_decision.get(
-                    "reasoning",
-                    terminal_decision.get("thought", ""),
-                )
-                terminal_failure_reason = ""
-                terminal_valid = bool(terminal_decision.get("done", False))
-                if terminal_decision.get("_parse_failed"):
-                    terminal_valid = False
-                    terminal_failure_reason = "invalid_json_or_missing_required_fields"
-                elif not terminal_valid:
-                    terminal_failure_reason = "not_finished"
-                elif terminal_answer is None:
-                    terminal_valid = False
-                    terminal_failure_reason = "missing_answer"
-                elif terminal_answer_type != expected_final_type:
-                    terminal_valid = False
-                    terminal_failure_reason = "wrong_answer_type"
-                elif (
-                    not learning_summary_required
-                    and plan.get("_mode") != "train"
-                    and not self._subagent_made_any_tool_call(execution_log)
-                ):
-                    terminal_valid = False
-                    terminal_failure_reason = "no_tool_use"
-                elif learning_summary_required:
-                    if not self._subagent_made_any_tool_call(execution_log):
-                        terminal_valid = False
-                        terminal_failure_reason = "no_tool_use"
-                    elif not self._is_valid_learning_summary_answer(terminal_answer):
-                        terminal_valid = False
-                        terminal_failure_reason = "invalid_learning_summary"
-                    elif not self._training_completion_contract_satisfied(
+            )
+            terminal_valid = False
+            recovered_terminal = self._recoverable_failure_record(
+                expected_type=expected_final_type,
+                task_type=plan["task_type"],
+                execution_log=execution_log,
+                horizon=plan.get("horizon"),
+                indicator_output_keys=plan.get("indicator_output_keys", []),
+            )
+            if recovered_terminal is not None and (
+                recoverable_final is None
+                or str(recoverable_final.get("answer_type") or "") != expected_final_type
+            ):
+                recoverable_final = recovered_terminal
+            locked_recoverable_final = recoverable_answer or recoverable_final
+            if learning_summary_required and not training_contract_satisfied:
+                trace.agent_step("executor", "act_terminal_self_correction_skipped", {
+                    "reason": "training_contract_unsatisfied",
+                    "training_contract": self._training_contract_status(
                         execution_log,
                         task_type=plan["task_type"],
                         horizon=plan.get("horizon"),
                         indicator_output_keys=plan.get("indicator_output_keys", []),
-                    ):
-                        terminal_valid = False
-                        terminal_failure_reason = "training_contract_unsatisfied"
-                else:
-                    present_in_prior_assistant_history = self._is_task_answer_present_in_assistant_history(
-                        plan["task_type"],
-                        terminal_answer,
-                        conversation[:-1],
+                    ),
+                })
+            else:
+                for terminal_attempt in range(MAX_TERMINAL_REPAIR_ATTEMPTS):
+                    terminal_decision = await self._request_terminal_path_review(
+                        expected_type=expected_final_type,
+                        task_type=plan["task_type"],
+                        task_description=plan.get("task_description", ""),
+                        execution_log=execution_log,
+                        trace_phase="act_terminal_self_correction",
+                        feedback_messages=terminal_feedback_messages,
                         horizon=plan.get("horizon"),
                         indicator_output_keys=plan.get("indicator_output_keys", []),
+                        recoverable_final=locked_recoverable_final,
                     )
-                    if not self._is_valid_final_answer(
-                        plan["task_type"],
-                        terminal_answer,
-                        horizon=plan.get("horizon"),
-                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                    terminal_answer = terminal_decision.get("answer")
+                    terminal_answer_type = terminal_decision.get("answer_type", "")
+                    terminal_reasoning = terminal_decision.get(
+                        "reasoning",
+                        terminal_decision.get("thought", ""),
+                    )
+                    terminal_failure_reason = ""
+                    terminal_valid = bool(terminal_decision.get("done", False))
+                    if terminal_decision.get("_parse_failed"):
+                        terminal_valid = False
+                        terminal_failure_reason = "invalid_json_or_missing_required_fields"
+                    elif not terminal_valid:
+                        terminal_failure_reason = "not_finished"
+                    elif terminal_answer is None:
+                        terminal_valid = False
+                        terminal_failure_reason = "missing_answer"
+                    elif terminal_answer_type != expected_final_type:
+                        terminal_valid = False
+                        terminal_failure_reason = "wrong_answer_type"
+                    elif (
+                        not learning_summary_required
+                        and plan.get("_mode") != "train"
+                        and not self._subagent_made_any_tool_call(execution_log)
                     ):
                         terminal_valid = False
-                        terminal_failure_reason = "invalid_final_answer"
-                    elif not (
-                        self._is_task_answer_backed_by_tool_output(
+                        terminal_failure_reason = "no_tool_use"
+                    elif learning_summary_required:
+                        if not self._subagent_made_any_tool_call(execution_log):
+                            terminal_valid = False
+                            terminal_failure_reason = "no_tool_use"
+                        elif not self._is_valid_learning_summary_answer(terminal_answer):
+                            terminal_valid = False
+                            terminal_failure_reason = "invalid_learning_summary"
+                        elif not training_contract_satisfied:
+                            terminal_valid = False
+                            terminal_failure_reason = "training_contract_unsatisfied"
+                    else:
+                        present_in_prior_assistant_history = self._is_task_answer_present_in_assistant_history(
                             plan["task_type"],
                             terminal_answer,
-                            execution_log,
+                            conversation[:-1],
                             horizon=plan.get("horizon"),
                             indicator_output_keys=plan.get("indicator_output_keys", []),
                         )
-                        or present_in_prior_assistant_history
-                    ):
-                        terminal_valid = False
-                        terminal_failure_reason = "unsupported_answer"
-                if not terminal_valid:
-                    trace.agent_step("executor", "act_terminal_self_correction_invalid", {
-                        "reason": terminal_failure_reason or "invalid_terminal_delivery",
-                        "done": bool(terminal_decision.get("done", False)),
-                        "answer_type": terminal_answer_type,
-                        "parse_failed": bool(terminal_decision.get("_parse_failed")),
-                    })
-                    if terminal_attempt + 1 >= MAX_TERMINAL_REPAIR_ATTEMPTS:
-                        break
-                    terminal_feedback_messages = [
-                        self._terminal_delivery_correction_message(
+                        if not self._is_valid_final_answer(
+                            plan["task_type"],
+                            terminal_answer,
+                            horizon=plan.get("horizon"),
+                            indicator_output_keys=plan.get("indicator_output_keys", []),
+                        ):
+                            terminal_valid = False
+                            terminal_failure_reason = "invalid_final_answer"
+                        elif not (
+                            self._is_task_answer_backed_by_tool_output(
+                                plan["task_type"],
+                                terminal_answer,
+                                execution_log,
+                                horizon=plan.get("horizon"),
+                                indicator_output_keys=plan.get("indicator_output_keys", []),
+                            )
+                            or present_in_prior_assistant_history
+                        ):
+                            terminal_valid = False
+                            terminal_failure_reason = "unsupported_answer"
+                        elif not self._terminal_answer_preserves_recoverable_answer(
                             expected_type=expected_final_type,
-                            failure_reason=terminal_failure_reason,
-                        )
-                    ]
-                    continue
+                            task_type=plan["task_type"],
+                            recoverable_final=locked_recoverable_final,
+                            candidate_answer=terminal_answer,
+                            horizon=plan.get("horizon"),
+                            indicator_output_keys=plan.get("indicator_output_keys", []),
+                        ):
+                            terminal_valid = False
+                            terminal_failure_reason = "changed_recoverable_answer"
+                    if not terminal_valid:
+                        trace.agent_step("executor", "act_terminal_self_correction_invalid", {
+                            "reason": terminal_failure_reason or "invalid_terminal_delivery",
+                            "done": bool(terminal_decision.get("done", False)),
+                            "answer_type": terminal_answer_type,
+                            "parse_failed": bool(terminal_decision.get("_parse_failed")),
+                        })
+                        if terminal_attempt + 1 >= MAX_TERMINAL_REPAIR_ATTEMPTS:
+                            break
+                        terminal_feedback_messages = [
+                            self._terminal_delivery_correction_message(
+                                expected_type=expected_final_type,
+                                failure_reason=terminal_failure_reason,
+                            )
+                        ]
+                        continue
 
-                terminal_execution_context = self._normalize_execution_context(
-                    terminal_decision.get("execution_context"),
-                    execution_log=execution_log,
-                )
-                terminal_reasoning = self._normalize_reasoning_for_reuse(
-                    terminal_reasoning,
-                    execution_log,
-                    terminal_execution_context,
-                )
-                terminal_recoverable = self._recoverable_final_record(
-                    answer=terminal_answer,
-                    answer_type=terminal_answer_type,
-                    confidence=terminal_decision.get("confidence"),
-                    reasoning=terminal_reasoning,
-                    execution_context=terminal_execution_context,
-                    control_context=self._normalize_control_context(
-                        terminal_decision.get("control_context")
-                    ),
-                )
-                try:
-                    terminal_reuse_verdict = await self._final_payload_reusability_verdict(
-                        mode=plan.get("_mode"),
-                        reasoning=terminal_reasoning,
-                        execution_context=terminal_execution_context,
+                    terminal_execution_context = self._normalize_execution_context(
+                        terminal_decision.get("execution_context"),
                         execution_log=execution_log,
                     )
-                except Exception as e:
-                    self._attach_partial_result_to_exception(
-                        e,
+                    if not learning_summary_required:
+                        terminal_execution_context = self._recoverable_execution_context_from_trace(
+                            tool_chain=self._reasoning_substantive_tool_chain(execution_log),
+                            answer=terminal_answer,
+                            reasoning=terminal_reasoning,
+                            execution_context=terminal_execution_context,
+                            execution_log=execution_log,
+                        )
+                    terminal_reasoning = self._normalize_reasoning_for_reuse(
+                        terminal_reasoning,
+                        execution_log,
+                        terminal_execution_context,
+                    )
+                    terminal_recoverable = self._recoverable_final_record(
                         answer=terminal_answer,
                         answer_type=terminal_answer_type,
                         confidence=terminal_decision.get("confidence"),
                         reasoning=terminal_reasoning,
                         execution_context=terminal_execution_context,
-                        control_context=self._normalize_control_context(
-                            terminal_decision.get("control_context")
+                        control_context=self._merge_control_context(
+                            base_control_context,
+                            terminal_decision.get("control_context"),
                         ),
-                        execution_log=execution_log,
                     )
-                    raise
-                if terminal_reuse_verdict.get("passed", False):
-                    accepted_answer = terminal_answer
-                    accepted_answer_type = terminal_answer_type
-                    accepted_confidence = terminal_decision.get("confidence")
-                    accepted_reasoning = terminal_reasoning
-                    accepted_execution_context = terminal_execution_context
-                    accepted_control_context = terminal_recoverable.get("control_context")
-                    trace.agent_step("executor", "act_terminal_self_correction_accepted", {
-                        "answer_type": terminal_answer_type,
-                        "confidence": accepted_confidence,
-                        "has_answer": True,
-                    })
-                    terminal_valid = True
-                    break
+                    try:
+                        terminal_reuse_verdict = await self._final_payload_reusability_verdict(
+                            mode=plan.get("_mode"),
+                            reasoning=terminal_reasoning,
+                            execution_context=terminal_execution_context,
+                            execution_log=execution_log,
+                        )
+                    except Exception as e:
+                        self._attach_partial_result_to_exception(
+                            e,
+                            answer=terminal_answer,
+                            answer_type=terminal_answer_type,
+                            confidence=terminal_decision.get("confidence"),
+                            reasoning=terminal_reasoning,
+                            execution_context=terminal_execution_context,
+                            control_context=self._merge_control_context(
+                                base_control_context,
+                                terminal_decision.get("control_context"),
+                            ),
+                            execution_log=execution_log,
+                        )
+                        raise
+                    if terminal_reuse_verdict.get("passed", False):
+                        accepted_answer = terminal_answer
+                        accepted_answer_type = terminal_answer_type
+                        accepted_confidence = terminal_decision.get("confidence")
+                        accepted_reasoning = terminal_reasoning
+                        accepted_execution_context = terminal_execution_context
+                        accepted_control_context = terminal_recoverable.get("control_context")
+                        trace.agent_step("executor", "act_terminal_self_correction_accepted", {
+                            "answer_type": terminal_answer_type,
+                            "confidence": accepted_confidence,
+                            "has_answer": True,
+                        })
+                        terminal_valid = True
+                        break
 
-                terminal_valid = False
-                recoverable_final = terminal_recoverable
-                trace.agent_step("executor", "act_terminal_self_correction_rejected", {
-                    "reason": (
-                        "execution_context_not_reusable"
-                        if not terminal_reuse_verdict["execution_context_verdict"].get("passed", False)
-                        else "reasoning_too_shallow"
-                    ),
-                    "execution_context_gate_missing": list(
-                        terminal_reuse_verdict["execution_context_verdict"].get("missing", [])
-                    ),
-                    "execution_context_gate_explanation": str(
-                        terminal_reuse_verdict["execution_context_verdict"].get("explanation") or ""
-                    ),
-                    "reasoning_gate_missing": list(
-                        terminal_reuse_verdict["reasoning_verdict"].get("missing", [])
-                    ),
-                    "reasoning_gate_explanation": str(
-                        terminal_reuse_verdict["reasoning_verdict"].get("explanation") or ""
-                    ),
-                })
-                if terminal_attempt + 1 >= MAX_TERMINAL_REPAIR_ATTEMPTS:
-                    break
-                terminal_feedback_messages = self._terminal_payload_repair_messages(
-                    execution_log,
-                    terminal_reuse_verdict,
-                )
-            if not accepted_answer_type and recoverable_final is not None:
+                    terminal_valid = False
+                    recoverable_final = terminal_recoverable
+                    trace.agent_step("executor", "act_terminal_self_correction_rejected", {
+                        "reason": (
+                            "execution_context_not_reusable"
+                            if not terminal_reuse_verdict["execution_context_verdict"].get("passed", False)
+                            else "reasoning_too_shallow"
+                        ),
+                        "execution_context_gate_missing": list(
+                            terminal_reuse_verdict["execution_context_verdict"].get("missing", [])
+                        ),
+                        "execution_context_gate_explanation": str(
+                            terminal_reuse_verdict["execution_context_verdict"].get("explanation") or ""
+                        ),
+                        "reasoning_gate_missing": list(
+                            terminal_reuse_verdict["reasoning_verdict"].get("missing", [])
+                        ),
+                        "reasoning_gate_explanation": str(
+                            terminal_reuse_verdict["reasoning_verdict"].get("explanation") or ""
+                        ),
+                    })
+                    if terminal_attempt + 1 >= MAX_TERMINAL_REPAIR_ATTEMPTS:
+                        break
+                    terminal_feedback_messages = self._terminal_payload_repair_messages(
+                        execution_log,
+                        terminal_reuse_verdict,
+                    )
+            if (
+                not accepted_answer_type
+                and recoverable_final is not None
+                and not (learning_summary_required and not training_contract_satisfied)
+            ):
                 accepted_answer = recoverable_final.get("answer")
                 accepted_answer_type = str(recoverable_final.get("answer_type") or "")
                 accepted_confidence = recoverable_final.get("confidence")
@@ -2228,8 +2599,9 @@ class ExecutorAgent(AgentBase):
                     execution_log,
                     accepted_execution_context,
                 )
-                accepted_control_context = self._normalize_control_context(
-                    recoverable_final.get("control_context")
+                accepted_control_context = self._merge_control_context(
+                    base_control_context,
+                    recoverable_final.get("control_context"),
                 )
                 trace.agent_step("executor", "act_recoverable_final_fallback", {
                     "answer_type": accepted_answer_type,
@@ -2238,15 +2610,34 @@ class ExecutorAgent(AgentBase):
                 })
 
         if not accepted_answer_type:
+            failure_reason = (
+                "training_contract_unsatisfied"
+                if (
+                    plan.get("_mode") == "train"
+                    and not bool(plan.get("_defer_learning_record", False))
+                    and not self._training_completion_contract_satisfied(
+                        execution_log,
+                        task_type=plan["task_type"],
+                        horizon=plan.get("horizon"),
+                        indicator_output_keys=plan.get("indicator_output_keys", []),
+                    )
+                )
+                else "max_steps_exhausted_without_final_answer"
+            )
             trace.agent_step("executor", "act_incomplete", {
-                "reason": "max_steps_exhausted_without_final_answer",
+                "reason": failure_reason,
                 "steps": MAX_REACT_STEPS,
                 "last_tool_result_preview": str(last_tool_result)[:5000] if last_tool_result is not None else None,
             })
-            raise MaxStepsExhaustedError(
-                agent_kind="executor",
-                max_steps=MAX_REACT_STEPS,
-                partial_result={
+            partial_result = self._failure_partial_result(
+                expected_type=expected_final_type,
+                task_type=plan["task_type"],
+                execution_log=execution_log,
+                horizon=plan.get("horizon"),
+                indicator_output_keys=plan.get("indicator_output_keys", []),
+                recoverable_final=recoverable_answer or recoverable_final,
+                failure_reason=failure_reason,
+                extra={
                     "prediction": accepted_answer,
                     "answer": accepted_answer,
                     "answer_type": accepted_answer_type,
@@ -2254,15 +2645,24 @@ class ExecutorAgent(AgentBase):
                     "reasoning": accepted_reasoning,
                     "execution_context": accepted_execution_context,
                     "control_context": accepted_control_context,
-                    "execution_log": list(execution_log),
-                    "tool_chain": [e.get("tool", "") for e in execution_log if e.get("tool")],
-                    "failure_reason": "max_steps_exhausted_without_final_answer",
                     "last_tool_result_preview": (
                         str(last_tool_result)[:5000] if last_tool_result is not None else ""
                     ),
                 },
             )
+            if failure_reason == "training_contract_unsatisfied":
+                raise DecisionOutputExhaustedError(
+                    agent_kind="executor",
+                    failure_reason=failure_reason,
+                    partial_result=partial_result,
+                )
+            raise MaxStepsExhaustedError(
+                agent_kind="executor",
+                max_steps=MAX_REACT_STEPS,
+                partial_result=partial_result,
+            )
 
+        accepted_confidence = coerce_confidence(accepted_confidence)
         final_result = accepted_answer
         if norm_inverse and final_result is not None:
             final_result = self._denormalize_prediction(final_result, norm_inverse)
@@ -2566,17 +2966,7 @@ class ExecutorAgent(AgentBase):
 
     @staticmethod
     def _canonical_indicator_key(key: str) -> str:
-        normalized = str(key).strip().lower()
-        alias_map = {
-            "upper_bollinger_band": "upper_bb",
-            "upper_bollinger_bands": "upper_bb",
-            "bollinger_upper": "upper_bb",
-            "bb_upper": "upper_bb",
-            "macd_values": "macd",
-            "macd_forecast": "macd",
-            "requested_indicator_key": "indicator_name",
-        }
-        return alias_map.get(normalized, normalized)
+        return canonical_indicator_key(key)
 
     @classmethod
     def _canonicalize_indicator_answer(
@@ -2585,40 +2975,10 @@ class ExecutorAgent(AgentBase):
         *,
         indicator_output_keys: list[str] | None = None,
     ) -> Any:
-        candidate = answer
-        if isinstance(candidate, dict) and isinstance(candidate.get("answer"), dict):
-            normalized_inner = cls._canonicalize_indicator_answer(
-                candidate["answer"],
-                indicator_output_keys=indicator_output_keys,
-            )
-            if normalized_inner is candidate["answer"]:
-                return candidate
-            wrapped = dict(candidate)
-            wrapped["answer"] = normalized_inner
-            return wrapped
-        if not isinstance(candidate, dict) or not candidate:
-            return answer
-
-        expected_keys = [
-            str(key).strip()
-            for key in (indicator_output_keys or [])
-            if str(key).strip()
-        ]
-        canonical_expected = [cls._canonical_indicator_key(key) for key in expected_keys]
-        actual_items = list(candidate.items())
-        canonical_actual = [
-            (cls._canonical_indicator_key(str(key)), value) for key, value in actual_items
-        ]
-
-        if expected_keys and len(canonical_actual) == 1:
-            canonical_key, value = canonical_actual[0]
-            if canonical_key == "indicator_name" or canonical_key in canonical_expected:
-                return {expected_keys[0]: value}
-
-        normalized = {
-            canonical_key: value for canonical_key, value in canonical_actual
-        }
-        return normalized
+        return canonicalize_indicator_answer(
+            answer,
+            indicator_output_keys=indicator_output_keys,
+        )
 
     @classmethod
     def _normalize_batch_eval_predictions_arg(
@@ -2755,6 +3115,39 @@ class ExecutorAgent(AgentBase):
         return aligned
 
     @classmethod
+    def _training_contract_status(
+        cls,
+        execution_log: list[dict[str, Any]],
+        *,
+        task_type: str,
+        horizon: int | None = None,
+        indicator_output_keys: list[str] | None = None,
+    ) -> dict[str, Any]:
+        candidate_count = cls._count_training_candidates(
+            execution_log,
+            task_type=task_type,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        )
+        spawned_candidate_count = cls._count_training_spawn_candidates(
+            execution_log,
+            task_type,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        )
+        has_eval = cls._has_training_evaluation(execution_log)
+        return {
+            "candidate_count": candidate_count,
+            "spawned_candidate_count": spawned_candidate_count,
+            "has_eval": has_eval,
+            "satisfied": (
+                candidate_count >= MIN_TRAINING_CANDIDATES
+                and spawned_candidate_count >= MIN_TRAINING_CANDIDATES
+                and has_eval
+            ),
+        }
+
+    @classmethod
     def _training_completion_contract_satisfied(
         cls,
         execution_log: list[dict[str, Any]],
@@ -2763,20 +3156,13 @@ class ExecutorAgent(AgentBase):
         horizon: int | None = None,
         indicator_output_keys: list[str] | None = None,
     ) -> bool:
-        return (
-            cls._has_training_evaluation(execution_log)
-            and cls._count_training_candidates(
+        return bool(
+            cls._training_contract_status(
                 execution_log,
                 task_type=task_type,
                 horizon=horizon,
                 indicator_output_keys=indicator_output_keys,
-            ) >= MIN_TRAINING_CANDIDATES
-            and cls._count_training_spawn_candidates(
-                execution_log,
-                task_type,
-                horizon=horizon,
-                indicator_output_keys=indicator_output_keys,
-            ) >= MIN_TRAINING_CANDIDATES
+            ).get("satisfied", False)
         )
 
     @classmethod
@@ -2834,19 +3220,15 @@ class ExecutorAgent(AgentBase):
         if remaining_turns <= 0:
             return ""
 
-        candidate_count = cls._count_training_candidates(
+        contract_status = cls._training_contract_status(
             execution_log,
             task_type=plan["task_type"],
             horizon=plan.get("horizon"),
             indicator_output_keys=plan.get("indicator_output_keys", []),
         )
-        spawned_candidate_count = cls._count_training_spawn_candidates(
-            execution_log,
-            plan["task_type"],
-            horizon=plan.get("horizon"),
-            indicator_output_keys=plan.get("indicator_output_keys", []),
-        )
-        has_eval = cls._has_training_evaluation(execution_log)
+        candidate_count = int(contract_status.get("candidate_count") or 0)
+        spawned_candidate_count = int(contract_status.get("spawned_candidate_count") or 0)
+        has_eval = bool(contract_status.get("has_eval", False))
 
         missing_candidates = candidate_count < MIN_TRAINING_CANDIDATES
         missing_spawned_candidates = spawned_candidate_count < MIN_TRAINING_CANDIDATES
@@ -2974,19 +3356,15 @@ class ExecutorAgent(AgentBase):
         if plan.get("_mode") != "train" or bool(plan.get("_defer_learning_record", False)):
             return False
 
-        candidate_count = cls._count_training_candidates(
+        contract_status = cls._training_contract_status(
             execution_log,
             task_type=plan["task_type"],
             horizon=plan.get("horizon"),
             indicator_output_keys=plan.get("indicator_output_keys", []),
         )
-        spawned_candidate_count = cls._count_training_spawn_candidates(
-            execution_log,
-            plan["task_type"],
-            horizon=plan.get("horizon"),
-            indicator_output_keys=plan.get("indicator_output_keys", []),
-        )
-        has_eval = cls._has_training_evaluation(execution_log)
+        candidate_count = int(contract_status.get("candidate_count") or 0)
+        spawned_candidate_count = int(contract_status.get("spawned_candidate_count") or 0)
+        has_eval = bool(contract_status.get("has_eval", False))
         if (
             candidate_count >= MIN_TRAINING_CANDIDATES
             and spawned_candidate_count >= MIN_TRAINING_CANDIDATES
@@ -3011,19 +3389,15 @@ class ExecutorAgent(AgentBase):
         if not spawn_candidate_available:
             return False
 
-        candidate_count = cls._count_training_candidates(
+        contract_status = cls._training_contract_status(
             execution_log,
             task_type=plan["task_type"],
             horizon=plan.get("horizon"),
             indicator_output_keys=plan.get("indicator_output_keys", []),
         )
-        spawned_candidate_count = cls._count_training_spawn_candidates(
-            execution_log,
-            plan["task_type"],
-            horizon=plan.get("horizon"),
-            indicator_output_keys=plan.get("indicator_output_keys", []),
-        )
-        has_eval = cls._has_training_evaluation(execution_log)
+        candidate_count = int(contract_status.get("candidate_count") or 0)
+        spawned_candidate_count = int(contract_status.get("spawned_candidate_count") or 0)
+        has_eval = bool(contract_status.get("has_eval", False))
         # New definition:
         # once training already has any task-valid candidate but still lacks the
         # required spawned branch set, another ordinary top-level tool call does
@@ -3285,8 +3659,9 @@ class ExecutorAgent(AgentBase):
             reuse_section = cls._render_prompt_section(
                 "Reuse Answer",
                 (
-                    "Reuse this exact answer payload unchanged unless it is structurally invalid "
-                    "for the required final type.\n"
+                    "Keep this exact answer payload unchanged. Repair mode may rewrite only "
+                    "`confidence`, `reasoning`, `execution_context`, and `control_context`; it "
+                    "must not change the answer content itself.\n"
                     f"{answer_preview[:2000]}"
                 ),
             )
@@ -3313,6 +3688,7 @@ class ExecutorAgent(AgentBase):
         output_lines = [
             "- Keep the answer grounded only in the execution trace below.",
             "- Rewrite `reasoning` as numbered steps that expand the same execution-side evidence.",
+            "- `thought` must keep the normal decision shape and explicitly contain both labeled parts in this order: `Reason:` then `Action:`.",
         ]
         if terminal_json:
             output_lines.append(
@@ -3321,7 +3697,11 @@ class ExecutorAgent(AgentBase):
             )
         else:
             output_lines.append(
-                "- Use the finish action now. Do not choose any ordinary tool call."
+                "- Return exactly one finish-action JSON object with `thought`, `done=true`, `answer`, "
+                f"`answer_type='{expected_type}'`, `confidence`, `reasoning`, `execution_context`, and `control_context`."
+            )
+            output_lines.append(
+                "- Do not return a bare final payload without the `thought` and `done=true` wrapper, because this repair path still goes through the normal decision parser."
             )
         if expected_type == "learning_summary":
             output_lines.append(
@@ -3417,11 +3797,744 @@ class ExecutorAgent(AgentBase):
         return {
             "answer": answer,
             "answer_type": answer_type,
-            "confidence": confidence,
+            "confidence": coerce_confidence(confidence),
             "reasoning": reasoning,
             "execution_context": execution_context,
             "control_context": control_context,
         }
+
+    @classmethod
+    def _recoverable_terminal_record(
+        cls,
+        *,
+        expected_type: str,
+        task_type: str,
+        execution_log: list[dict[str, Any]],
+        horizon: int | None,
+        indicator_output_keys: list[str] | None,
+    ) -> dict[str, Any] | None:
+        """Recover a terminal payload directly from executed evidence.
+
+        New definition:
+            Terminal recovery is execution-log-based, not prompt-based. When
+            the last LLM delivery step fails after a real tool path already
+            solved the task, recover the terminal payload from executed tool
+            evidence instead of requiring one more model rewrite.
+        """
+        if str(expected_type).strip() == "learning_summary":
+            return cls._recoverable_learning_summary_record_from_execution_log(
+                execution_log=execution_log,
+                task_type=task_type,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
+        return cls._recoverable_task_record_from_execution_log(
+            task_type=task_type,
+            execution_log=execution_log,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        )
+
+    @classmethod
+    def _recoverable_failure_record(
+        cls,
+        *,
+        expected_type: str,
+        task_type: str,
+        execution_log: list[dict[str, Any]],
+        horizon: int | None,
+        indicator_output_keys: list[str] | None,
+    ) -> dict[str, Any] | None:
+        expected_type_text = str(expected_type or "").strip()
+        if expected_type_text == "learning_summary" and not cls._training_completion_contract_satisfied(
+            execution_log,
+            task_type=task_type,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        ):
+            return cls._recoverable_task_record_from_execution_log(
+                task_type=task_type,
+                execution_log=execution_log,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
+        return cls._recoverable_terminal_record(
+            expected_type=expected_type,
+            task_type=task_type,
+            execution_log=execution_log,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        )
+
+    @classmethod
+    def _failure_partial_result(
+        cls,
+        *,
+        expected_type: str,
+        task_type: str,
+        execution_log: list[dict[str, Any]],
+        horizon: int | None,
+        indicator_output_keys: list[str] | None,
+        recoverable_final: dict[str, Any] | None = None,
+        failure_reason: str = "",
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        record = recoverable_final if isinstance(recoverable_final, dict) and recoverable_final else None
+        if record is None:
+            record = cls._recoverable_failure_record(
+                expected_type=expected_type,
+                task_type=task_type,
+                execution_log=execution_log,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
+        if isinstance(record, dict):
+            payload.update(record)
+        payload["execution_log"] = list(execution_log)
+        payload["tool_chain"] = [
+            str(entry.get("tool") or "").strip()
+            for entry in execution_log
+            if isinstance(entry, dict) and str(entry.get("tool") or "").strip()
+        ]
+        if failure_reason:
+            payload["failure_reason"] = str(failure_reason)
+        if str(expected_type or "").strip() == "learning_summary":
+            payload["training_contract"] = cls._training_contract_status(
+                execution_log,
+                task_type=task_type,
+                horizon=horizon,
+                indicator_output_keys=indicator_output_keys,
+            )
+        if isinstance(extra, dict):
+            payload.update(extra)
+        return payload
+
+    @classmethod
+    def _decision_from_recoverable_final(
+        cls,
+        record: dict[str, Any] | None,
+        *,
+        thought: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(record, dict) or not record:
+            return None
+        answer_type = str(record.get("answer_type") or "").strip()
+        if not answer_type:
+            return None
+        return {
+            "thought": thought,
+            "done": True,
+            "answer": record.get("answer"),
+            "answer_type": answer_type,
+            "confidence": record.get("confidence"),
+            "reasoning": record.get("reasoning"),
+            "execution_context": record.get("execution_context"),
+            "control_context": record.get("control_context"),
+        }
+
+    @staticmethod
+    def _recoverable_preview_text(value: Any, *, limit: int = 240) -> str:
+        try:
+            text = json.dumps(
+                ExecutorAgent._round_prompt_numbers(value),
+                ensure_ascii=False,
+                default=str,
+            )
+        except TypeError:
+            text = str(value)
+        return text if len(text) <= limit else text[:limit] + "..."
+
+    @classmethod
+    def _recoverable_reasoning_snippets(cls, text: Any, *, limit: int = 3) -> list[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        snippets: list[str] = []
+        seen: set[str] = set()
+        for part in re.split(r"(?<=[.!?])\s+|[;\n]+", raw):
+            cleaned = sanitize_learning_evidence_text(str(part), drop_imperatives=True)
+            cleaned = cleaned.strip()
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            snippets.append(cleaned)
+            if len(snippets) >= limit:
+                break
+        return snippets
+
+    @classmethod
+    def _recoverable_execution_context_from_trace(
+        cls,
+        *,
+        tool_chain: list[str],
+        answer: Any,
+        reasoning: Any,
+        execution_context: Any = None,
+        execution_log: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        normalized = cls._normalize_execution_context(
+            execution_context,
+            execution_log=execution_log,
+        )
+        if cls._has_reusable_execution_context(
+            normalized,
+            execution_log or [],
+        ):
+            return normalized
+
+        clean_chain = [str(tool).strip() for tool in tool_chain if str(tool).strip()]
+        snippets = list(normalized.get("public_reasoning") or [])
+        if not snippets:
+            snippets = cls._recoverable_reasoning_snippets(reasoning, limit=3)
+        if not snippets:
+            preview = cls._recoverable_preview_text(answer, limit=180)
+            if clean_chain:
+                snippets = [f"`{clean_chain[-1]}` produced {preview}."]
+            elif preview:
+                snippets = [f"The executed path produced {preview}."]
+        evidence_summary = str(normalized.get("evidence_summary") or "").strip()
+        if not evidence_summary:
+            if snippets:
+                evidence_summary = snippets[0]
+            elif clean_chain:
+                evidence_summary = (
+                    f"The executed path `{' -> '.join(clean_chain)}` produced the accepted result."
+                )
+        return {
+            "tool_chain": clean_chain or list(normalized.get("tool_chain") or []),
+            "public_reasoning": snippets[:3],
+            "evidence_summary": evidence_summary[:400].strip(),
+        }
+
+    @classmethod
+    def _has_reusable_execution_context(
+        cls,
+        execution_context: dict[str, Any] | None,
+        execution_log: list[dict[str, Any]],
+    ) -> bool:
+        normalized = cls._normalize_execution_context(
+            execution_context,
+            execution_log=execution_log,
+        )
+        substantive_tools = cls._available_substantive_tool_names(execution_log)
+        if not substantive_tools:
+            return True
+
+        tool_chain = [
+            str(item).strip()
+            for item in normalized.get("tool_chain") or []
+            if str(item).strip()
+        ]
+        public_reasoning = [
+            str(item).strip()
+            for item in normalized.get("public_reasoning") or []
+            if str(item).strip()
+        ]
+        evidence_summary = str(normalized.get("evidence_summary") or "").strip()
+        if not tool_chain or not public_reasoning or not evidence_summary:
+            return False
+
+        execution_text = "\n".join([*public_reasoning, evidence_summary]).lower()
+        hard_control_markers = (
+            "task-valid",
+            "ground truth",
+            "ground_truth",
+            "evaluate_against_gt",
+            "evaluate_batch_against_gt",
+            "batch_evaluate_against_gt",
+            "spawn_subagent",
+            "return unchanged",
+            "execution context",
+            "json repair",
+            "payload wrapping",
+            "before finishing",
+        )
+        if any(marker in execution_text for marker in hard_control_markers):
+            return False
+
+        candidate_labels = cls._reasoning_candidate_labels(execution_log)
+        mentioned_tools = cls._mentioned_substantive_tools(execution_text, substantive_tools)
+        mentioned_labels = cls._mentioned_candidate_path_labels(execution_text, candidate_labels)
+        if not mentioned_tools and not mentioned_labels:
+            return False
+
+        evidence_fragments = [*public_reasoning, evidence_summary]
+        if max((len(fragment) for fragment in evidence_fragments), default=0) < 60:
+            return False
+        if sum(len(fragment) for fragment in evidence_fragments) < 140:
+            return False
+        return True
+
+    @classmethod
+    def _recoverable_task_record_from_execution_log(
+        cls,
+        *,
+        task_type: str,
+        execution_log: list[dict[str, Any]],
+        horizon: int | None,
+        indicator_output_keys: list[str] | None,
+    ) -> dict[str, Any] | None:
+        for entry in reversed(execution_log):
+            tool_name = str(entry.get("tool") or "").strip()
+            if tool_name == "spawn_subagent":
+                output = entry.get("output") or []
+                for idx in range(len(output) - 1, -1, -1):
+                    item = output[idx]
+                    if not isinstance(item, dict) or not item.get("success"):
+                        continue
+                    result = item.get("result") or {}
+                    if not isinstance(result, dict):
+                        continue
+                    sub_execution_log = result.get("execution_log") or []
+                    answer = cls._unwrap_task_terminal_answer(
+                        task_type,
+                        result.get("answer", result.get("prediction")),
+                    )
+                    if task_type == "indicator":
+                        answer = cls._canonicalize_indicator_answer(
+                            answer,
+                            indicator_output_keys=indicator_output_keys,
+                        )
+                    if not cls._is_valid_final_answer(
+                        task_type,
+                        answer,
+                        horizon=horizon,
+                        indicator_output_keys=indicator_output_keys,
+                    ):
+                        continue
+                    if not cls._is_task_answer_backed_by_tool_output(
+                        task_type,
+                        answer,
+                        sub_execution_log,
+                        horizon=horizon,
+                        indicator_output_keys=indicator_output_keys,
+                    ):
+                        continue
+                    reasoning = str(result.get("reasoning") or "").strip()
+                    tool_chain = cls._reasoning_substantive_tool_chain(sub_execution_log)
+                    execution_context = cls._recoverable_execution_context_from_trace(
+                        tool_chain=tool_chain,
+                        answer=answer,
+                        reasoning=reasoning,
+                        execution_context=result.get("execution_context"),
+                        execution_log=sub_execution_log,
+                    )
+                    reasoning_text = cls._normalize_reasoning_for_reuse(
+                        reasoning or (
+                            f"1. `{' -> '.join(tool_chain) if tool_chain else task_type}` produced "
+                            f"the task answer {cls._recoverable_preview_text(answer, limit=120)}."
+                        ),
+                        sub_execution_log,
+                        execution_context,
+                    )
+                    return cls._recoverable_final_record(
+                        answer=answer,
+                        answer_type=task_type,
+                        confidence=result.get("confidence"),
+                        reasoning=reasoning_text,
+                        execution_context=execution_context,
+                        control_context=cls._normalize_control_context(
+                            result.get("control_context")
+                        ),
+                    )
+
+        top_level_records = cls._top_level_candidate_records(
+            execution_log,
+            task_type=task_type,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        )
+        if not top_level_records:
+            return None
+        record = top_level_records[-1]
+        answer = record.get("prediction")
+        tool_chain = [
+            str(tool).strip()
+            for tool in record.get("tool_chain") or []
+            if str(tool).strip()
+        ]
+        execution_context = cls._recoverable_execution_context_from_trace(
+            tool_chain=tool_chain,
+            answer=answer,
+            reasoning="",
+            execution_context=None,
+            execution_log=execution_log,
+        )
+        reasoning = (
+            f"1. `{' -> '.join(tool_chain) if tool_chain else task_type}` produced "
+            f"the task answer {cls._recoverable_preview_text(answer, limit=120)}."
+        )
+        return cls._recoverable_final_record(
+            answer=answer,
+            answer_type=task_type,
+            confidence=None,
+            reasoning=reasoning,
+            execution_context=execution_context,
+            control_context={"completion_notes": ""},
+        )
+
+    @classmethod
+    def _observed_task_answer_from_execution_log(
+        cls,
+        *,
+        task_type: str,
+        execution_log: list[dict[str, Any]],
+        horizon: int | None,
+        indicator_output_keys: list[str] | None,
+    ) -> Any | None:
+        """Recover the task answer directly observed in substantive tool output.
+
+        New definition:
+            When a branch-level wrapped `result.answer` disagrees with the
+            branch's real tool observations, batch evaluation should use the
+            observed tool-backed answer instead of the wrapped payload.
+        """
+        top_level_records = cls._top_level_candidate_records(
+            execution_log,
+            task_type=task_type,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        )
+        if not top_level_records:
+            return None
+        return top_level_records[-1].get("prediction")
+
+    @staticmethod
+    def _recoverable_metrics_score(metrics: dict[str, Any]) -> tuple[int, float]:
+        if isinstance(metrics.get("accuracy"), (int, float)):
+            return (0, -float(metrics["accuracy"]))
+        if isinstance(metrics.get("correct"), bool):
+            return (0, 0.0 if metrics["correct"] else 1.0)
+        for key in ("mae", "avg_mae", "rmse", "mse", "max_mae"):
+            if isinstance(metrics.get(key), (int, float)):
+                return (1, float(metrics[key]))
+        return (9, 0.0)
+
+    @classmethod
+    def _recoverable_metric_summary(cls, metrics: dict[str, Any]) -> str:
+        if not isinstance(metrics, dict):
+            return ""
+        parts: list[str] = []
+        for key in ("accuracy", "correct", "mae", "avg_mae", "rmse", "mse", "max_mae", "mape"):
+            value = metrics.get(key)
+            if isinstance(value, bool):
+                parts.append(f"{key}={str(value).lower()}")
+            elif isinstance(value, (int, float)):
+                parts.append(f"{key}={float(value):.3f}")
+        return ", ".join(parts[:4])
+
+    @staticmethod
+    def _recoverable_candidate_identity_key(name: Any, tool_chain: list[str], index: int) -> str:
+        clean_chain = [str(tool).strip() for tool in tool_chain if str(tool).strip()]
+        if clean_chain:
+            return " -> ".join(clean_chain)
+        clean_name = str(name or "").strip()
+        if clean_name:
+            return clean_name
+        return f"candidate_{index}"
+
+    @classmethod
+    def _recoverable_branch_anchored_candidate_key(
+        cls,
+        candidate: dict[str, Any],
+        index: int,
+    ) -> str:
+        path = " -> ".join(
+            str(tool).strip()
+            for tool in candidate.get("tool_chain") or []
+            if str(tool).strip()
+        )
+        stable = str(candidate.get("name") or "").strip()
+        base = str(candidate.get("candidate_key") or "").strip()
+        if stable:
+            if not path:
+                return stable
+            if stable.lower() == path.lower() or path.lower() in stable.lower():
+                return stable
+            return f"{stable} :: {path}"
+        if path:
+            return path
+        if base:
+            return base
+        return f"candidate_{index}"
+
+    @classmethod
+    def _disambiguate_recoverable_candidate_keys(
+        cls,
+        candidates: list[dict[str, Any]],
+    ) -> None:
+        grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for index, candidate in enumerate(candidates):
+            key = str(candidate.get("candidate_key") or candidate.get("name") or "").strip()
+            if not key:
+                continue
+            grouped.setdefault(key, []).append((index, candidate))
+        for group in grouped.values():
+            if len(group) <= 1:
+                continue
+            for index, candidate in group:
+                candidate["candidate_key"] = cls._recoverable_branch_anchored_candidate_key(
+                    candidate,
+                    index,
+                )
+
+    @classmethod
+    def _recoverable_training_candidates(
+        cls,
+        *,
+        execution_log: list[dict[str, Any]],
+        task_type: str,
+        horizon: int | None,
+        indicator_output_keys: list[str] | None,
+    ) -> list[dict[str, Any]]:
+        candidates: list[dict[str, Any]] = []
+
+        def _trace_keys(candidate: dict[str, Any]) -> set[str]:
+            keys = {
+                str(candidate.get("name") or "").strip().lower(),
+                str(candidate.get("candidate_key") or "").strip().lower(),
+                " -> ".join(candidate.get("tool_chain") or []).lower(),
+            }
+            return {key for key in keys if key}
+
+        def _match_candidate(name: Any, prediction: Any) -> dict[str, Any] | None:
+            name_text = str(name or "").strip().lower()
+            if name_text:
+                for candidate in candidates:
+                    if name_text in _trace_keys(candidate):
+                        return candidate
+            for candidate in candidates:
+                if cls._answers_match_semantically(
+                    task_type,
+                    candidate.get("prediction"),
+                    prediction,
+                    horizon=horizon,
+                    indicator_output_keys=indicator_output_keys,
+                ):
+                    return candidate
+            return None
+
+        for entry_idx, entry in enumerate(execution_log):
+            if str(entry.get("tool") or "").strip() != "spawn_subagent":
+                continue
+            output = entry.get("output") or []
+            for idx, item in enumerate(output):
+                if not isinstance(item, dict) or not item.get("success"):
+                    continue
+                result = item.get("result") or {}
+                if not isinstance(result, dict):
+                    continue
+                answer = cls._unwrap_task_terminal_answer(
+                    task_type,
+                    result.get("answer", result.get("prediction")),
+                )
+                if task_type == "indicator":
+                    answer = cls._canonicalize_indicator_answer(
+                        answer,
+                        indicator_output_keys=indicator_output_keys,
+                    )
+                if not cls._is_valid_final_answer(
+                    task_type,
+                    answer,
+                    horizon=horizon,
+                    indicator_output_keys=indicator_output_keys,
+                ):
+                    continue
+                sub_execution_log = result.get("execution_log") or []
+                tool_chain = cls._reasoning_substantive_tool_chain(sub_execution_log)
+                public_reasoning = cls._recoverable_execution_context_from_trace(
+                    tool_chain=tool_chain,
+                    answer=answer,
+                    reasoning=result.get("reasoning"),
+                    execution_context=result.get("execution_context"),
+                    execution_log=sub_execution_log,
+                ).get("public_reasoning", [])
+                candidates.append(
+                    {
+                        "name": cls._candidate_branch_id(result, fallback_idx=idx),
+                        "candidate_key": cls._recoverable_candidate_identity_key(
+                            cls._candidate_branch_id(result, fallback_idx=idx),
+                            tool_chain,
+                            idx,
+                        ),
+                        "tool_chain": tool_chain,
+                        "prediction": answer,
+                        "metrics": {},
+                        "public_reasoning": public_reasoning,
+                        "confidence": result.get("confidence"),
+                        "entry_index": entry_idx,
+                    }
+                )
+
+        for entry in execution_log:
+            tool_name = str(entry.get("tool") or "").strip()
+            observation = entry.get("observation")
+            if observation is None:
+                observation = {}
+            if tool_name in {"evaluate_batch_against_gt", "batch_evaluate_against_gt"}:
+                if not isinstance(observation, dict):
+                    continue
+                for item in observation.get("results") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    matched = _match_candidate(item.get("name"), item.get("prediction"))
+                    if matched is not None and isinstance(item.get("metrics"), dict):
+                        matched["metrics"] = dict(item.get("metrics") or {})
+                continue
+            if tool_name != "evaluate_against_gt" or not isinstance(observation, dict):
+                continue
+            metrics = observation.get("metrics")
+            if not isinstance(metrics, dict) or not metrics:
+                continue
+            args = entry.get("args") or {}
+            matched = _match_candidate("", args.get("prediction"))
+            if matched is not None:
+                matched["metrics"] = dict(metrics)
+        cls._disambiguate_recoverable_candidate_keys(candidates)
+        return [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate.get("metrics"), dict) and candidate.get("metrics")
+        ]
+
+    @classmethod
+    def _recoverable_learning_summary_record_from_execution_log(
+        cls,
+        *,
+        execution_log: list[dict[str, Any]],
+        task_type: str,
+        horizon: int | None,
+        indicator_output_keys: list[str] | None,
+    ) -> dict[str, Any] | None:
+        if not cls._training_completion_contract_satisfied(
+            execution_log,
+            task_type=task_type,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        ):
+            return None
+
+        candidate_traces = cls._recoverable_training_candidates(
+            execution_log=execution_log,
+            task_type=task_type,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
+        )
+        if not candidate_traces:
+            return None
+
+        ranked = sorted(
+            candidate_traces,
+            key=lambda trace: cls._recoverable_metrics_score(trace.get("metrics") or {}),
+        )
+        winner = ranked[0]
+        runner_up = ranked[1] if len(ranked) > 1 else None
+
+        winner_chain = [
+            str(tool).strip()
+            for tool in winner.get("tool_chain") or []
+            if str(tool).strip()
+        ]
+        winner_label = " -> ".join(winner_chain) or str(winner.get("name") or "candidate").strip()
+        winner_reason = ""
+        public_reasoning = [
+            str(item).strip()
+            for item in winner.get("public_reasoning") or []
+            if str(item).strip()
+        ]
+        if public_reasoning:
+            winner_reason = public_reasoning[0]
+        metric_text = cls._recoverable_metric_summary(dict(winner.get("metrics") or {}))
+        prediction_text = cls._recoverable_preview_text(winner.get("prediction"), limit=120)
+
+        insight_parts = [f"Strongest path on this sample: `{winner_label}`."]
+        if winner_reason:
+            insight_parts.append(f"Execution evidence: {winner_reason.rstrip('.')}.")
+        if prediction_text:
+            insight_parts.append(f"Observed output: {prediction_text}.")
+        if metric_text:
+            insight_parts.append(f"Observed evaluation: {metric_text}.")
+        insight = " ".join(part.strip() for part in insight_parts if part).strip()
+
+        recommendation = (
+            f"Reusable lesson: prefer `{winner_label}` when similar evidence supports the same pattern"
+        )
+        if winner_reason:
+            recommendation += f", because {winner_reason.rstrip('.')}"
+        if runner_up is not None:
+            runner_up_chain = [
+                str(tool).strip()
+                for tool in runner_up.get("tool_chain") or []
+                if str(tool).strip()
+            ]
+            runner_up_label = " -> ".join(runner_up_chain) or str(runner_up.get("name") or "runner-up").strip()
+            recommendation += f". Compare it against `{runner_up_label}` when the alternative path is also plausible."
+        else:
+            recommendation += "."
+
+        reasoning_lines = [
+            f"1. `{winner_label}` produced the reusable candidate answer {prediction_text}.",
+        ]
+        if winner_reason:
+            reasoning_lines.append(f"2. {winner_reason.rstrip('.')}.")
+        if metric_text:
+            reasoning_lines.append(f"3. Its recorded evaluation was {metric_text}.")
+        if runner_up is not None:
+            runner_up_chain = [
+                str(tool).strip()
+                for tool in runner_up.get("tool_chain") or []
+                if str(tool).strip()
+            ]
+            runner_up_label = " -> ".join(runner_up_chain) or str(runner_up.get("name") or "runner-up").strip()
+            reasoning_lines.append(
+                f"4. Compared explored candidates, `{winner_label}` remained the strongest evaluated path over `{runner_up_label}`."
+            )
+        reasoning = "\n".join(reasoning_lines)
+
+        summary_answer = {
+            "insight": insight,
+            "recommendation": recommendation,
+            "winner_candidate": str(
+                winner.get("candidate_key") or winner.get("name") or ""
+            ).strip(),
+            "winner_prediction": winner.get("prediction"),
+            "winner_tool_chain": winner_chain,
+            "winner_metrics": dict(winner.get("metrics") or {}),
+            "compared_candidates": [
+                {
+                    "name": str(trace.get("candidate_key") or trace.get("name") or "").strip(),
+                    "tool_chain": list(trace.get("tool_chain") or []),
+                    "prediction": trace.get("prediction"),
+                    "metrics": dict(trace.get("metrics") or {}),
+                }
+                for trace in ranked
+            ],
+        }
+        execution_context = cls._recoverable_execution_context_from_trace(
+            tool_chain=winner_chain,
+            answer=winner.get("prediction"),
+            reasoning=winner_reason or reasoning,
+            execution_context={
+                "tool_chain": winner_chain,
+                "public_reasoning": public_reasoning[:2],
+                "evidence_summary": winner_reason or metric_text,
+            },
+            execution_log=execution_log,
+        )
+        return cls._recoverable_final_record(
+            answer=summary_answer,
+            answer_type="learning_summary",
+            confidence=winner.get("confidence"),
+            reasoning=reasoning,
+            execution_context=execution_context,
+            control_context={
+                "completion_notes": "Recovered from executed candidate traces after terminal delivery failed.",
+            },
+        )
 
     @classmethod
     def _is_task_solve_ready_finish(
@@ -3807,6 +4920,80 @@ class ExecutorAgent(AgentBase):
                     "`branch_metadata` must be a JSON object when provided."
                 )
         return None
+
+    def _prepare_main_spawn_subagent_tasks(
+        self,
+        *,
+        tool_args: dict[str, Any],
+        execution_log: list[dict[str, Any]],
+        plan: dict[str, Any],
+        is_train: bool,
+        needs_more_candidates: bool,
+    ) -> tuple[list[dict[str, Any]] | None, str, str]:
+        """Validate and normalize a main-agent spawn decision before execution.
+
+        New definition:
+            Spawn validation failures in the main loop are non-actions. They
+            should be retried within the same top-level step instead of burning
+            a full step budget before any real branch executes.
+        """
+        used_slot_ids: set[int] = set()
+        spawn_rounds = 0
+        for entry in execution_log:
+            if not isinstance(entry, dict) or entry.get("tool") != "spawn_subagent":
+                continue
+            spawn_rounds += 1
+            output = entry.get("output") or []
+            if isinstance(output, dict):
+                output = output.get("results") or []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                result = item.get("result") or {}
+                slot_id = result.get("slot_id")
+                if isinstance(slot_id, int):
+                    used_slot_ids.add(slot_id)
+
+        spawn_min_tasks = MIN_TRAINING_CANDIDATES if is_train else 0
+        slot_error = self._validate_spawn_subagent_tasks(
+            tool_args.get("tasks", []),
+            plan.get("subagent_slots", []),
+            min_tasks=spawn_min_tasks,
+            disallowed_slot_ids=used_slot_ids if is_train and spawn_rounds > 0 else None,
+        )
+        if slot_error:
+            return None, "invalid_subagent_slots", slot_error
+
+        normalized_tasks, normalize_error = self._normalize_spawn_tasks(
+            tool_args.get("tasks", []),
+            plan=plan,
+        )
+        if normalize_error:
+            return None, "non_distinct_subagent_paths_after_dropout", normalize_error
+
+        if is_train and spawn_rounds == 0:
+            prior_mix_error = self._validate_first_spawn_prior_mix(
+                normalized_tasks,
+                prior_path=plan.get("train_spawn_prior_path", []),
+            )
+            if prior_mix_error:
+                return None, "first_spawn_prior_mix_missing", prior_mix_error
+
+        if len(normalized_tasks) < max(1, spawn_min_tasks):
+            detail = (
+                "Self-correction: after deriving advisory paths from the selected "
+                "slots' visible tools, only "
+                f"{len(normalized_tasks)} distinct branch(es) remain. Choose more "
+                "distinct `slot_id`s so this spawn round keeps enough different paths."
+            )
+            return None, "insufficient_distinct_subagent_paths_after_dropout", detail
+
+        if is_train and needs_more_candidates:
+            # Explicitly keep the training branch-count requirement attached to
+            # the prepared spawn so the caller can preserve its existing control
+            # flow without recomputing slot state.
+            return list(normalized_tasks), "", ""
+        return list(normalized_tasks), "", ""
 
     @staticmethod
     def _hinted_tools(tools_hint: Any) -> list[str]:
@@ -4453,10 +5640,114 @@ class ExecutorAgent(AgentBase):
         )
 
     @staticmethod
+    def _series_source_ref_for_step(step: int, tool_name: str) -> str:
+        safe_tool = re.sub(r"[^a-zA-Z0-9_]+", "_", str(tool_name or "").strip()) or "artifact"
+        return f"step_{int(step)}_{safe_tool}"
+
+    @classmethod
+    def _initial_series_sources(
+        cls,
+        data: Any,
+        current_series_state: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        return {
+            "original_input": {
+                "data": data,
+                "state": dict(current_series_state),
+            },
+        }
+
+    @classmethod
+    def _register_series_source(
+        cls,
+        series_sources: dict[str, dict[str, Any]],
+        *,
+        ref: str,
+        data: Any,
+        state: dict[str, Any] | None,
+    ) -> None:
+        if not ref or data is None or not isinstance(state, dict):
+            return
+        if str(state.get("artifact_type") or "").strip() != "series":
+            return
+        series_sources[ref] = {
+            "data": data,
+            "state": dict(state),
+        }
+
+    @classmethod
+    def _series_source_prompt_payload(
+        cls,
+        *,
+        series_sources: dict[str, dict[str, Any]],
+        current_series_state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+
+        def _summary(ref: str, state: dict[str, Any], *, is_current: bool) -> dict[str, Any]:
+            coordinate_system = state.get("coordinate_system")
+            payload: dict[str, Any] = {
+                "ref": ref,
+                "is_current": bool(is_current),
+                "producer_tool": state.get("producer_tool"),
+                "artifact_type": state.get("artifact_type"),
+                "parent_artifact_type": state.get("parent_artifact_type"),
+            }
+            length = cls._series_length_from_state(state)
+            if length:
+                payload["length"] = length
+            if isinstance(coordinate_system, dict):
+                if coordinate_system.get("current_space") is not None:
+                    payload["current_space"] = coordinate_system.get("current_space")
+                if coordinate_system.get("origin_space") is not None:
+                    payload["origin_space"] = coordinate_system.get("origin_space")
+                if coordinate_system.get("relative_to") is not None:
+                    payload["relative_to"] = coordinate_system.get("relative_to")
+            return payload
+
+        items.append(_summary("current", current_series_state, is_current=True))
+        for ref, bundle in series_sources.items():
+            if ref == "current":
+                continue
+            state = bundle.get("state")
+            if not isinstance(state, dict):
+                continue
+            items.append(_summary(ref, state, is_current=False))
+        return items
+
+    @classmethod
+    def _resolve_series_source(
+        cls,
+        source_ref: Any,
+        *,
+        current_data: Any,
+        current_series_state: dict[str, Any],
+        series_sources: dict[str, dict[str, Any]],
+    ) -> tuple[Any, dict[str, Any], str, str | None]:
+        ref = str(source_ref or "").strip()
+        if not ref or ref == "current":
+            return current_data, current_series_state, "current", None
+        bundle = series_sources.get(ref)
+        if not isinstance(bundle, dict):
+            available = ["current", *sorted(series_sources.keys())]
+            return (
+                current_data,
+                current_series_state,
+                "current",
+                "Self-correction: unknown `source_ref`. "
+                f"Choose one of: {', '.join(available)}.",
+            )
+        state = bundle.get("state")
+        if not isinstance(state, dict):
+            return current_data, current_series_state, "current", None
+        return bundle.get("data"), state, ref, None
+
+    @staticmethod
     def _build_state_update_message(
         *,
         current_series_state: dict[str, Any],
         latest_artifact_state: dict[str, Any],
+        accessible_series_sources: list[dict[str, Any]] | None = None,
         task_answer_status: dict[str, Any] | None = None,
         branch_task_answer_status: dict[str, Any] | None = None,
         latest_redundancy_status: dict[str, Any] | None = None,
@@ -4465,6 +5756,8 @@ class ExecutorAgent(AgentBase):
             "current_series_state": current_series_state,
             "latest_artifact_state": latest_artifact_state,
         }
+        if accessible_series_sources:
+            payload["accessible_series_sources"] = accessible_series_sources
         if isinstance(task_answer_status, dict) and task_answer_status:
             payload["task_answer_status"] = task_answer_status
         if isinstance(branch_task_answer_status, dict) and branch_task_answer_status:
@@ -4479,9 +5772,11 @@ class ExecutorAgent(AgentBase):
                 default=str,
             )
             + "\n\n## Indexing Rule\n"
-            + "- For index-sensitive tools such as `slice`, `value_at`, and `window_stats`, use indices from `current_series_state.coordinate_system.current_space`.\n"
-            + "- Treat `origin_space` as provenance only. It explains where the current artifact came from; it is not the coordinate space for the next tool call.\n"
-            + "- If the current working series is no longer the original input series, do not call index-sensitive tools with original-input indices. If you still need an original-input statistic, use values already present in the task/context or a reasoning tool that can combine original history with the current artifact.\n"
+            + "- By default, index-sensitive tools such as `slice`, `value_at`, and `window_stats` use indices from `current_series_state.coordinate_system.current_space`.\n"
+            + "- If you pass `source_ref`, the tool reads that selected series source instead, and indices must follow that source's own `current_space` shown in `accessible_series_sources`.\n"
+            + "- Treat `origin_space` as provenance only. It explains where a series came from; it is not the coordinate space for the next tool call.\n"
+            + "- If the current working series is no longer the original input series, do not call index-sensitive tools with original-input indices against the current series.\n"
+            + "- Use `source_ref=\"original_input\"` when you need the raw history after the working series has already moved to a forecast, slice, or other derived artifact.\n"
         )
 
     async def reflect(self, action_result: dict[str, Any]) -> dict[str, Any]:
@@ -4573,10 +5868,13 @@ class ExecutorAgent(AgentBase):
         for i, r in enumerate(done_results):
             if isinstance(r, Exception):
                 error_type = type(r).__name__
-                failure_reason = (
-                    "max_steps_exhausted"
-                    if isinstance(r, MaxStepsExhaustedError)
-                    else error_type
+                failure_reason = str(
+                    getattr(r, "failure_reason", "")
+                    or (
+                        "max_steps_exhausted"
+                        if isinstance(r, MaxStepsExhaustedError)
+                        else error_type
+                    )
                 )
                 results.append({
                     "sub_task": i,
@@ -4674,17 +5972,63 @@ class ExecutorAgent(AgentBase):
             [tool for tool in self._hinted_tools(tools_hint) if tool in candidates],
             plan["task_type"],
         )
+        hinted_tool_note_keys = self._selected_tool_note_keys(
+            plan.get("tool_notes", {}),
+            [tool for tool in self._hinted_tools(tools_hint) if tool in candidates],
+            plan["task_type"],
+        )
+
+        task_boundary_section = self._render_prompt_section(
+            "Task Boundary",
+            self._build_task_boundary_section(
+                plan["task_type"],
+                horizon=plan.get("horizon"),
+                indicator_output_keys=plan.get("indicator_output_keys", []),
+            ),
+        )
+        execution_context_section = self._render_prompt_section(
+            "Execution Context",
+            "",
+        )
+        control_context_section = self._render_prompt_section(
+            "Control Context",
+            self._join_prompt_sections(
+                self._build_action_state_section(
+                    state="need_evidence",
+                    required_final_type=plan["task_type"],
+                    execution_log=[],
+                ),
+                f"Branch Goal:\n{task_description}\n" if str(task_description).strip() else "",
+                self._build_subagent_tools_hint_section(
+                    tools_hint,
+                    candidates,
+                ),
+                self._build_parent_branch_metadata_section(branch_metadata),
+            ),
+        )
+        output_contract_section = self._render_prompt_section(
+            "Output Contract",
+            self._build_subagent_final_answer_contract_section(
+                plan["task_type"],
+                horizon=plan.get("horizon"),
+                indicator_output_keys=plan.get("indicator_output_keys", []),
+            ),
+        )
+        support_section = self._render_prompt_section(
+            "Support",
+            self._join_prompt_sections(
+                hinted_tool_notes,
+                memory_section,
+            ),
+        )
+        decision_section = self._build_decision_section(
+            allow_finish=True,
+            spawn_available=False,
+        )
 
         first_user = executor_prompt.SUBAGENT_FIRST_TURN.format(
             task_prompt=plan.get("task_description", ""),
-            task_boundary_section=self._render_prompt_section(
-                "Task Boundary",
-                self._build_task_boundary_section(
-                    plan["task_type"],
-                    horizon=plan.get("horizon"),
-                    indicator_output_keys=plan.get("indicator_output_keys", []),
-                ),
-            ),
+            task_boundary_section=task_boundary_section,
             fingerprint=self._format_prompt_payload(
                 self._prepare_prompt_fingerprint(
                     plan["fingerprint"],
@@ -4693,47 +6037,38 @@ class ExecutorAgent(AgentBase):
                 limit=3000,
             ),
             profiling_section=plan.get("profiling_section", ""),
-            execution_context_section=self._render_prompt_section(
-                "Execution Context",
-                "",
-            ),
-            control_context_section=self._render_prompt_section(
-                "Control Context",
-                self._join_prompt_sections(
-                    self._build_action_state_section(
-                        state="need_evidence",
-                        required_final_type=plan["task_type"],
-                        execution_log=[],
-                    ),
-                    f"Branch Goal:\n{task_description}\n" if str(task_description).strip() else "",
-                    self._build_subagent_tools_hint_section(
-                        tools_hint,
-                        candidates,
-                    ),
-                    self._build_parent_branch_metadata_section(branch_metadata),
-                ),
-            ),
-            output_contract_section=self._render_prompt_section(
-                "Output Contract",
-                self._build_subagent_final_answer_contract_section(
-                    plan["task_type"],
-                    horizon=plan.get("horizon"),
-                    indicator_output_keys=plan.get("indicator_output_keys", []),
-                ),
-            ),
-            support_section=self._render_prompt_section(
-                "Support",
-                self._join_prompt_sections(
-                    hinted_tool_notes,
-                    memory_section,
-                ),
-            ),
-            decision_section=self._build_decision_section(
-                allow_finish=True,
-                spawn_available=False,
-            ),
+            execution_context_section=execution_context_section,
+            control_context_section=control_context_section,
+            output_contract_section=output_contract_section,
+            support_section=support_section,
+            decision_section=decision_section,
             tool_names=executor_prompt.build_tool_name_text(candidates),
         )
+
+        base_control_context = self._normalize_control_context({
+            "completion_notes": "",
+            "audit": self._build_control_context_audit(
+                memory_injected={
+                    "soul_text": str((plan.get("memory_audit") or {}).get("soul_text") or "").strip(),
+                    "memory_text": str((plan.get("memory_audit") or {}).get("memory_text") or "").strip(),
+                    "system_memory_text": system_memory,
+                    "skills_text": memory_section,
+                    "tool_notes_section": hinted_tool_notes,
+                    "tool_note_keys": hinted_tool_note_keys,
+                    "tool_note_count": len(hinted_tool_note_keys),
+                },
+                prompt_sections=[
+                    self._build_prompt_section_audit(name="system_prompt", text=system_prompt),
+                    self._build_prompt_section_audit(name="first_user", text=first_user),
+                    self._build_prompt_section_audit(name="task_boundary_section", text=task_boundary_section),
+                    self._build_prompt_section_audit(name="execution_context_section", text=execution_context_section),
+                    self._build_prompt_section_audit(name="control_context_section", text=control_context_section),
+                    self._build_prompt_section_audit(name="output_contract_section", text=output_contract_section),
+                    self._build_prompt_section_audit(name="support_section", text=support_section),
+                    self._build_prompt_section_audit(name="decision_section", text=decision_section),
+                ],
+            ),
+        })
 
         conversation: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
@@ -4744,6 +6079,7 @@ class ExecutorAgent(AgentBase):
         horizon = plan.get("horizon")
         current_data = data
         current_series_state = self._initial_series_state(current_data)
+        series_sources = self._initial_series_sources(current_data, current_series_state)
         final_result: dict[str, Any] = {}
         execution_log: list[dict[str, Any]] = []
         recoverable_answer: dict[str, Any] | None = None
@@ -4804,60 +6140,175 @@ class ExecutorAgent(AgentBase):
                     sub_task_description=task_description,
                     tools_hint=tools_hint,
                 )
-            response, decision = await self._request_structured_decision(
-                decision_conversation,
-                allow_tool_call=tool_call_allowed,
-                allow_finish=True,
-                ordinary_tool_names=[
-                    name for name in turn_candidates
-                    if name not in {
-                        "spawn_subagent",
-                        "evaluate_against_gt",
-                        "evaluate_batch_against_gt",
-                        "batch_evaluate_against_gt",
-                    }
-                ] if tool_call_allowed else [],
-                evaluate_tool_names=[],
-                spawn_available=False,
-                fallback_thought="parse failed",
-                finish_mode="task",
-            )
-            thought = decision.get("thought", "")
-            parse_failed = bool(decision.get("_parse_failed"))
-            trace.agent_step("executor", "subagent_react_step", {
-                "sub_agent_idx": idx,
-                "step": step,
-                "decision": decision,
-            })
-
-            if parse_failed and step < MAX_SUB_REACT_STEPS:
-                invalid_json_msg = self._invalid_json_self_correction_message(thought)
-                if repair_delivery_mode:
-                    repair_delivery_feedback_messages = [invalid_json_msg]
-                conversation.append({
-                    "role": "user",
-                    "content": invalid_json_msg,
-                })
-                skip_generic_turn_prompt_once = True
-                continue
-
-            conversation.append({
-                "role": "assistant",
-                "content": self._decision_to_conversation_text(decision),
-            })
-
-            if not self._has_structured_thought(thought) and step < MAX_SUB_REACT_STEPS:
-                structured_thought_msg = (
-                    "Your `thought` must explicitly include `Reason:` and "
-                    "`Action:`. Please continue with that structure."
+            response = None
+            decision: dict[str, Any] = {}
+            thought = ""
+            advance_to_next_step = False
+            non_action_self_corrections = 0
+            decision_recovery_exhaustions = 0
+            while True:
+                response, decision = await self._request_structured_decision(
+                    decision_conversation,
+                    allow_tool_call=tool_call_allowed,
+                    allow_finish=True,
+                    ordinary_tool_names=[
+                        name for name in turn_candidates
+                        if name not in {
+                            "spawn_subagent",
+                            "evaluate_against_gt",
+                            "evaluate_batch_against_gt",
+                            "batch_evaluate_against_gt",
+                        }
+                    ] if tool_call_allowed else [],
+                    evaluate_tool_names=[],
+                    spawn_available=False,
+                    fallback_thought="parse failed",
+                    finish_mode="task",
                 )
-                if repair_delivery_mode:
-                    repair_delivery_feedback_messages = [structured_thought_msg]
-                conversation.append({
-                    "role": "user",
-                    "content": structured_thought_msg,
+                thought = decision.get("thought", "")
+                parse_failed = bool(decision.get("_parse_failed"))
+                trace.agent_step("executor", "subagent_react_step", {
+                    "sub_agent_idx": idx,
+                    "step": step,
+                    "decision": decision,
+                    "same_step_retry_count": non_action_self_corrections,
                 })
-                skip_generic_turn_prompt_once = True
+
+                if parse_failed:
+                    invalid_json_msg = self._invalid_json_self_correction_message(thought)
+                    if repair_delivery_mode:
+                        repair_delivery_feedback_messages = [invalid_json_msg]
+                    conversation.append({
+                        "role": "user",
+                        "content": invalid_json_msg,
+                    })
+                    skip_generic_turn_prompt_once = True
+                    if non_action_self_corrections < MAX_NON_ACTION_SELF_CORRECTIONS_PER_STEP:
+                        non_action_self_corrections += 1
+                        continue
+                    if decision_recovery_exhaustions < MAX_DECISION_RECOVERY_EXHAUSTIONS_PER_STEP:
+                        decision_recovery_exhaustions += 1
+                        non_action_self_corrections = 0
+                        continue
+                    if repair_delivery_mode:
+                        recoverable_decision = self._decision_from_recoverable_final(
+                            self._recoverable_failure_record(
+                                expected_type=plan["task_type"],
+                                task_type=plan["task_type"],
+                                execution_log=execution_log,
+                                horizon=plan.get("horizon"),
+                                indicator_output_keys=plan.get("indicator_output_keys", []),
+                            ),
+                            thought=(
+                                "Reason: This branch already has an execution-grounded recoverable "
+                                "final payload, so more formatting retries would not add evidence. "
+                                "Action: Finish with that recovered payload unchanged."
+                            ),
+                        )
+                        if recoverable_decision is not None:
+                            decision = recoverable_decision
+                            thought = str(decision.get("thought") or thought)
+                            break
+                    failure_reason = "decision_parse_exhausted"
+                    trace.agent_step("executor", "subagent_self_correction", {
+                        "sub_agent_idx": idx,
+                        "step": step,
+                        "reason": failure_reason,
+                    })
+                    raise DecisionOutputExhaustedError(
+                        agent_kind="subagent",
+                        sub_agent_idx=idx,
+                        failure_reason=failure_reason,
+                        partial_result=self._failure_partial_result(
+                            expected_type=plan["task_type"],
+                            task_type=plan["task_type"],
+                            execution_log=execution_log,
+                            horizon=plan.get("horizon"),
+                            indicator_output_keys=plan.get("indicator_output_keys", []),
+                            recoverable_final=recoverable_answer or recoverable_final,
+                            failure_reason=failure_reason,
+                            extra={
+                                "slot_id": slot_id,
+                                "sub_task_description": task_description,
+                                "tools_hint": tools_hint,
+                                "branch_metadata": branch_metadata,
+                            },
+                        ),
+                    )
+
+                if not parse_failed:
+                    conversation.append({
+                        "role": "assistant",
+                        "content": self._decision_to_conversation_text(decision),
+                    })
+
+                if not self._has_structured_thought(thought):
+                    structured_thought_msg = (
+                        "Your `thought` must explicitly include `Reason:` and "
+                        "`Action:`. Please continue with that structure."
+                    )
+                    if repair_delivery_mode:
+                        repair_delivery_feedback_messages = [structured_thought_msg]
+                    conversation.append({
+                        "role": "user",
+                        "content": structured_thought_msg,
+                    })
+                    skip_generic_turn_prompt_once = True
+                    if non_action_self_corrections < MAX_NON_ACTION_SELF_CORRECTIONS_PER_STEP:
+                        non_action_self_corrections += 1
+                        continue
+                    if decision_recovery_exhaustions < MAX_DECISION_RECOVERY_EXHAUSTIONS_PER_STEP:
+                        decision_recovery_exhaustions += 1
+                        non_action_self_corrections = 0
+                        continue
+                    if repair_delivery_mode:
+                        recoverable_decision = self._decision_from_recoverable_final(
+                            self._recoverable_failure_record(
+                                expected_type=plan["task_type"],
+                                task_type=plan["task_type"],
+                                execution_log=execution_log,
+                                horizon=plan.get("horizon"),
+                                indicator_output_keys=plan.get("indicator_output_keys", []),
+                            ),
+                            thought=(
+                                "Reason: This branch already has an execution-grounded final "
+                                "payload and repeated format retries are no longer changing the "
+                                "evidence. Action: Finish with that recovered payload."
+                            ),
+                        )
+                        if recoverable_decision is not None:
+                            decision = recoverable_decision
+                            thought = str(decision.get("thought") or thought)
+                            break
+                    failure_reason = "decision_format_exhausted"
+                    trace.agent_step("executor", "subagent_self_correction", {
+                        "sub_agent_idx": idx,
+                        "step": step,
+                        "reason": failure_reason,
+                    })
+                    raise DecisionOutputExhaustedError(
+                        agent_kind="subagent",
+                        sub_agent_idx=idx,
+                        failure_reason=failure_reason,
+                        partial_result=self._failure_partial_result(
+                            expected_type=plan["task_type"],
+                            task_type=plan["task_type"],
+                            execution_log=execution_log,
+                            horizon=plan.get("horizon"),
+                            indicator_output_keys=plan.get("indicator_output_keys", []),
+                            recoverable_final=recoverable_answer or recoverable_final,
+                            failure_reason=failure_reason,
+                            extra={
+                                "slot_id": slot_id,
+                                "sub_task_description": task_description,
+                                "tools_hint": tools_hint,
+                                "branch_metadata": branch_metadata,
+                            },
+                        ),
+                    )
+                break
+
+            if advance_to_next_step:
                 continue
 
             if decision.get("done", False):
@@ -4985,18 +6436,52 @@ class ExecutorAgent(AgentBase):
                             ),
                         })
                     continue
-                reasoning = decision.get("reasoning", decision.get("thought", ""))
+                repair_record = (
+                    recoverable_answer if isinstance(recoverable_answer, dict) and recoverable_answer
+                    else recoverable_final if isinstance(recoverable_final, dict) and recoverable_final
+                    else None
+                )
+                reasoning = self._coerce_reasoning_text(
+                    decision.get("reasoning", decision.get("thought", ""))
+                )
                 execution_context = self._normalize_execution_context(
                     decision.get("execution_context"),
                     execution_log=execution_log,
                 )
+                if (
+                    repair_delivery_mode
+                    and isinstance(repair_record, dict)
+                    and not any(
+                        execution_context.get(key)
+                        for key in ("tool_chain", "public_reasoning", "evidence_summary")
+                    )
+                ):
+                    execution_context = self._normalize_execution_context(
+                        repair_record.get("execution_context"),
+                        execution_log=execution_log,
+                    )
+                if (
+                    repair_delivery_mode
+                    and isinstance(repair_record, dict)
+                    and not reasoning
+                ):
+                    reasoning = self._coerce_reasoning_text(
+                        repair_record.get("reasoning", decision.get("thought", ""))
+                    )
                 reasoning = self._normalize_reasoning_for_reuse(
                     reasoning,
                     execution_log,
                     execution_context,
                 )
-                control_context = self._normalize_control_context(
-                    decision.get("control_context")
+                repair_base_control_context = base_control_context
+                if repair_delivery_mode and isinstance(repair_record, dict):
+                    repair_base_control_context = self._merge_control_context(
+                        base_control_context,
+                        repair_record.get("control_context"),
+                    )
+                control_context = self._merge_control_context(
+                    repair_base_control_context,
+                    decision.get("control_context"),
                 )
                 solve_ready_current = self._is_task_solve_ready_finish(
                     task_type=requested_type,
@@ -5008,6 +6493,19 @@ class ExecutorAgent(AgentBase):
                     require_tool_use=True,
                     tools_hint=tools_hint,
                 )
+                if solve_ready_current:
+                    execution_context = self._recoverable_execution_context_from_trace(
+                        tool_chain=self._reasoning_substantive_tool_chain(execution_log),
+                        answer=answer,
+                        reasoning=reasoning,
+                        execution_context=execution_context,
+                        execution_log=execution_log,
+                    )
+                    reasoning = self._normalize_reasoning_for_reuse(
+                        reasoning,
+                        execution_log,
+                        execution_context,
+                    )
                 if solve_ready_current:
                     recoverable_answer = self._recoverable_final_record(
                         answer=answer,
@@ -5127,10 +6625,29 @@ class ExecutorAgent(AgentBase):
                     "content": f"Tool '{tool_name}' not available.",
                 })
                 continue
-            runtime_incompatibility_msg = self._tool_runtime_incompatibility_message(
-                tool_name,
+            selected_data, selected_state, selected_source_ref, source_error = self._resolve_series_source(
+                tool_args.get("source_ref"),
                 current_data=current_data,
                 current_series_state=current_series_state,
+                series_sources=series_sources,
+            )
+            if source_error:
+                trace.agent_step("executor", "subagent_self_correction", {
+                    "sub_agent_idx": idx,
+                    "step": step,
+                    "reason": "unknown_source_ref",
+                    "tool": tool_name,
+                    "source_ref": tool_args.get("source_ref"),
+                })
+                conversation.append({
+                    "role": "user",
+                    "content": source_error,
+                })
+                continue
+            runtime_incompatibility_msg = self._tool_runtime_incompatibility_message(
+                tool_name,
+                current_data=selected_data,
+                current_series_state=selected_state,
             )
             if runtime_incompatibility_msg and step < MAX_SUB_REACT_STEPS:
                 trace.agent_step("executor", "subagent_self_correction", {
@@ -5138,6 +6655,7 @@ class ExecutorAgent(AgentBase):
                     "step": step,
                     "reason": "runtime_incompatible_tool",
                     "tool": tool_name,
+                    "source_ref": selected_source_ref,
                 })
                 conversation.append({
                     "role": "user",
@@ -5202,7 +6720,7 @@ class ExecutorAgent(AgentBase):
                 )
 
             pre_tool_series_state = dict(current_series_state)
-            result = await self._execute_tool(tool_name, tool_args, current_data, text_data, images)
+            result = await self._execute_tool(tool_name, tool_args, selected_data, text_data, images)
             success = result is not None and result.success
             downstream_data = None
             observation_payload = (
@@ -5215,6 +6733,7 @@ class ExecutorAgent(AgentBase):
                 "output": result.data if success else None,
                 "observation": observation_payload,
                 "thought": thought,
+                "source_ref": selected_source_ref,
             }
             redundancy_status = self._latest_redundancy_status(
                 task_type=plan["task_type"],
@@ -5258,6 +6777,12 @@ class ExecutorAgent(AgentBase):
                         previous_series_state=pre_tool_series_state,
                         tool_args=tool_args,
                     )
+                    self._register_series_source(
+                        series_sources,
+                        ref=self._series_source_ref_for_step(step, tool_name),
+                        data=downstream_data,
+                        state=current_series_state,
+                    )
             latest_artifact_state = self._artifact_state_from_result(
                 tool_name=tool_name,
                 result_data=observation_payload,
@@ -5270,6 +6795,10 @@ class ExecutorAgent(AgentBase):
                 "content": self._build_state_update_message(
                     current_series_state=current_series_state,
                     latest_artifact_state=latest_artifact_state,
+                    accessible_series_sources=self._series_source_prompt_payload(
+                        series_sources=series_sources,
+                        current_series_state=current_series_state,
+                    ),
                     task_answer_status=self._task_answer_status(
                         task_type=plan["task_type"],
                         candidate=observation_payload,
@@ -5316,6 +6845,16 @@ class ExecutorAgent(AgentBase):
                 "reasoning_verdict": {"passed": True, "missing": [], "explanation": ""},
             }
             terminal_feedback_messages: list[str] = []
+            recovered_terminal = self._recoverable_terminal_record(
+                expected_type=plan["task_type"],
+                task_type=plan["task_type"],
+                execution_log=execution_log,
+                horizon=plan.get("horizon"),
+                indicator_output_keys=plan.get("indicator_output_keys", []),
+            )
+            if recovered_terminal is not None and recoverable_final is None:
+                recoverable_final = recovered_terminal
+            locked_recoverable_final = recoverable_answer or recoverable_final
             for terminal_attempt in range(MAX_TERMINAL_REPAIR_ATTEMPTS):
                 terminal_decision = await self._request_terminal_path_review(
                     expected_type=plan["task_type"],
@@ -5327,7 +6866,7 @@ class ExecutorAgent(AgentBase):
                     horizon=plan.get("horizon"),
                     indicator_output_keys=plan.get("indicator_output_keys", []),
                     sub_agent_idx=idx,
-                    recoverable_final=recoverable_answer or recoverable_final,
+                    recoverable_final=locked_recoverable_final,
                     sub_task_description=task_description,
                     tools_hint=tools_hint,
                 )
@@ -5373,6 +6912,16 @@ class ExecutorAgent(AgentBase):
                 elif not self._subagent_followed_tools_hint(execution_log, tools_hint):
                     terminal_valid = False
                     terminal_failure_reason = "tools_hint_not_followed"
+                elif not self._terminal_answer_preserves_recoverable_answer(
+                    expected_type=plan["task_type"],
+                    task_type=plan["task_type"],
+                    recoverable_final=locked_recoverable_final,
+                    candidate_answer=terminal_answer,
+                    horizon=plan.get("horizon"),
+                    indicator_output_keys=plan.get("indicator_output_keys", []),
+                ):
+                    terminal_valid = False
+                    terminal_failure_reason = "changed_recoverable_answer"
                 if not terminal_valid:
                     trace.agent_step("executor", "subagent_terminal_self_correction_invalid", {
                         "sub_agent_idx": idx,
@@ -5394,6 +6943,13 @@ class ExecutorAgent(AgentBase):
 
                 terminal_execution_context = self._normalize_execution_context(
                     terminal_decision.get("execution_context"),
+                    execution_log=execution_log,
+                )
+                terminal_execution_context = self._recoverable_execution_context_from_trace(
+                    tool_chain=self._reasoning_substantive_tool_chain(execution_log),
+                    answer=terminal_answer,
+                    reasoning=terminal_reasoning,
+                    execution_context=terminal_execution_context,
                     execution_log=execution_log,
                 )
                 terminal_reasoning = self._normalize_reasoning_for_reuse(
@@ -5639,6 +7195,7 @@ class ExecutorAgent(AgentBase):
             "- `insight` must be a short non-empty string that names the winning candidate path/tool chain and the decisive evidence that made it stronger than the compared candidates.\n"
             "- `recommendation` must be a short non-empty string stating one reusable next-time lesson tied to the same kind of evidence pattern; if the selected winner is incorrect overall, state a cautionary failure pattern instead.\n"
             "- `recommendation` is not the task prediction, not a forecast array, and not an indicator JSON object.\n"
+            "- Do not put winner bookkeeping fields such as `winning_candidate_name`, `winning_tool_chain`, `winning_prediction`, `compared_candidates`, or `selection_basis` inside `answer`; those are controller-derived metadata, not the required user-facing summary fields.\n"
             "- `reasoning` must be the numbered long-form version of the same execution-side evidence recorded in `execution_context.public_reasoning`; reuse the same literal tool/path names instead of introducing looser aliases.\n"
             "- Final-answer fields must also include `execution_context` and `control_context`.\n"
             "- `execution_context` must contain only execution-side evidence: the substantive `tool_chain`, reusable `public_reasoning`, and a concise `evidence_summary`.\n"
@@ -5782,6 +7339,21 @@ class ExecutorAgent(AgentBase):
             issues.append(
                 "`recommendation` must be a non-empty string that states the reusable lesson or cautionary failure pattern, "
                 "not the task prediction object or numeric payload"
+            )
+        disallowed_summary_fields = [
+            key for key in (
+                "winning_candidate_name",
+                "winning_tool_chain",
+                "winning_prediction",
+                "compared_candidates",
+                "selection_basis",
+            )
+            if key in answer
+        ]
+        if disallowed_summary_fields:
+            issues.append(
+                "do not put winner bookkeeping fields inside `answer`: "
+                + ", ".join(f"`{key}`" for key in disallowed_summary_fields)
             )
         if not issues:
             issues.append("use non-empty string fields for both `insight` and `recommendation`")
@@ -6609,6 +8181,45 @@ class ExecutorAgent(AgentBase):
                         "Use an empty string when there is nothing extra to note."
                     ),
                 },
+                "audit": {
+                    "type": "object",
+                    "description": (
+                        "Controller-populated audit metadata showing which memory/prompt "
+                        "sections were injected. The agent may omit this field."
+                    ),
+                    "properties": {
+                        "memory_injected": {
+                            "type": "object",
+                            "properties": {
+                                "soul_text": {"type": "string"},
+                                "memory_text": {"type": "string"},
+                                "system_memory_text": {"type": "string"},
+                                "skills_text": {"type": "string"},
+                                "tool_notes_section": {"type": "string"},
+                                "tool_note_keys": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "tool_note_count": {"type": "integer"},
+                            },
+                            "additionalProperties": False,
+                        },
+                        "prompt_sections": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "chars": {"type": "integer"},
+                                    "nonempty": {"type": "boolean"},
+                                },
+                                "required": ["name", "chars", "nonempty"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "additionalProperties": False,
+                },
             },
             "required": ["completion_notes"],
             "additionalProperties": False,
@@ -6683,71 +8294,169 @@ class ExecutorAgent(AgentBase):
         cleaned = str(text or "").strip()
         if not cleaned:
             return ""
-
-        sentence_re = re.compile(r"(?<=[.!?])\s+|;\s+")
-        replacements = [
-            (r"(?i)\btask-valid\b", ""),
-            (r"(?i)\bexact task-valid format\b", "exact format"),
-            (r"(?i)\breturn(?:ed|ing)? unchanged\b", ""),
-            (r"(?i)\bused unchanged\b", ""),
-            (r"(?i)\bprovided reuse answer\b", ""),
-            (r"(?i)\breuse answer\b", ""),
-            (r"(?i)\baccepted (?:result|answer|forecast|payload)\b", "result"),
-            (r"(?i)\bwinning (?:branch|candidate|path)\b", "path"),
-            (r"(?i)\bbest candidate among explored branches\b", "path"),
-            (r"(?i)\bexplored branches\b", "tested paths"),
-            (r"(?i)\brepair-only\b", ""),
-            (r"(?i)\bfinish-only\b", ""),
-            (r"(?i)\bfinal JSON delivery\b", ""),
-            (r"(?i)\bfinal answer\b", ""),
-            (r"(?i)\bthe user requested\b", ""),
-            (r"(?i)\bexecution context\b", ""),
-            (r"(?i)\bcompletion mechanics\b", ""),
-            (r"(?i)\bpayload wrapping\b", ""),
-            (r"(?i)\bcontroller-side\b", ""),
-            (r"(?i)\bcontroller\b", ""),
-        ]
-        hard_control_markers = (
-            "ground truth",
-            "ground_truth",
-            "evaluate_against_gt",
-            "evaluate_batch_against_gt",
-            "batch_evaluate_against_gt",
-            "spawn_subagent",
-            "json repair",
-            "before finishing",
-            " repair ",
-            "completion contract",
-            "branch instructions",
-            "return the corrected final answer",
-        )
-        kept_parts: list[str] = []
-        for part in sentence_re.split(cleaned):
-            chunk = str(part or "").strip()
-            if not chunk:
-                continue
-            for pattern, repl in replacements:
-                chunk = re.sub(pattern, repl, chunk)
-            lowered = f" {chunk.lower()} "
-            if any(marker in lowered for marker in hard_control_markers):
-                continue
-            chunk = re.sub(r"\s+", " ", chunk)
-            chunk = re.sub(r"\s+([,.;:])", r"\1", chunk)
-            chunk = chunk.strip(" -|,;:")
-            if re.match(r"(?i)^(use|return|wrap|resend|copy)\b", chunk):
-                continue
-            if chunk:
-                kept_parts.append(chunk)
-        if not kept_parts:
-            return ""
-        return ". ".join(kept_parts).strip().rstrip(".")
+        return sanitize_learning_evidence_text(cleaned, drop_imperatives=True)
 
     @staticmethod
     def _normalize_control_context(payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):
             payload = {}
-        return {
+        normalized = {
             "completion_notes": str(payload.get("completion_notes") or "").strip(),
+        }
+        audit = ExecutorAgent._normalize_control_context_audit(payload.get("audit"))
+        if audit:
+            normalized["audit"] = audit
+        return normalized
+
+    @staticmethod
+    def _coerce_reasoning_text(reasoning: Any) -> str:
+        if isinstance(reasoning, str):
+            return reasoning.strip()
+        if isinstance(reasoning, (list, tuple)):
+            lines: list[str] = []
+            for idx, item in enumerate(reasoning, start=1):
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                if re.match(r"^\d+\.\s+", text):
+                    lines.append(text)
+                else:
+                    lines.append(f"{idx}. {text}")
+            return "\n".join(lines).strip()
+        return str(reasoning or "").strip()
+
+    @classmethod
+    def _coerce_structured_thought_text(cls, thought: Any) -> str:
+        if isinstance(thought, str):
+            return thought.strip()
+        if isinstance(thought, dict):
+            reason = ""
+            action = ""
+            for key, value in thought.items():
+                key_text = str(key or "").strip().lower()
+                if key_text == "reason":
+                    reason = cls._coerce_reasoning_text(value)
+                elif key_text == "action":
+                    action = cls._coerce_reasoning_text(value)
+            if reason and action:
+                return f"Reason: {reason} Action: {action}".strip()
+        return str(thought or "").strip()
+
+    @staticmethod
+    def _normalize_control_context_audit(payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+
+        normalized: dict[str, Any] = {}
+
+        memory_payload = payload.get("memory_injected")
+        if isinstance(memory_payload, dict):
+            tool_note_keys = [
+                str(item).strip()
+                for item in memory_payload.get("tool_note_keys") or []
+                if str(item).strip()
+            ]
+            memory_injected = {
+                "soul_text": str(memory_payload.get("soul_text") or "").strip(),
+                "memory_text": str(memory_payload.get("memory_text") or "").strip(),
+                "system_memory_text": str(memory_payload.get("system_memory_text") or "").strip(),
+                "skills_text": str(memory_payload.get("skills_text") or "").strip(),
+                "tool_notes_section": str(memory_payload.get("tool_notes_section") or "").strip(),
+                "tool_note_keys": tool_note_keys,
+                "tool_note_count": max(
+                    len(tool_note_keys),
+                    int(memory_payload.get("tool_note_count") or 0),
+                ),
+            }
+            if any(
+                memory_injected[key]
+                for key in (
+                    "soul_text",
+                    "memory_text",
+                    "system_memory_text",
+                    "skills_text",
+                    "tool_notes_section",
+                    "tool_note_keys",
+                    "tool_note_count",
+                )
+            ):
+                normalized["memory_injected"] = memory_injected
+
+        section_payload = payload.get("prompt_sections")
+        if isinstance(section_payload, list):
+            prompt_sections: list[dict[str, Any]] = []
+            for item in section_payload:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                chars = max(0, int(item.get("chars") or 0))
+                nonempty = bool(item.get("nonempty")) if "nonempty" in item else chars > 0
+                prompt_sections.append({
+                    "name": name,
+                    "chars": chars,
+                    "nonempty": nonempty,
+                })
+            if prompt_sections:
+                normalized["prompt_sections"] = prompt_sections
+
+        return normalized
+
+    @classmethod
+    def _merge_control_context(
+        cls,
+        base: Any,
+        override: Any,
+    ) -> dict[str, Any]:
+        base_norm = cls._normalize_control_context(base)
+        override_norm = cls._normalize_control_context(override)
+        merged = {
+            "completion_notes": (
+                str(override_norm.get("completion_notes") or "").strip()
+                or str(base_norm.get("completion_notes") or "").strip()
+            ),
+        }
+        audit = dict(base_norm.get("audit") or {})
+        override_audit = override_norm.get("audit") or {}
+        if isinstance(override_audit, dict):
+            audit.update(override_audit)
+        if audit:
+            merged["audit"] = audit
+        return merged
+
+    @classmethod
+    def _build_control_context_audit(
+        cls,
+        *,
+        memory_injected: dict[str, Any] | None = None,
+        prompt_sections: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        audit: dict[str, Any] = {}
+        normalized_memory = cls._normalize_control_context_audit(
+            {"memory_injected": memory_injected or {}}
+        )
+        if "memory_injected" in normalized_memory:
+            audit["memory_injected"] = normalized_memory["memory_injected"]
+        normalized_sections = cls._normalize_control_context_audit(
+            {"prompt_sections": prompt_sections or []}
+        )
+        if "prompt_sections" in normalized_sections:
+            audit["prompt_sections"] = normalized_sections["prompt_sections"]
+        return audit
+
+    @classmethod
+    def _build_prompt_section_audit(
+        cls,
+        *,
+        name: str,
+        text: Any,
+    ) -> dict[str, Any]:
+        content = str(text or "")
+        return {
+            "name": str(name),
+            "chars": len(content),
+            "nonempty": bool(content.strip()),
         }
 
     @staticmethod
@@ -6828,10 +8537,6 @@ class ExecutorAgent(AgentBase):
         candidate_labels = cls._reasoning_candidate_labels(execution_log)
         substantive_tools = cls._available_substantive_tool_names(execution_log)
         evidence_text = " ".join([*public_reasoning, evidence_summary]).strip()
-        mentioned_labels = cls._mentioned_candidate_path_labels(evidence_text, candidate_labels)
-        if mentioned_labels:
-            return [mentioned_labels[0]]
-
         path_labels = [item for item in tool_chain if "->" in item]
         plain_tools = [item for item in tool_chain if "->" not in item]
         if path_labels:
@@ -6842,6 +8547,56 @@ class ExecutorAgent(AgentBase):
             return list(primary_chain)
 
         mentioned_tools = cls._mentioned_substantive_tools(evidence_text, substantive_tools)
+        inferred_candidate_labels: list[str] = []
+        if mentioned_tools and candidate_labels:
+            plain_tool_set = set(plain_tools)
+            for label in candidate_labels:
+                segments = [
+                    str(segment).strip()
+                    for segment in cls._normalize_label_text(label).split(" -> ")
+                    if str(segment).strip()
+                ]
+                if not segments:
+                    continue
+                if not set(segments).issubset(set(mentioned_tools)):
+                    continue
+                if plain_tool_set and not plain_tool_set.issubset(set(segments)):
+                    continue
+                inferred_candidate_labels.append(" -> ".join(segments))
+        if inferred_candidate_labels:
+            inferred_candidate_labels.sort(
+                key=lambda label: len([segment for segment in label.split(" -> ") if segment]),
+                reverse=True,
+            )
+            if (
+                len(inferred_candidate_labels) == 1
+                or len([
+                    label for label in inferred_candidate_labels
+                    if len(label.split(" -> ")) == len(inferred_candidate_labels[0].split(" -> "))
+                ]) == 1
+            ):
+                return [inferred_candidate_labels[0]]
+
+        mentioned_labels = cls._mentioned_candidate_path_labels(evidence_text, candidate_labels)
+        if mentioned_labels:
+            mentioned_labels = [
+                cls._normalize_label_text(label)
+                for label in mentioned_labels
+                if cls._normalize_label_text(label)
+            ]
+            mentioned_labels.sort(
+                key=lambda label: len([segment for segment in label.split(" -> ") if segment]),
+                reverse=True,
+            )
+            if (
+                len(mentioned_labels) == 1
+                or len([
+                    label for label in mentioned_labels
+                    if len(label.split(" -> ")) == len(mentioned_labels[0].split(" -> "))
+                ]) == 1
+            ):
+                return [mentioned_labels[0]]
+
         if mentioned_tools:
             filtered_plain = [tool for tool in plain_tools if tool in mentioned_tools]
             if filtered_plain:
@@ -7014,13 +8769,37 @@ class ExecutorAgent(AgentBase):
                     result = item.get("result") or {}
                     if not isinstance(result, dict):
                         continue
-                    answer = result.get("answer", result.get("prediction"))
-                    answer = cls._unwrap_task_terminal_answer(task_type, answer)
+                    sub_execution_log = result.get("execution_log") or []
+                    answer = cls._unwrap_task_terminal_answer(
+                        task_type,
+                        result.get("answer", result.get("prediction")),
+                    )
+                    observed_answer = cls._observed_task_answer_from_execution_log(
+                        task_type=task_type,
+                        execution_log=sub_execution_log,
+                        horizon=horizon,
+                        indicator_output_keys=indicator_output_keys,
+                    )
                     if task_type == "indicator":
                         answer = cls._canonicalize_indicator_answer(
                             answer,
                             indicator_output_keys=indicator_output_keys,
                         )
+                        observed_answer = cls._canonicalize_indicator_answer(
+                            observed_answer,
+                            indicator_output_keys=indicator_output_keys,
+                        )
+                    if (
+                        observed_answer is not None
+                        and not cls._is_task_answer_backed_by_tool_output(
+                            task_type,
+                            answer,
+                            sub_execution_log,
+                            horizon=horizon,
+                            indicator_output_keys=indicator_output_keys,
+                        )
+                    ):
+                        answer = observed_answer
                     if not cls._is_valid_final_answer(
                         task_type,
                         answer,
@@ -7354,6 +9133,8 @@ class ExecutorAgent(AgentBase):
                 "missing": ["numbered_steps", "explicit_names"],
                 "explanation": "reasoning is empty",
             }
+        if self._has_stepwise_reasoning(text, execution_log):
+            return {"passed": True, "missing": [], "explanation": ""}
 
         messages = [
             {
@@ -7417,7 +9198,7 @@ class ExecutorAgent(AgentBase):
         ]
         parsed = await self._complete_json_judge_response(
             messages,
-            error_message="stepwise reasoning judge returned invalid JSON",
+            error_context="stepwise reasoning judge",
         )
         missing = [
             str(item).strip()
@@ -7449,6 +9230,8 @@ class ExecutorAgent(AgentBase):
             "execution_only_language",
         }
         if not substantive_tools:
+            return {"passed": True, "missing": [], "explanation": ""}
+        if self._has_reusable_execution_context(execution_context, execution_log):
             return {"passed": True, "missing": [], "explanation": ""}
         execution_text = "\n".join([
             *(
@@ -7543,7 +9326,7 @@ class ExecutorAgent(AgentBase):
         ]
         parsed = await self._complete_json_judge_response(
             messages,
-            error_message="execution_context judge returned invalid JSON",
+            error_context="execution_context judge",
         )
         missing = [
             str(item).strip()
@@ -7599,17 +9382,35 @@ class ExecutorAgent(AgentBase):
         self,
         messages: list[dict[str, str]],
         *,
-        error_message: str,
+        error_context: str,
     ) -> dict[str, Any]:
+        last_failure = "invalid JSON"
         for attempt in range(MAX_JSON_JUDGE_ATTEMPTS):
             response = await self.llm.complete(messages, response_format="json")
-            parsed = self._json_dict_from_response(response)
+            parsed = self._json_dict_from_response(response, required_keys={"passed"})
             if isinstance(parsed, dict) and "passed" in parsed:
                 return parsed
-            response_text = str(getattr(response, "text", "") or "").strip()
-            if response_text or attempt + 1 >= MAX_JSON_JUDGE_ATTEMPTS:
+            if self._json_judge_response_is_empty(response):
+                last_failure = "empty response"
+            else:
+                last_failure = "invalid JSON"
+            if attempt + 1 >= MAX_JSON_JUDGE_ATTEMPTS:
                 break
-        raise RuntimeError(error_message)
+        raise RuntimeError(f"{error_context} returned {last_failure}")
+
+    @staticmethod
+    def _json_judge_response_is_empty(response: Any) -> bool:
+        if response is None:
+            return True
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, dict) and parsed:
+            return False
+        if isinstance(parsed, list) and parsed:
+            return False
+        text = getattr(response, "text", None)
+        if isinstance(text, str) and text.strip():
+            return False
+        return True
 
     @staticmethod
     def _attach_partial_result_to_exception(
@@ -7657,14 +9458,42 @@ class ExecutorAgent(AgentBase):
         setattr(exc, "control_context", payload.get("control_context", {}))
 
     @staticmethod
-    def _json_dict_from_response(response: Any) -> dict[str, Any]:
-        parsed = response.parsed if isinstance(getattr(response, "parsed", None), dict) else {}
+    def _json_dict_from_response(
+        response: Any,
+        *,
+        required_keys: set[str] | None = None,
+    ) -> dict[str, Any]:
+        required = {str(key).strip() for key in (required_keys or set()) if str(key).strip()}
+        raw_parsed = getattr(response, "parsed", None)
+        parsed = ExecutorAgent._find_nested_dict_with_keys(raw_parsed, required)
         if not parsed and isinstance(getattr(response, "text", None), str) and response.text.strip():
             try:
-                parsed = json.loads(response.text)
+                decoded = json.loads(response.text)
             except json.JSONDecodeError:
-                parsed = {}
+                try:
+                    decoded, _ = json.JSONDecoder().raw_decode(response.text.lstrip())
+                except Exception:
+                    decoded = {}
+            parsed = ExecutorAgent._find_nested_dict_with_keys(decoded, required)
         return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _find_nested_dict_with_keys(payload: Any, required_keys: set[str] | None = None) -> dict[str, Any]:
+        required = {str(key).strip() for key in (required_keys or set()) if str(key).strip()}
+        if isinstance(payload, dict):
+            if not required or required.issubset({str(key).strip() for key in payload.keys()}):
+                return payload
+            for value in payload.values():
+                nested = ExecutorAgent._find_nested_dict_with_keys(value, required)
+                if nested:
+                    return nested
+            return {}
+        if isinstance(payload, list):
+            for item in payload:
+                nested = ExecutorAgent._find_nested_dict_with_keys(item, required)
+                if nested:
+                    return nested
+        return {}
 
     @classmethod
     def _terminal_payload_repair_messages(
@@ -7721,6 +9550,9 @@ class ExecutorAgent(AgentBase):
             "unsupported_answer": (
                 "The last `answer` was not grounded in the completed path's evidence."
             ),
+            "changed_recoverable_answer": (
+                "Repair mode may not change the already recovered answer payload; only reasoning/context fields may be repaired."
+            ),
             "no_tool_use": (
                 "A final answer here must be backed by at least one actual tool call in this path."
             ),
@@ -7743,6 +9575,30 @@ class ExecutorAgent(AgentBase):
             "`control_context` is only for completion notes. "
             f"{detail} If completion is genuinely impossible from the existing path, "
             "return `done=false` and explain why."
+        )
+
+    @classmethod
+    def _terminal_answer_preserves_recoverable_answer(
+        cls,
+        *,
+        expected_type: str,
+        task_type: str,
+        recoverable_final: dict[str, Any] | None,
+        candidate_answer: Any,
+        horizon: int | None = None,
+        indicator_output_keys: list[str] | None = None,
+    ) -> bool:
+        if not isinstance(recoverable_final, dict) or "answer" not in recoverable_final:
+            return True
+        original_answer = recoverable_final.get("answer")
+        if expected_type == "learning_summary":
+            return candidate_answer == original_answer
+        return cls._answers_match_semantically(
+            task_type,
+            candidate_answer,
+            original_answer,
+            horizon=horizon,
+            indicator_output_keys=indicator_output_keys,
         )
 
     @staticmethod
@@ -7942,251 +9798,8 @@ class ExecutorAgent(AgentBase):
         return any(alias and alias in reasoning_lower for alias in aliases)
 
     @staticmethod
-    def _decision_tools(
-        *,
-        allow_tool_call: bool,
-        allow_finish: bool,
-        ordinary_tool_names: list[str] | None = None,
-        evaluate_tool_names: list[str] | None = None,
-        spawn_available: bool = False,
-        finish_mode: str = "task",
-    ) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        ordinary_tool_names = [
-            str(name).strip()
-            for name in (ordinary_tool_names or [])
-            if str(name).strip()
-        ]
-        evaluate_tool_names = [
-            str(name).strip()
-            for name in (evaluate_tool_names or [])
-            if str(name).strip()
-        ]
-        if allow_tool_call:
-            if ordinary_tool_names:
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": _DECISION_TOOL_CALL,
-                        "strict": True,
-                        "description": (
-                            "Emit the single ordinary tool call to execute for the current turn. "
-                            "Use this only for ordinary tools in the allowed list below."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "thought": ExecutorAgent._thought_schema(),
-                                "tool": {
-                                    "type": "string",
-                                    "enum": ordinary_tool_names,
-                                },
-                                "args_json": {
-                                    "type": "string",
-                                    "description": (
-                                        "Arguments for the chosen ordinary tool serialized as a valid JSON "
-                                        "object string. Use \"{}\" when the tool takes no arguments."
-                                    ),
-                                },
-                            },
-                            "required": ["thought", "tool", "args_json"],
-                            "additionalProperties": False,
-                        },
-                    },
-                })
-            if spawn_available:
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": _DECISION_SPAWN,
-                        "strict": True,
-                        "description": (
-                            "Emit a `spawn_subagent` action for the current turn. Use this only when "
-                            "you are opening parallel candidate branches."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "thought": ExecutorAgent._thought_schema(),
-                                "tasks": {
-                                    "type": "array",
-                                    "description": "Distinct sub-agent branch tasks for `spawn_subagent`.",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "slot_id": {
-                                                "type": "integer",
-                                                "description": (
-                                                    "One chosen candidate slot id whose visible tools fully "
-                                                    "support every tool named in this branch's tools_hint."
-                                                ),
-                                            },
-                                            "task": {
-                                                "type": "string",
-                                                "description": "Short branch description for that slot.",
-                                            },
-                                            "slot_local_path_tools": {
-                                                "type": "array",
-                                                "description": (
-                                                    "Ordered slot-local tool path for that branch. Every named "
-                                                    "tool must appear in that slot's visible_tools. Use an empty "
-                                                    "array when there is no explicit path."
-                                                ),
-                                                "items": {
-                                                    "type": "string",
-                                                },
-                                            },
-                                            "branch_metadata_json": {
-                                                "type": "string",
-                                                "description": (
-                                                    "Structured parent branch metadata serialized as a valid JSON "
-                                                    "object string. Use an empty string when absent."
-                                                ),
-                                            },
-                                        },
-                                        "required": ["slot_id", "task", "slot_local_path_tools", "branch_metadata_json"],
-                                        "additionalProperties": False,
-                                    },
-                                },
-                            },
-                            "required": ["thought", "tasks"],
-                            "additionalProperties": False,
-                        },
-                    },
-                })
-            if evaluate_tool_names:
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": _DECISION_EVALUATE,
-                        "strict": True,
-                        "description": (
-                            "Emit one `evaluate_*` action for the current turn. Use this only for "
-                            "ground-truth evaluation tools in the allowed list below."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "thought": ExecutorAgent._thought_schema(),
-                                "tool": {
-                                    "type": "string",
-                                    "enum": evaluate_tool_names,
-                                },
-                                "task_type": {
-                                    "type": "string",
-                                    "description": "Current task type to evaluate against ground truth.",
-                                },
-                                "prediction_json": {
-                                    "type": "string",
-                                    "description": (
-                                        "Single prediction payload serialized as valid JSON. "
-                                        "Use an empty string when omitted."
-                                    ),
-                                },
-                                "predictions_json": {
-                                    "type": "string",
-                                    "description": (
-                                        "Multiple prediction payloads serialized as a JSON array string. "
-                                        "Use an empty string when omitted."
-                                    ),
-                                },
-                            },
-                            "required": ["thought", "tool", "task_type", "prediction_json", "predictions_json"],
-                            "additionalProperties": False,
-                        },
-                    },
-                })
-        if allow_finish:
-            if finish_mode == "learning_summary":
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": _DECISION_FINISH,
-                        "strict": True,
-                        "description": "Emit the single training learning summary to finish the current turn.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "thought": ExecutorAgent._thought_schema(),
-                                "insight": {
-                                    "type": "string",
-                                    "description": "A short factual summary of which explored path won and why.",
-                                },
-                                "recommendation": {
-                                    "type": "string",
-                                    "description": "A short reusable lesson or cautionary failure pattern, not the task payload.",
-                                },
-                                "confidence": {"type": "number"},
-                                "reasoning": {"type": "string"},
-                                "execution_context": ExecutorAgent._execution_context_schema(),
-                                "control_context": ExecutorAgent._control_context_schema(),
-                            },
-                            "required": [
-                                "thought",
-                                "insight",
-                                "recommendation",
-                                "confidence",
-                                "reasoning",
-                                "execution_context",
-                                "control_context",
-                            ],
-                            "additionalProperties": False,
-                        },
-                    },
-                })
-                return tools
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": _DECISION_FINISH,
-                    "strict": True,
-                    "description": "Emit the single final answer to finish the current turn.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "thought": ExecutorAgent._thought_schema(),
-                            "answer_type": {"type": "string"},
-                            "answer_json": {
-                                "type": "string",
-                                "description": (
-                                    "The final answer payload serialized as valid JSON. "
-                                    "Examples: \"\\\"B\\\"\", \"[1.0, 2.0]\", or "
-                                    "\"{\\\"insight\\\": \\\"...\\\", \\\"recommendation\\\": \\\"...\\\"}\"."
-                                ),
-                            },
-                            "confidence": {"type": "number"},
-                            "reasoning": {"type": "string"},
-                            "execution_context": ExecutorAgent._execution_context_schema(),
-                            "control_context": ExecutorAgent._control_context_schema(),
-                        },
-                        "required": [
-                            "thought",
-                            "answer_type",
-                            "answer_json",
-                            "confidence",
-                            "reasoning",
-                            "execution_context",
-                            "control_context",
-                        ],
-                        "additionalProperties": False,
-                    },
-                },
-            })
-        return tools
-
-    @staticmethod
     def _decision_response_preview(response: Any) -> str:
-        parts: list[str] = []
-        tool_calls = getattr(response, "tool_calls", None) or []
-        if tool_calls:
-            try:
-                parts.append(json.dumps(tool_calls, ensure_ascii=False, default=str))
-            except TypeError:
-                parts.append(str(tool_calls))
-        text = str(getattr(response, "text", "") or "").strip()
-        if text:
-            parts.append(text)
-        return "\n".join(parts)[:4000]
+        return str(getattr(response, "text", "") or "").strip()[:4000]
 
     @staticmethod
     def _decision_to_conversation_text(decision: dict[str, Any]) -> str:
@@ -8208,12 +9821,21 @@ class ExecutorAgent(AgentBase):
         fallback_thought: str,
         finish_mode: str = "task",
     ) -> dict[str, Any]:
-        tool_calls = getattr(response, "tool_calls", None) or []
-        if len(tool_calls) != 1:
+        nested_parsed = cls._json_dict_from_response(
+            response,
+            required_keys={"thought", "done"},
+        )
+        normalized = cls._normalize_legacy_decision_payload(
+            nested_parsed,
+            allow_tool_call=allow_tool_call,
+            allow_finish=allow_finish,
+            finish_mode=finish_mode,
+        ) if nested_parsed else None
+        if normalized is None:
             legacy = cls._coerce_llm_decision(
                 getattr(response, "parsed", None),
                 getattr(response, "text", None),
-                fallback_thought="invalid_decision_tool_call_count",
+                fallback_thought=fallback_thought,
             )
             normalized = cls._normalize_legacy_decision_payload(
                 legacy,
@@ -8221,204 +9843,19 @@ class ExecutorAgent(AgentBase):
                 allow_finish=allow_finish,
                 finish_mode=finish_mode,
             )
-            if normalized is not None:
-                return normalized
+        if normalized is None:
             return {
                 "done": False,
                 "_parse_failed": True,
-                "thought": "invalid_decision_tool_call_count",
+                "thought": fallback_thought,
             }
-        call = tool_calls[0] or {}
-        name = str(call.get("name") or "").strip()
-        arguments = call.get("arguments") or {}
-        if not isinstance(arguments, dict):
-            return {
-                "done": False,
-                "_parse_failed": True,
-                "thought": "invalid_decision_tool_call_payload",
-            }
-        ordinary_tool_set = {
-            str(name).strip() for name in (ordinary_tool_names or []) if str(name).strip()
-        }
-        evaluate_tool_set = {
-            str(name).strip() for name in (evaluate_tool_names or []) if str(name).strip()
-        }
-        if name == _DECISION_TOOL_CALL and allow_tool_call:
-            tool_name = str(arguments.get("tool") or "")
-            if ordinary_tool_set and tool_name not in ordinary_tool_set:
-                return {
-                    "done": False,
-                    "_parse_failed": True,
-                    "thought": "invalid_decision_wrong_tool_family",
-                }
-            parsed_args: dict[str, Any] = {}
-            args_json = arguments.get("args_json")
-            if isinstance(args_json, str):
-                try:
-                    loaded_args = json.loads(args_json)
-                except Exception:
-                    loaded_args = None
-                if isinstance(loaded_args, dict):
-                    parsed_args = loaded_args
-            return {
-                "thought": str(arguments.get("thought") or ""),
-                "done": False,
-                "tool": tool_name,
-                "args": parsed_args,
-            }
-        if name == _DECISION_SPAWN and allow_tool_call:
-            tasks = arguments.get("tasks")
-            if not spawn_available:
-                return {
-                    "done": False,
-                    "_parse_failed": True,
-                    "thought": "invalid_decision_wrong_tool_family",
-                }
-            normalized_tasks: list[dict[str, Any]] = []
-            if isinstance(tasks, list):
-                for item in tasks:
-                    if not isinstance(item, dict):
-                        continue
-                    normalized: dict[str, Any] = {}
-                    slot_id = item.get("slot_id")
-                    if isinstance(slot_id, int):
-                        normalized["slot_id"] = slot_id
-                    task = item.get("task")
-                    if isinstance(task, str):
-                        normalized["task"] = task
-                    slot_local_path_tools = item.get("slot_local_path_tools")
-                    if isinstance(slot_local_path_tools, list):
-                        normalized_path = [
-                            str(tool).strip()
-                            for tool in slot_local_path_tools
-                            if str(tool).strip()
-                        ]
-                        if normalized_path:
-                            normalized["tools_hint"] = normalized_path
-                    elif isinstance(slot_local_path_tools, tuple):
-                        normalized_path = [
-                            str(tool).strip()
-                            for tool in slot_local_path_tools
-                            if str(tool).strip()
-                        ]
-                        if normalized_path:
-                            normalized["tools_hint"] = normalized_path
-                    else:
-                        tools_hint = item.get("tools_hint")
-                        if isinstance(tools_hint, str) and tools_hint.strip():
-                            normalized["tools_hint"] = tools_hint
-                    branch_metadata_json = item.get("branch_metadata_json")
-                    if isinstance(branch_metadata_json, str) and branch_metadata_json.strip():
-                        try:
-                            parsed_branch_metadata = json.loads(branch_metadata_json)
-                        except Exception:
-                            parsed_branch_metadata = None
-                        if isinstance(parsed_branch_metadata, dict):
-                            normalized["branch_metadata"] = parsed_branch_metadata
-                    if "slot_id" in normalized and "task" in normalized:
-                        normalized_tasks.append(normalized)
-            return {
-                "thought": str(arguments.get("thought") or ""),
-                "done": False,
-                "tool": "spawn_subagent",
-                "args": {"tasks": normalized_tasks},
-            }
-        if name == _DECISION_EVALUATE and allow_tool_call:
-            tool_name = str(arguments.get("tool") or "")
-            if evaluate_tool_set and tool_name not in evaluate_tool_set:
-                return {
-                    "done": False,
-                    "_parse_failed": True,
-                    "thought": "invalid_decision_wrong_tool_family",
-                }
-            normalized_args: dict[str, Any] = {}
-            task_type = arguments.get("task_type")
-            if isinstance(task_type, str) and task_type.strip():
-                normalized_args["task_type"] = task_type
-            prediction_json = arguments.get("prediction_json")
-            if isinstance(prediction_json, str) and prediction_json.strip():
-                try:
-                    parsed_prediction = json.loads(prediction_json)
-                except Exception:
-                    parsed_prediction = None
-                if parsed_prediction is not None:
-                    normalized_args["prediction"] = parsed_prediction
-            predictions_json = arguments.get("predictions_json")
-            if isinstance(predictions_json, str) and predictions_json.strip():
-                try:
-                    parsed_predictions = json.loads(predictions_json)
-                except Exception:
-                    parsed_predictions = None
-                if isinstance(parsed_predictions, list):
-                    normalized_args["predictions"] = parsed_predictions
-            return {
-                "thought": str(arguments.get("thought") or ""),
-                "done": False,
-                "tool": tool_name,
-                "args": normalized_args,
-            }
-        if name == _DECISION_FINISH and allow_finish:
-            if finish_mode == "learning_summary":
-                insight = arguments.get("insight")
-                recommendation = arguments.get("recommendation")
-                reasoning = arguments.get("reasoning")
-                if not (
-                    isinstance(insight, str)
-                    and isinstance(recommendation, str)
-                    and isinstance(reasoning, str)
-                ):
-                    return {
-                        "done": False,
-                        "_parse_failed": True,
-                        "thought": "invalid_learning_summary_payload",
-                    }
-                return {
-                    "thought": str(arguments.get("thought") or ""),
-                    "done": True,
-                    "answer": {
-                        "insight": insight,
-                        "recommendation": recommendation,
-                    },
-                    "answer_type": "learning_summary",
-                    "confidence": arguments.get("confidence"),
-                    "reasoning": reasoning,
-                    "execution_context": cls._normalize_execution_context(
-                        arguments.get("execution_context")
-                    ),
-                    "control_context": cls._normalize_control_context(
-                        arguments.get("control_context")
-                    ),
-                }
-            answer_json = arguments.get("answer_json")
-            if not isinstance(answer_json, str):
-                return {
-                    "done": False,
-                    "_parse_failed": True,
-                    "thought": "invalid_final_answer_payload_json",
-                }
-            try:
-                answer = json.loads(answer_json)
-            except Exception:
-                return {
-                    "done": False,
-                    "_parse_failed": True,
-                    "thought": "invalid_final_answer_payload_json",
-                }
-            return {
-                "thought": str(arguments.get("thought") or ""),
-                "done": True,
-                "answer": answer,
-                "answer_type": str(arguments.get("answer_type") or ""),
-                "confidence": arguments.get("confidence"),
-                "reasoning": str(arguments.get("reasoning") or ""),
-                "execution_context": cls._normalize_execution_context(
-                    arguments.get("execution_context")
-                ),
-                "control_context": cls._normalize_control_context(
-                    arguments.get("control_context")
-                ),
-            }
-        return {"done": False, "_parse_failed": True, "thought": fallback_thought}
+        return cls._validate_json_decision_tool_access(
+            normalized,
+            allow_tool_call=allow_tool_call,
+            ordinary_tool_names=ordinary_tool_names,
+            evaluate_tool_names=evaluate_tool_names,
+            spawn_available=spawn_available,
+        )
 
     @classmethod
     def _normalize_legacy_decision_payload(
@@ -8432,14 +9869,44 @@ class ExecutorAgent(AgentBase):
         if not isinstance(decision, dict) or decision.get("_parse_failed"):
             return None
 
-        thought = str(decision.get("thought") or "")
+        thought = cls._coerce_structured_thought_text(decision.get("thought"))
         is_done = bool(decision.get("done", False))
+        answer = decision.get("answer")
+        answer_type = str(decision.get("answer_type") or "").strip()
+        confidence = decision.get("confidence")
+        reasoning = cls._coerce_reasoning_text(decision.get("reasoning"))
+
+        if (
+            not is_done
+            and allow_finish
+            and not allow_tool_call
+            and answer is not None
+            and reasoning
+            and "tool" not in decision
+            and "args" not in decision
+        ):
+            if finish_mode == "learning_summary" and not answer_type:
+                answer_type = "learning_summary"
+            if answer_type:
+                return {
+                    "thought": thought or (
+                        "Reason: Repair mode already has enough execution-grounded evidence. "
+                        "Action: finish with the repaired final payload."
+                    ),
+                    "done": True,
+                    "answer": answer,
+                    "answer_type": answer_type,
+                    "confidence": confidence,
+                    "reasoning": reasoning,
+                    "execution_context": cls._normalize_execution_context(
+                        decision.get("execution_context")
+                    ),
+                    "control_context": cls._normalize_control_context(
+                        decision.get("control_context")
+                    ),
+                }
 
         if is_done:
-            answer = decision.get("answer")
-            answer_type = str(decision.get("answer_type") or "")
-            confidence = decision.get("confidence")
-            reasoning = str(decision.get("reasoning") or "")
             if not allow_finish or answer is None or not answer_type or not reasoning:
                 return None
             if "tool" in decision or "args" in decision:
@@ -8483,6 +9950,53 @@ class ExecutorAgent(AgentBase):
             "args": args,
         }
 
+    @staticmethod
+    def _validate_json_decision_tool_access(
+        decision: dict[str, Any],
+        *,
+        allow_tool_call: bool,
+        ordinary_tool_names: list[str] | None = None,
+        evaluate_tool_names: list[str] | None = None,
+        spawn_available: bool = False,
+    ) -> dict[str, Any]:
+        if not isinstance(decision, dict) or decision.get("_parse_failed"):
+            return decision
+        if bool(decision.get("done", False)):
+            return decision
+
+        tool_name = str(decision.get("tool") or "").strip()
+        if not allow_tool_call or not tool_name:
+            return {
+                "done": False,
+                "_parse_failed": True,
+                "thought": "invalid_decision_wrong_tool_family",
+            }
+
+        ordinary_tool_set = {
+            str(name).strip() for name in (ordinary_tool_names or []) if str(name).strip()
+        }
+        evaluate_tool_set = {
+            str(name).strip() for name in (evaluate_tool_names or []) if str(name).strip()
+        }
+
+        if tool_name == "spawn_subagent":
+            if spawn_available:
+                return decision
+            return {
+                "done": False,
+                "_parse_failed": True,
+                "thought": "invalid_decision_wrong_tool_family",
+            }
+        if tool_name in evaluate_tool_set:
+            return decision
+        if tool_name in ordinary_tool_set:
+            return decision
+        return {
+            "done": False,
+            "_parse_failed": True,
+            "thought": "invalid_decision_wrong_tool_family",
+        }
+
     async def _request_structured_decision(
         self,
         conversation: list[dict[str, str]],
@@ -8495,17 +10009,9 @@ class ExecutorAgent(AgentBase):
         fallback_thought: str,
         finish_mode: str = "task",
     ) -> tuple[Any, dict[str, Any]]:
-        response = await self.llm.complete_with_tools(
+        response = await self.llm.complete(
             conversation,
-            tools=self._decision_tools(
-                allow_tool_call=allow_tool_call,
-                allow_finish=allow_finish,
-                ordinary_tool_names=ordinary_tool_names,
-                evaluate_tool_names=evaluate_tool_names,
-                spawn_available=spawn_available,
-                finish_mode=finish_mode,
-            ),
-            tool_choice="required",
+            response_format="json",
         )
         decision = self._coerce_structured_decision(
             response,
@@ -8514,9 +10020,33 @@ class ExecutorAgent(AgentBase):
             ordinary_tool_names=ordinary_tool_names,
             evaluate_tool_names=evaluate_tool_names,
             spawn_available=spawn_available,
-            fallback_thought=fallback_thought,
             finish_mode=finish_mode,
+            fallback_thought=fallback_thought,
         )
+        if decision.get("_parse_failed"):
+            nested_parsed = self._json_dict_from_response(
+                response,
+                required_keys={"thought", "done"},
+            )
+            normalized_nested = self._normalize_legacy_decision_payload(
+                nested_parsed,
+                allow_tool_call=allow_tool_call,
+                allow_finish=allow_finish,
+                finish_mode=finish_mode,
+            ) if nested_parsed else None
+            trace.agent_step("executor", "decision_parse_debug", {
+                "fallback_thought": fallback_thought,
+                "response_text_preview": self._decision_response_preview(response),
+                "response_parsed_type": type(getattr(response, "parsed", None)).__name__,
+                "nested_parsed_found": bool(nested_parsed),
+                "nested_parsed_keys": list((nested_parsed or {}).keys())[:10],
+                "normalized_nested_preview": normalized_nested,
+                "allow_tool_call": allow_tool_call,
+                "allow_finish": allow_finish,
+                "spawn_available": spawn_available,
+                "ordinary_tool_names_preview": list(ordinary_tool_names or [])[:8],
+                "evaluate_tool_names_preview": list(evaluate_tool_names or [])[:8],
+            })
         return response, decision
 
 
@@ -8686,6 +10216,25 @@ class ExecutorAgent(AgentBase):
             candidates.append("llm_reasoning")
             candidates.append(f"llm_reasoning::{task_type}")
         return candidates
+
+    def _selected_tool_note_keys(
+        self,
+        tool_notes: dict[str, Any],
+        candidates: list[str],
+        task_type: str,
+    ) -> list[str]:
+        if not isinstance(tool_notes, dict) or not tool_notes:
+            return []
+        selected: list[str] = []
+        seen: set[str] = set()
+        for tool_name in candidates:
+            for key in self._tool_note_candidates(tool_name, task_type):
+                if key in tool_notes and str(tool_notes[key]).strip():
+                    if key not in seen:
+                        seen.add(key)
+                        selected.append(key)
+                    break
+        return selected
 
     def _build_tool_notes_section(
         self,

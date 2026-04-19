@@ -124,7 +124,7 @@ class ContextManager:
         ]
 
         try:
-            response = await llm.complete(messages)
+            response = await llm.complete(messages, reasoning_effort="none")
             self._compacted_summary = response.text or summary
             return self._compacted_summary
         except Exception as e:

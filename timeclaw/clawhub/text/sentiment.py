@@ -103,6 +103,7 @@ class SentimentTool(ClawTool):
             resp = await llm.complete(
                 [{"role": "user", "content": prompt}],
                 response_format="json",
+                reasoning_effort="none",
             )
             if resp.parsed:
                 return resp.parsed

@@ -158,8 +158,20 @@ def build_tool_name_text(tool_names: list[str]) -> str:
             return ""
         return "Current-state preconditions: " + "; ".join(parts) + "."
 
+    def _fmt_framework_series_source_arg(tool: ClawTool) -> str:
+        required_modalities = tool.required_modalities()
+        if "timeseries" not in required_modalities:
+            return ""
+        return (
+            "Framework-supported optional arg: "
+            "source_ref<string>: select which accessible series source to read from. "
+            "Use `current` for the current working series, `original_input` for the raw input, "
+            "or a `step_<n>_<tool>` ref listed in the latest state update."
+        )
+
     lines: list[str] = []
     for tool_name in tool_names:
+        framework_source_text = ""
         if tool_name in runtime_only_tools:
             meta = runtime_only_tools[tool_name]
             description = str(meta["description"]).strip()
@@ -194,6 +206,7 @@ def build_tool_name_text(tool_names: list[str]) -> str:
                 else:
                     optional_args.append(_fmt_param(name, spec, required=False))
             contract_text = _fmt_input_contract(tool)
+            framework_source_text = _fmt_framework_series_source_arg(tool)
 
         arg_parts: list[str] = []
         if required_args:
@@ -202,6 +215,8 @@ def build_tool_name_text(tool_names: list[str]) -> str:
             arg_parts.append("Optional args: " + "; ".join(optional_args))
         if tool_name not in runtime_only_tools and contract_text:
             arg_parts.append(contract_text)
+        if tool_name not in runtime_only_tools and framework_source_text:
+            arg_parts.append(framework_source_text)
         if not arg_parts:
             arg_parts.append("Args: none.")
         lines.append(f"- {tool_name}: {description} {' '.join(arg_parts)}")
@@ -269,8 +284,8 @@ When done — you MUST include `answer` with the final result:
 {{
   "thought": "Reason: <why the evidence supports the final answer>. Action: <finish and return the answer>",
   "done": true,
-  "answer": "<the final result — array for forecast, dict for indicator, label for classification, text for QA>",
-  "answer_type": "forecast | indicator | classification | qa | correlation",
+  "answer": "<the final result — array for forecast, dict for indicator, label for classification, text for QA; or, in training main-agent mode, a JSON object like {{\"insight\":\"...\",\"recommendation\":\"...\"}}>",
+  "answer_type": "forecast | indicator | classification | qa | correlation | learning_summary (training main-agent only)",
   "confidence": 0.85,
   "reasoning": "numbered step-by-step explanation focused on substantive analysis. Write it as a numbered expansion of the same execution-side evidence you put in `execution_context.public_reasoning`, and reuse the same literal tool/path names there. If you directly used analysis tools yourself, include one numbered item per substantive analysis tool in order. If your top-level work was only orchestration (for example spawning candidates and comparing them), do NOT describe orchestration-only tools such as spawn_subagent or evaluate_* as steps; instead explain the candidate approaches considered, the decisive evidence, and why the winner was selected.",
   "execution_context": {{
@@ -286,6 +301,7 @@ Final-answer JSON must not include `tool` or `args`.
 `execution_context` is for reusable task evidence only. Do NOT put branch control,
 completion mechanics, packaging, or prompt-contract language inside it.
 `control_context` is the only place where orchestration/completion mechanics may appear.
+In training main-agent mode, the only valid final `answer_type` is `learning_summary`.
 
 IMPORTANT: `done: true` without `answer` is INVALID. You must always provide a
 concrete answer when you intentionally finish.

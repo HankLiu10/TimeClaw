@@ -112,6 +112,8 @@ def test_executor_tool_catalog_includes_descriptions_and_required_args():
     assert "Required args:" in catalog
     assert "start<integer> required" in catalog
     assert "end<integer> required" in catalog
+    assert "source_ref<string>" in catalog
+    assert "`original_input`" in catalog
     assert "- spawn_subagent:" in catalog
     assert "tasks<array> required" in catalog
     assert "- evaluate_against_gt:" in catalog

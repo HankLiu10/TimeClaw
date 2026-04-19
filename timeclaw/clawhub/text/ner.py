@@ -87,7 +87,11 @@ class NERTool(ClawTool):
                 f"type, value, start, end. Entity types to find: {types_str}.\n"
                 f"Text: {text[:1000]}"
             )
-            resp = await llm.complete([{"role": "user", "content": prompt}], response_format="json")
+            resp = await llm.complete(
+                [{"role": "user", "content": prompt}],
+                response_format="json",
+                reasoning_effort="none",
+            )
             if resp.parsed and isinstance(resp.parsed, list):
                 return resp.parsed
             if resp.parsed and isinstance(resp.parsed, dict) and "entities" in resp.parsed:

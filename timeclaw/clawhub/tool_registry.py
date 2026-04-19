@@ -37,16 +37,6 @@ def list_tool_instances(category: ToolCategory | str | None = None) -> list[Claw
     return [t for t in _TOOL_INSTANCES.values() if t.category.value == cat]
 
 
-def get_all_function_schemas() -> list[dict[str, Any]]:
-    """Get LLM function-calling schemas for all registered tools."""
-    return [t.to_function_schema() for t in _TOOL_INSTANCES.values()]
-
-
-def get_function_schemas_by_category(category: ToolCategory | str) -> list[dict[str, Any]]:
-    """Get function schemas filtered by category."""
-    return [t.to_function_schema() for t in list_tool_instances(category)]
-
-
 def should_expose_tool_module(category: str, modname: str) -> bool:
     """Return whether a clawhub tool module should be exposed to agents."""
     return modname not in _HIDDEN_TOOL_MODULES.get(category, set())

@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from timeclaw.clawhub.tool_base import ClawTool, ToolCategory, ToolIOType
+from timeclaw.core.indicator_answers import canonicalize_indicator_answer, infer_indicator_key
 
 
 def _fmt_array(arr: np.ndarray, max_points: int = 0) -> str:
@@ -153,50 +154,28 @@ class LLMReasoningIndicatorTool(_BaseLLMReasoningTool):
 
     @staticmethod
     def _infer_indicator_key(question: str, context: str) -> str | None:
-        text = f"{question}\n{context}".lower()
-        if "upper_bb" in text or "upper bollinger band" in text:
-            return "upper_bb"
-        if re.search(r"\bmacd\b", text) or "moving average convergence divergence" in text:
-            return "macd"
-        return None
+        return infer_indicator_key(question, context)
 
     def _normalise_payload(self, payload: Any) -> dict[str, Any]:
         if isinstance(payload, dict) and "answer" in payload:
             answer = payload["answer"]
         else:
             answer = payload
-        if isinstance(answer, dict) and len(answer) == 1:
-            key, value = next(iter(answer.items()))
-            normalized_key = str(key).strip().lower()
-            alias_map = {
-                "indicator_name": self._infer_indicator_key(
-                    str(payload.get("question", "")) if isinstance(payload, dict) else "",
-                    str(payload.get("context", "")) if isinstance(payload, dict) else "",
-                ),
-                "upper_bollinger_band": "upper_bb",
-                "upper_bollinger_bands": "upper_bb",
-                "bollinger_upper": "upper_bb",
-                "bb_upper": "upper_bb",
-                "macd_values": "macd",
-                "macd_forecast": "macd",
-            }
-            canonical_key = alias_map.get(normalized_key)
-            if canonical_key:
-                answer = {canonical_key: value}
-        return {"answer": answer}
+        return {
+            "answer": canonicalize_indicator_answer(
+                answer,
+                question=str(payload.get("question", "")) if isinstance(payload, dict) else "",
+                context=str(payload.get("context", "")) if isinstance(payload, dict) else "",
+            )
+        }
 
     async def _run(self, ts_data: Any = None, **params: Any) -> Any:
         result = await super()._run(ts_data=ts_data, **params)
-        answer = result.get("answer")
-        if isinstance(answer, dict) and len(answer) == 1:
-            key, value = next(iter(answer.items()))
-            normalized_key = str(key).strip().lower()
-            inferred_key = self._infer_indicator_key(
-                str(params.get("question", "")),
-                str(params.get("context", "")),
-            )
-            if normalized_key == "indicator_name" and inferred_key:
-                result["answer"] = {inferred_key: value}
+        result["answer"] = canonicalize_indicator_answer(
+            result.get("answer"),
+            question=str(params.get("question", "")),
+            context=str(params.get("context", "")),
+        )
         return result
 
 

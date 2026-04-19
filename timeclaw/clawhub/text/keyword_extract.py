@@ -101,7 +101,11 @@ class KeywordExtractTool(ClawTool):
                 f"Extract the top {top_k} keywords from this text. "
                 f"Return JSON with key 'keywords' as array of strings.\n\nText: {text[:2000]}"
             )
-            resp = await llm.complete([{"role": "user", "content": prompt}], response_format="json")
+            resp = await llm.complete(
+                [{"role": "user", "content": prompt}],
+                response_format="json",
+                reasoning_effort="none",
+            )
             if resp.parsed and "keywords" in resp.parsed:
                 kws = resp.parsed["keywords"]
                 return {"keywords": [{"keyword": k} for k in kws[:top_k]], "method": "llm"}

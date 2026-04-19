@@ -1,10 +1,12 @@
 import asyncio
+import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from timeclaw.memory import hierarchical as hm
-from timeclaw.memory.hierarchical import DistillationAgent, MemoryStore
+from timeclaw.memory.hierarchical import DistillStateStore, DistillationAgent, MemoryStore
 from timeclaw.pipeline.runner import PipelineRunner
 
 
@@ -50,6 +52,8 @@ class _FakeMemory:
         normalized.setdefault("conditions", [])
         normalized.setdefault("preferred_tools", [])
         normalized.setdefault("avoid_tools", [])
+        normalized.setdefault("preferred_tool_chains", [])
+        normalized.setdefault("avoid_tool_chains", [])
         normalized.setdefault("rationale", "")
         normalized.setdefault("evidence", {"sample_refs": []})
         return normalized
@@ -96,6 +100,20 @@ Scope:
 Prediction:
 ok
 """
+
+
+def test_distill_state_store_writes_atomically_without_tmp_leftovers(tmp_path, monkeypatch):
+    monkeypatch.setattr(hm, "MEMORY_ROOT", tmp_path / "hierarchical_memory")
+    monkeypatch.setattr(hm, "STATE_DIR", hm.MEMORY_ROOT / "state")
+    monkeypatch.setattr(hm, "DISTILL_STATE_FILE", hm.STATE_DIR / "distill_state.json")
+    monkeypatch.setattr(hm, "DISTILL_STATE_LOCK_FILE", hm.STATE_DIR / ".distill_state.lock")
+
+    store = DistillStateStore()
+    store.update_scope("scope_a", notes_total_seq=3, memory_fingerprint="fp")
+
+    assert hm.DISTILL_STATE_FILE.exists()
+    assert json.loads(hm.DISTILL_STATE_FILE.read_text())["scopes"]["scope_a"]["memory_fingerprint"] == "fp"
+    assert list(hm.STATE_DIR.glob(".*.tmp")) == []
 
 
 @pytest.mark.asyncio
@@ -211,6 +229,35 @@ async def test_shutdown_falls_back_to_global_flush_when_no_scopes_were_touched()
 
 
 @pytest.mark.asyncio
+async def test_shutdown_skips_memory_drain_when_disabled_for_test_mode():
+    runner = PipelineRunner.__new__(PipelineRunner)
+    called = {"distill_pending": False, "distill_pending_scopes": False}
+
+    async def fake_distill_pending():
+        called["distill_pending"] = True
+
+    async def fake_distill_pending_scopes(scope_keys):
+        called["distill_pending_scopes"] = True
+
+    runner._disable_memory = False
+    runner._drain_memory_on_shutdown = False
+    runner._touched_memory_scopes = {"scope_a"}
+    runner.memory = SimpleNamespace(
+        distill_pending=fake_distill_pending,
+        distill_pending_scopes=fake_distill_pending_scopes,
+    )
+    runner.router = SimpleNamespace(shutdown=AsyncMock())
+    runner._mcp_manager = None
+    runner._mcp_started = False
+
+    await PipelineRunner.shutdown(runner)
+
+    assert called["distill_pending"] is False
+    assert called["distill_pending_scopes"] is False
+    runner.router.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_distill_pending_scopes_limits_flush_to_selected_scope_and_bucket(monkeypatch):
     agent = DistillationAgent(
         notes=_FakeNotes(scoped={"scope_a": 3, "scope_b": 4}),
@@ -250,6 +297,299 @@ async def test_distill_pending_scopes_limits_flush_to_selected_scope_and_bucket(
 
     assert seen_scopes == ["scope_b"]
     assert seen_buckets == ["scope_b"]
+
+
+@pytest.mark.asyncio
+async def test_distill_pending_scopes_waits_for_scope_flush_before_bucket_flush(monkeypatch):
+    agent = DistillationAgent(
+        notes=_FakeNotes(scoped={"scope_b": 4}),
+        memory=_FakeMemory(),
+        tools=_FakeTools(),
+        skills=_FakeSkills(),
+    )
+    scope_state = {
+        "scope_b": {
+            "notes_total_seq": 0,
+            "notes_to_memory_done_seq": 0,
+            "memory_to_skills_done_fingerprint": "",
+            "memory_to_tools_done_fingerprint": "",
+        }
+    }
+    bucket_state = {
+        "scope_b": {
+            "memory_to_cross_done_fingerprint": "",
+        }
+    }
+    events: list[str] = []
+
+    async def fake_update_scope_state(scope, **kwargs):
+        scope_state.setdefault(scope, {}).update(kwargs)
+        return dict(scope_state[scope])
+
+    async def fake_get_scope_state(scope):
+        return dict(scope_state.get(scope, {}))
+
+    async def fake_update_bucket_state(bucket, **kwargs):
+        bucket_state.setdefault(bucket, {}).update(kwargs)
+        return dict(bucket_state[bucket])
+
+    async def fake_get_bucket_state(bucket):
+        return dict(bucket_state.get(bucket, {}))
+
+    monkeypatch.setattr(agent, "_update_scope_state", fake_update_scope_state)
+    monkeypatch.setattr(agent, "_get_scope_state", fake_get_scope_state)
+    monkeypatch.setattr(agent, "_update_bucket_state", fake_update_bucket_state)
+    monkeypatch.setattr(agent, "_get_bucket_state", fake_get_bucket_state)
+    monkeypatch.setattr(agent, "_scope_memory_fingerprint", lambda scope: "scope-fp")
+    monkeypatch.setattr(agent, "_bucket_memory_fingerprint", lambda bucket: "bucket-fp")
+
+    def fake_ensure_scope_worker(scope, force=False):
+        if scope in agent._scope_workers and not agent._scope_workers[scope].done():
+            return
+
+        async def _run():
+            events.append(f"scope_start:{scope}")
+            await fake_update_scope_state(
+                scope,
+                notes_to_memory_done_seq=agent.notes.scoped_total(scope),
+                memory_to_skills_done_fingerprint="scope-fp",
+                memory_to_tools_done_fingerprint="scope-fp",
+            )
+            events.append(f"scope_end:{scope}")
+
+        agent._scope_workers[scope] = asyncio.create_task(_run())
+
+    def fake_ensure_bucket_worker(bucket, force=False):
+        if bucket in agent._bucket_workers and not agent._bucket_workers[bucket].done():
+            return
+
+        async def _run():
+            events.append(
+                f"bucket_seen_done_seq:{scope_state['scope_b']['notes_to_memory_done_seq']}"
+            )
+            assert scope_state["scope_b"]["notes_to_memory_done_seq"] == 4
+            await fake_update_bucket_state(
+                bucket,
+                memory_to_cross_done_fingerprint="bucket-fp",
+            )
+            events.append(f"bucket_end:{bucket}")
+
+        agent._bucket_workers[bucket] = asyncio.create_task(_run())
+
+    monkeypatch.setattr(agent, "_ensure_scope_worker", fake_ensure_scope_worker)
+    monkeypatch.setattr(agent, "_ensure_bucket_worker", fake_ensure_bucket_worker)
+
+    await agent.distill_pending_scopes(["scope_b"])
+
+    assert events == [
+        "scope_start:scope_b",
+        "scope_end:scope_b",
+        "bucket_seen_done_seq:4",
+        "bucket_end:scope_b",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_distill_pending_scopes_does_not_wait_for_unrelated_scope_worker(monkeypatch):
+    agent = DistillationAgent(
+        notes=_FakeNotes(scoped={"scope_a": 4, "scope_b": 4}),
+        memory=_FakeMemory(),
+        tools=_FakeTools(),
+        skills=_FakeSkills(),
+    )
+
+    async def fake_update_scope_state(scope, **kwargs):
+        return {
+            "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
+            "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "pending_snapshot_notes_to_seq": 0,
+        }
+
+    async def fake_get_scope_state(scope):
+        return {
+            "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
+            "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "pending_snapshot_notes_to_seq": 0,
+        }
+
+    async def fake_get_bucket_state(bucket):
+        return {
+            "memory_to_cross_done_fingerprint": agent._bucket_memory_fingerprint(bucket),
+        }
+
+    monkeypatch.setattr(agent, "_update_scope_state", fake_update_scope_state)
+    monkeypatch.setattr(agent, "_get_scope_state", fake_get_scope_state)
+    monkeypatch.setattr(agent, "_get_bucket_state", fake_get_bucket_state)
+
+    unrelated_gate = asyncio.Event()
+    agent._scope_workers["scope_a"] = asyncio.create_task(unrelated_gate.wait())
+
+    await asyncio.wait_for(agent.distill_pending_scopes(["scope_b"]), timeout=0.2)
+
+    assert not unrelated_gate.is_set()
+    agent._scope_workers["scope_a"].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await agent._scope_workers["scope_a"]
+
+
+@pytest.mark.asyncio
+async def test_distill_pending_scopes_does_not_wait_for_unrelated_bucket_worker(monkeypatch):
+    agent = DistillationAgent(
+        notes=_FakeNotes(scoped={"scope_b": 4}),
+        memory=_FakeMemory(),
+        tools=_FakeTools(),
+        skills=_FakeSkills(),
+    )
+
+    async def fake_update_scope_state(scope, **kwargs):
+        return {
+            "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
+            "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "pending_snapshot_notes_to_seq": 0,
+        }
+
+    async def fake_get_scope_state(scope):
+        return {
+            "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
+            "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "pending_snapshot_notes_to_seq": 0,
+        }
+
+    async def fake_get_bucket_state(bucket):
+        return {
+            "memory_to_cross_done_fingerprint": agent._bucket_memory_fingerprint(bucket),
+        }
+
+    monkeypatch.setattr(agent, "_update_scope_state", fake_update_scope_state)
+    monkeypatch.setattr(agent, "_get_scope_state", fake_get_scope_state)
+    monkeypatch.setattr(agent, "_get_bucket_state", fake_get_bucket_state)
+
+    unrelated_gate = asyncio.Event()
+    agent._bucket_workers["other_bucket"] = asyncio.create_task(unrelated_gate.wait())
+
+    await asyncio.wait_for(agent.distill_pending_scopes(["scope_b"]), timeout=0.2)
+
+    assert not unrelated_gate.is_set()
+    agent._bucket_workers["other_bucket"].cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await agent._bucket_workers["other_bucket"]
+
+
+@pytest.mark.asyncio
+async def test_force_flush_upgrades_existing_scope_worker(monkeypatch):
+    initial_note_count = hm._DISTILL_L1_TO_L2
+    notes = _FakeNotes(scoped={"scope_b": initial_note_count})
+    agent = DistillationAgent(
+        notes=notes,
+        memory=_FakeMemory(),
+        tools=_FakeTools(),
+        skills=_FakeSkills(),
+    )
+    scope_state = {
+        "scope_b": {
+            "notes_total_seq": 0,
+            "notes_to_memory_done_seq": 0,
+            "memory_fingerprint": "",
+            "memory_to_skills_done_fingerprint": "",
+            "memory_to_tools_done_fingerprint": "",
+            "pending_snapshot_notes_from_seq": 0,
+            "pending_snapshot_notes_to_seq": 0,
+            "pending_snapshot_memory_fingerprint": "",
+        }
+    }
+    note_force_calls: list[bool] = []
+    first_call_started = asyncio.Event()
+    release_first_call = asyncio.Event()
+
+    async def fake_update_scope_state(scope, **kwargs):
+        scope_state.setdefault(scope, {}).update(kwargs)
+        return dict(scope_state[scope])
+
+    async def fake_get_scope_state(scope):
+        return dict(scope_state.get(scope, {}))
+
+    async def fake_distill_notes_to_memory(scope, target_seq=None, force=False):
+        note_force_calls.append(bool(force))
+        if len(note_force_calls) == 1:
+            first_call_started.set()
+            await release_first_call.wait()
+        return True
+
+    async def fake_distill_memory_to_skills(scope):
+        return True
+
+    async def fake_distill_memory_to_tools(scope):
+        return True
+
+    async def fake_append_memory_history_snapshot(**kwargs):
+        return None
+
+    def fake_ensure_bucket_worker(bucket, force=False):
+        if bucket in agent._bucket_workers and not agent._bucket_workers[bucket].done():
+            return
+        agent._bucket_workers[bucket] = asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(agent, "_update_scope_state", fake_update_scope_state)
+    monkeypatch.setattr(agent, "_get_scope_state", fake_get_scope_state)
+    monkeypatch.setattr(agent, "maybe_distill_notes_to_memory", fake_distill_notes_to_memory)
+    monkeypatch.setattr(agent, "maybe_distill_memory_to_skills", fake_distill_memory_to_skills)
+    monkeypatch.setattr(agent, "maybe_distill_memory_to_tools", fake_distill_memory_to_tools)
+    monkeypatch.setattr(agent, "_append_memory_history_snapshot", fake_append_memory_history_snapshot)
+    monkeypatch.setattr(agent, "_scope_memory_fingerprint", lambda scope: "scope-fp")
+    monkeypatch.setattr(agent, "_ensure_bucket_worker", fake_ensure_bucket_worker)
+
+    agent._ensure_scope_worker("scope_b", force=False)
+    await first_call_started.wait()
+
+    notes._scoped["scope_b"] = initial_note_count + 1
+    agent._ensure_scope_worker("scope_b", force=True)
+    release_first_call.set()
+
+    worker = agent._scope_workers["scope_b"]
+    await asyncio.wait_for(worker, timeout=1.0)
+
+    assert note_force_calls == [False, True]
+    assert scope_state["scope_b"]["notes_to_memory_done_seq"] == initial_note_count + 1
+
+
+@pytest.mark.asyncio
+async def test_force_bucket_worker_rebuilds_only_once(monkeypatch):
+    agent = DistillationAgent(
+        notes=_FakeNotes(),
+        memory=_FakeMemory(),
+        tools=_FakeTools(),
+        skills=_FakeSkills(),
+    )
+    bucket_state = {
+        "scope_b": {
+            "memory_fingerprint": "",
+            "memory_to_cross_done_fingerprint": "",
+            "memory_to_cross_inflight": False,
+        }
+    }
+    cross_calls: list[str] = []
+
+    async def fake_update_bucket_state(bucket, **kwargs):
+        bucket_state.setdefault(bucket, {}).update(kwargs)
+        return dict(bucket_state[bucket])
+
+    monkeypatch.setattr(agent, "_update_bucket_state", fake_update_bucket_state)
+    monkeypatch.setattr(agent, "_bucket_memory_fingerprint", lambda bucket: "bucket-fp")
+
+    async def fake_distill_memory_to_cross_domain(bucket):
+        cross_calls.append(bucket)
+        return True
+
+    monkeypatch.setattr(agent, "maybe_distill_memory_to_cross_domain", fake_distill_memory_to_cross_domain)
+
+    await asyncio.wait_for(agent._bucket_worker("scope_b", force=True), timeout=1.0)
+
+    assert cross_calls == ["scope_b"]
+    assert bucket_state["scope_b"]["memory_to_cross_done_fingerprint"] == "bucket-fp"
 
 
 def test_entry_support_count_uses_unique_note_refs():
@@ -304,6 +644,103 @@ def test_memory_prompt_section_only_injects_injectable_rules():
     assert "Rule: Prefer ets_forecast on smooth downtrends." in prompt
     assert "Evidence: 2 note(s)" in prompt
     assert "Old contradicted rule." not in prompt
+
+
+def test_memory_prompt_section_renders_path_rules_without_flattening_to_single_tools():
+    store = MemoryStore()
+    store._entries = {
+        "weather_aligned_long_trend": [
+            {
+                "summary": "Daily aggregation should precede trend classification on hourly weather trend tasks.",
+                "conditions": ["hourly weather trend classification"],
+                "preferred_tools": ["segment"],
+                "avoid_tools": [],
+                "preferred_tool_chains": [["segment", "llm_reasoning_classification"]],
+                "avoid_tool_chains": [["detect_trend", "llm_reasoning_classification"]],
+                "rationale": "Winning runs first aggregate to daily structure, then classify.",
+                "evidence": {"sample_refs": ["n1", "n2", "n3"]},
+                "injectable": True,
+            }
+        ]
+    }
+
+    prompt = store.get_prompt_section(scope="weather_aligned_long_trend")
+
+    assert "Prefer Path: segment -> llm_reasoning_classification" in prompt
+    assert "Avoid Path: detect_trend -> llm_reasoning_classification" in prompt
+    assert "Prefer: segment" in prompt
+
+
+def test_notes_to_memory_prompt_explicitly_distinguishes_single_tools_from_tool_chains():
+    assert "A multi-item `preferred_tools` list should read as \"any of these single tools may be suitable\"" in hm.NOTES_TO_MEMORY_PROMPT
+    assert "If the evidence says \"tool A before tool B\"" in hm.NOTES_TO_MEMORY_PROMPT
+    assert "verify that every non-empty `preferred_tools` / `avoid_tools`" in hm.NOTES_TO_MEMORY_PROMPT
+
+
+def test_memory_prompt_section_orders_top_ranked_rules_first_without_truncating_injectable_rules():
+    store = MemoryStore()
+    store._entries = {
+        "weather_aligned_long_trend": [
+            {
+                "rule_id": f"weather_aligned_long_trend::{idx:03d}",
+                "summary": f"rule_{idx}",
+                "conditions": [],
+                "preferred_tools": [],
+                "avoid_tools": [],
+                "rationale": "",
+                "evidence": {"sample_refs": [f"n{idx}"] * max(1, 12 - idx)},
+                "injectable": True,
+                "confidence": 1.0 - (idx * 0.01),
+                "timestamp": 1000 - idx,
+            }
+            for idx in range(10)
+        ]
+    }
+
+    prompt = store.get_prompt_section(scope="weather_aligned_long_trend")
+
+    assert "Rule: rule_0" in prompt
+    assert "Rule: rule_7" in prompt
+    assert "Rule: rule_8" in prompt
+    assert "Rule: rule_9" in prompt
+    assert prompt.index("Rule: rule_0") < prompt.index("Rule: rule_8")
+    assert prompt.index("Rule: rule_8") < prompt.index("Rule: rule_9")
+
+
+def test_compute_statistics_treats_scored_separately_and_does_not_claim_success_rates():
+    notes = [
+        """### [00:00:00] s1 — SCORED
+[s1] SCORED
+
+Winner Tools:
+- compute_macd
+
+Prediction:
+1.0
+
+Metrics:
+- macd_mae: 0.100
+""",
+        """### [00:00:01] s2 — FAIL
+[s2] FAIL
+
+Winner Tools:
+- compute_macd
+""",
+        """### [00:00:02] s3 — OK
+[s3] OK
+
+Winner Tools:
+- compute_bollinger
+""",
+    ]
+
+    statistics = DistillationAgent._compute_statistics(notes)
+
+    assert "Total runs: 3 (OK=1, FAIL=1, SCORED=1)" in statistics
+    assert "Tool success rates:" not in statistics
+    assert "Winner-tool occurrence by note outcome:" in statistics
+    assert "compute_macd: total=2 (FAIL=1, SCORED=1)" in statistics
 
 
 def test_source_rule_note_refs_dedupes_across_source_rules():

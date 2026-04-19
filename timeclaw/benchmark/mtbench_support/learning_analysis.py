@@ -7,7 +7,7 @@ from typing import Any
 from loguru import logger
 
 from timeclaw.core.config import TimeClawConfig
-from timeclaw.core.learning_text import normalize_learning_clause
+from timeclaw.core.candidate_labels import canonical_candidate_label, strip_branch_prefix
 from timeclaw.llm.router import ModelRouter
 
 _analysis_llm = None
@@ -17,12 +17,13 @@ _SYSTEM_PROMPT = """You are writing a single-sample learning analysis for a time
 Your output will be stored in notes and later distilled into reusable memory.
 Do not write a generic summary. Write compact, evidence-grounded learning material.
 
-Extract exactly five fields:
+Extract exactly six fields:
 0. text signals: 3-6 short original-text snippets from the task's text/context that are most useful for solving this sample
 1. sample conditions that matter for tool choice
 2. concrete evidence for why the accepted tool/path matched this sample better than the other tested paths
 3. failure signals from weaker tested paths
 4. a reusable decision rule for future similar cases
+5. candidate evidence: per-tested-path evidence bullets grounded in the real execution trace
 
 Rules:
 - Be specific and operational.
@@ -62,15 +63,25 @@ Rules:
 - In reusable_rule, write exactly one bullet that starts with "When".
 - Keep each bullet short and factual.
 - If no clear failure signal exists, return an empty list for failure_signals.
-- If `Winner correctness` is `incorrect`, treat the selected winner as the
-  strongest failed challenger, not a success pattern:
-  - winner_evidence should explain why it still surfaced as the strongest challenger
-  - failure_signals should include why it was still wrong or fragile
+- For candidate_evidence, return a list of objects with keys:
+  - path: exact tested path label from the Candidates block when possible
+  - evidence: 1-2 short bullets grounded in real steps, observations, predictions, or metrics for that path
+- candidate_evidence is for note display and later audit. It should summarize
+  what this path actually did or revealed on this sample, not orchestration or
+  packaging behavior.
+- Do not invent missing evidence. If a path has no concrete trace-grounded
+  evidence beyond the final prediction/metric, it is acceptable to use those.
+- If `Winner correctness` is `incorrect` or the Final accepted winner block is empty,
+  treat the sample as having no validated winner:
+  - do not present any explored path as the accepted winner
+  - winner_evidence should explain why no explored path was validated, or stay empty if
+    that field would otherwise invent a winner
+  - failure_signals should explain what made the explored paths fail or remain fragile
   - reusable_rule must be a cautionary rule that starts with "When" and warns what
     to avoid, verify, or compare before trusting a similar path
 
 Return ONLY JSON with keys:
-text_signals, sample_conditions, winner_evidence, failure_signals, reusable_rule"""
+text_signals, sample_conditions, winner_evidence, failure_signals, reusable_rule, candidate_evidence"""
 
 
 def _get_analysis_llm():
@@ -128,13 +139,12 @@ def _remove_ground_truth_lines(text: str) -> str:
 
 def _candidate_prompt_block(candidate_traces: list[dict[str, Any]]) -> str:
     def _display_candidate_name(trace: dict[str, Any], index: int) -> str:
-        name = str(trace.get("name") or f"candidate_{index}").strip()
-        tool_chain = [t for t in trace.get("tool_chain", []) if t]
-        if name and not re.fullmatch(r"(slot|candidate|approach)_\d+", name):
-            return name
-        if tool_chain:
-            return " -> ".join(tool_chain[:5])
-        return name
+        return canonical_candidate_label(
+            candidate_key=trace.get("candidate_key"),
+            name=trace.get("name"),
+            tool_chain=trace.get("tool_chain"),
+            fallback=f"candidate_{index}",
+        )
 
     lines: list[str] = []
     for idx, trace in enumerate(candidate_traces[:4], 1):
@@ -146,20 +156,11 @@ def _candidate_prompt_block(candidate_traces: list[dict[str, Any]]) -> str:
         lines.append(f"- Tested path: {name}")
         if tool_chain:
             lines.append(f"  Tool chain: {' -> '.join(tool_chain[:5])}")
+        prediction = trace.get("prediction")
+        if prediction is not None:
+            lines.append(f"  Prediction: {_short_text(prediction, 300)}")
         if metrics:
             lines.append(f"  Metrics: {_short_text(metrics, 300)}")
-        public_snippets = trace.get("public_reasoning_snippets")
-        if isinstance(public_snippets, list):
-            cleaned_public = [
-                str(item).strip()
-                for item in public_snippets
-                if str(item).strip()
-            ]
-            if cleaned_public:
-                lines.append(
-                    "  Execution evidence: "
-                    + " | ".join(_short_text(item, 240) for item in cleaned_public[:3])
-                )
         steps = trace.get("steps")
         if isinstance(steps, list) and steps:
             lines.append("  Steps:")
@@ -177,57 +178,100 @@ def _candidate_alias_map(candidate_traces: list[dict[str, Any]]) -> dict[str, st
     for idx, trace in enumerate(candidate_traces):
         if not isinstance(trace, dict):
             continue
-        display = ""
-        name = str(trace.get("name") or "").strip()
-        tool_chain = [str(t).strip() for t in trace.get("tool_chain", []) if str(t).strip()]
-        if name and not re.fullmatch(r"(slot|candidate|approach)_\d+", name):
-            display = name
-        elif tool_chain:
-            display = " -> ".join(tool_chain[:5])
-        elif name:
-            display = name
-        else:
-            display = f"candidate_{idx}"
+        display = canonical_candidate_label(
+            candidate_key=trace.get("candidate_key"),
+            name=trace.get("name"),
+            tool_chain=trace.get("tool_chain"),
+            fallback=f"candidate_{idx}",
+        )
         for raw in (trace.get("name"), trace.get("candidate_key")):
             alias = str(raw or "").strip()
             if not alias:
                 continue
             aliases[alias.lower()] = display
+            stripped = strip_branch_prefix(alias)
+            if stripped and stripped != alias:
+                aliases[stripped.lower()] = display
     return aliases
 
 
 def _sanitize_analysis_item(text: Any, alias_map: dict[str, str]) -> str:
-    cleaned = _short_text(text, 500).strip()
-    if not cleaned:
-        return ""
-    if re.search(
-        r"(?i)\b(spawn_subagent|evaluate_against_gt|evaluate_batch_against_gt|batch_evaluate_against_gt)\b",
-        cleaned,
-    ):
-        return ""
-    for alias, display in sorted(alias_map.items(), key=lambda item: len(item[0]), reverse=True):
-        cleaned = re.sub(rf"(?i)\b{re.escape(alias)}\b", display, cleaned)
-    for display in sorted(set(alias_map.values()), key=len, reverse=True):
-        cleaned = re.sub(
-            rf"(?i)\b{re.escape(display)}\b\s+using\s+\b{re.escape(display)}\b",
-            display,
-            cleaned,
-        )
-    cleaned = normalize_learning_clause(cleaned)
-    if re.search(
-        r"(?i)\b(execution context|assigned(?: exploration)? path|assigned branch|branch(?: instructions?)?|training mode|learning mode|learning-mode|ground truth)\b",
-        cleaned,
-    ):
-        return ""
-    if re.search(r"(?i)\bbefore finishing\b", cleaned):
-        return ""
-    if re.search(
-        r"(?i)\b(gt-selected|task-valid(?: candidate)?|branch comparison|most efficient (?:next step|way)|most direct next step|available from a real tool result|may be returned unchanged|current branch state confirms)\b",
-        cleaned,
-    ):
-        return ""
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,:;|-")
-    return cleaned
+    # Temporary probe mode:
+    # keep the analysis text as close as possible to the raw LLM output so we
+    # can inspect whether later post-processing, rather than the analysis LLM
+    # itself, is responsible for malformed note wording.
+    return _short_text(text, 500).strip()
+
+
+def _normalize_candidate_evidence(
+    value: Any,
+    alias_map: dict[str, str],
+) -> list[dict[str, list[str] | str]]:
+    if not isinstance(value, list):
+        return []
+
+    normalized: list[dict[str, list[str] | str]] = []
+    seen_paths: set[str] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(
+            item.get("path")
+            or item.get("candidate")
+            or item.get("name")
+            or ""
+        ).strip()
+        if not raw_path:
+            continue
+        path_key = raw_path.lower()
+        path = alias_map.get(path_key)
+        if not path:
+            stripped = strip_branch_prefix(raw_path)
+            path = alias_map.get(stripped.lower()) if stripped else None
+        if not path:
+            path = raw_path
+        path = canonical_candidate_label(name=path).strip()
+        if not path:
+            continue
+
+        raw_evidence = item.get("evidence")
+        if isinstance(raw_evidence, list):
+            evidence_items = raw_evidence
+        elif raw_evidence is None:
+            evidence_items = []
+        else:
+            evidence_items = [raw_evidence]
+
+        cleaned_evidence: list[str] = []
+        seen_evidence: set[str] = set()
+        for evidence in evidence_items:
+            cleaned = _short_text(evidence, 500).strip()
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if lowered in seen_evidence:
+                continue
+            seen_evidence.add(lowered)
+            cleaned_evidence.append(cleaned)
+
+        if not cleaned_evidence:
+            continue
+        lowered_path = path.lower()
+        if lowered_path in seen_paths:
+            for existing in normalized:
+                if str(existing.get("path") or "").lower() != lowered_path:
+                    continue
+                merged = list(existing.get("evidence") or [])
+                for evidence in cleaned_evidence:
+                    if evidence.lower() not in {str(x).lower() for x in merged}:
+                        merged.append(evidence)
+                existing["evidence"] = merged[:2]
+                break
+            continue
+
+        seen_paths.add(lowered_path)
+        normalized.append({"path": path, "evidence": cleaned_evidence[:2]})
+    return normalized
 
 
 def _extract_text_context(task_description: str) -> str:
@@ -350,13 +394,12 @@ def _tool_chain_text(trace: dict[str, Any] | None) -> str:
 def _winner_name_text(trace: dict[str, Any] | None) -> str:
     if not isinstance(trace, dict):
         return "candidate"
-    name = str(trace.get("name") or trace.get("candidate_key") or "").strip()
-    chain = _tool_chain_text(trace)
-    if name and not re.fullmatch(r"(slot|candidate|approach|top_level)_\d+", name.lower()):
-        return name
-    if chain:
-        return chain
-    return name or "candidate"
+    return canonical_candidate_label(
+        candidate_key=trace.get("candidate_key"),
+        name=trace.get("name"),
+        tool_chain=trace.get("tool_chain"),
+        fallback="candidate",
+    )
 
 
 def _scalar_prediction_text(prediction: Any) -> str:
@@ -405,7 +448,14 @@ def render_learning_summary_from_analysis(
     failure_signals = _join_analysis_items(analysis.get("failure_signals"), limit=2)
     reusable_rule = _join_analysis_items(analysis.get("reusable_rule"), limit=1)
 
-    if winner_correct is False:
+    if winner_correct is False and winner_trace is None:
+        parts = []
+        if sample_conditions:
+            parts.append(f"Relevant data characteristics: {sample_conditions}")
+        parts.append("No explored candidate was validated against ground truth on this sample")
+        if failure_signals:
+            parts.append(f"Observed failure signals across explored paths: {failure_signals}")
+    elif winner_correct is False:
         parts: list[str] = []
         if sample_conditions:
             parts.append(f"Relevant data characteristics: {sample_conditions}")
@@ -435,11 +485,13 @@ def render_learning_summary_from_analysis(
 def _normalize_analysis_payload(
     payload: dict[str, Any] | None,
     candidate_traces: list[dict[str, Any]] | None = None,
-) -> dict[str, list[str]] | None:
+    *,
+    allow_empty_winner_evidence: bool = False,
+) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
     alias_map = _candidate_alias_map(candidate_traces or [])
-    normalized: dict[str, list[str]] = {}
+    normalized: dict[str, Any] = {}
     for key in ("text_signals", "sample_conditions", "winner_evidence", "failure_signals", "reusable_rule"):
         value = payload.get(key)
         if value is None:
@@ -457,7 +509,15 @@ def _normalize_analysis_payload(
                 else str(value).strip()
             )
             normalized[key] = [text] if text else []
-    if not normalized["sample_conditions"] or not normalized["winner_evidence"] or not normalized["reusable_rule"]:
+    normalized["candidate_evidence"] = _normalize_candidate_evidence(
+        payload.get("candidate_evidence"),
+        alias_map,
+    )
+    if (
+        not normalized["sample_conditions"]
+        or (not normalized["winner_evidence"] and not allow_empty_winner_evidence)
+        or not normalized["reusable_rule"]
+    ):
         return None
     return normalized
 
@@ -476,8 +536,9 @@ async def generate_learning_analysis(
     winner_correct: bool | None = None,
     fallback_summary: str = "",
     llm: Any | None = None,
-) -> tuple[dict[str, list[str]] | None, str]:
+) -> tuple[dict[str, Any] | None, str]:
     llm = llm or _get_analysis_llm()
+    no_validated_winner = winner_correct is False and selected_winner_trace is None
     text_context = _extract_text_context(task_description)
     best_metrics = _strip_ground_truth_fields(best_metrics)
     fallback_summary = _remove_ground_truth_lines(fallback_summary)
@@ -507,7 +568,11 @@ async def generate_learning_analysis(
             ],
             response_format="json",
         )
-        payload = _normalize_analysis_payload(resp.parsed if resp else None, candidate_traces)
+        payload = _normalize_analysis_payload(
+            resp.parsed if resp else None,
+            candidate_traces,
+            allow_empty_winner_evidence=no_validated_winner,
+        )
         if payload:
             payload["text_signals"] = _sanitize_text_signals(payload.get("text_signals", []), text_context)
             return payload, render_learning_analysis_text(payload)

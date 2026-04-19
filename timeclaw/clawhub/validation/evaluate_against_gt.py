@@ -222,10 +222,13 @@ class EvaluateAgainstGTTool(ClawTool):
         pred_str = str(pred).strip().lower()
         gt_str = str(gt).strip().lower()
         correct = pred_str == gt_str
-        if not correct and len(pred_str) == 1 and len(gt_str) == 1:
-            correct = pred_str == gt_str
-        if not correct:
-            correct = pred_str[:1] == gt_str[:1] and gt_str[:1].isalpha()
+        if (
+            not correct
+            and len(gt_str) == 1
+            and gt_str.isalpha()
+            and pred_str[:1].isalpha()
+        ):
+            correct = pred_str[:1] == gt_str
         return {
             "accuracy": 1.0 if correct else 0.0,
             "correct": correct,

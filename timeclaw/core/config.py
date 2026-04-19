@@ -36,6 +36,14 @@ class LLMConfig(BaseModel):
     azure_api_base: str | None = "https://asure-test-openai-004.openai.azure.com/"
     azure_api_key: str | None = "5jDLlQ5ccmal2OAOchrqcatcKMr4FfqQbOD1n0YUwkIFCwdxcI5aJQQJ99ALACYeBjFXJ3w3AAABACOGZLN4"
     azure_api_version: str | None = "2024-12-01-preview"
+    # OpenAI Responses API: reasoning.effort (none/minimal/low/medium/high/xhigh).
+    # Native openai/ + proxy path only. Does not request reasoning.summary, so optional
+    # human-readable reasoning summaries are not added to the response output (see OpenAI reasoning guide).
+    #
+    # New definition:
+    # - Default is ``medium`` for main planning / execution / synthesis calls.
+    # - Lightweight extraction / summarization helpers may explicitly override this per call to ``none``.
+    reasoning_effort: str | None = "medium"
 
 
 class ReasoningConfig(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
@@ -11,6 +12,8 @@ import pytest
 
 from timeclaw.core import trace_logger as trace
 from timeclaw.core.config import LLMConfig, LLMModelConfig, TimeClawConfig
+from timeclaw.core.evidence import EvidenceLog
+from timeclaw.clawhub.tool_base import ToolResult
 from timeclaw.llm.base import LLMResponse
 from timeclaw.pipeline import runner as runner_mod
 from timeclaw.pipeline.runner import PipelineRunner
@@ -68,50 +71,93 @@ async def test_pipeline_end_to_end():
 
     runner = PipelineRunner(config)
 
-    with patch("litellm.acompletion", new_callable=AsyncMock) as mock_acompletion:
-        mock_acompletion.side_effect = _make_mock_litellm_response
+    forecast_values = [float(i) for i in range(10)]
+    llm_calls = {"count": 0}
 
-        np.random.seed(42)
-        data = np.arange(100, dtype=float) + np.random.randn(100) * 2
+    def _make_executor_response(*args, **kwargs):
+        del args, kwargs
+        llm_calls["count"] += 1
+        if llm_calls["count"] == 1:
+            payload = {
+                "thought": "Reason: need a direct forecast baseline first. Action: run arima_forecast.",
+                "done": False,
+                "tool": "arima_forecast",
+                "args": {"horizon": 10},
+            }
+        else:
+            payload = {
+                "thought": "Reason: arima_forecast already produced the 10-step forecast. Action: finish now.",
+                "done": True,
+                "answer": forecast_values,
+                "answer_type": "forecast",
+                "confidence": 0.8,
+                "reasoning": (
+                    "1. `arima_forecast` produced the final 10-step forecast vector.\n"
+                    "2. I return that exact tool output unchanged."
+                ),
+                "execution_context": {
+                    "tool_chain": ["arima_forecast"],
+                    "public_reasoning": [
+                        "`arima_forecast` produced the final 10-step forecast vector.",
+                    ],
+                    "evidence_summary": "The final answer reuses the exact `arima_forecast` output.",
+                },
+                "control_context": {"completion_notes": ""},
+            }
+        return _make_mock_chat_completion(payload)
 
-        result = await runner.run(
-            data=data,
-            task_type="forecast",
-            description="Forecast next 10 steps",
-            horizon=10,
+    async def _fake_execute_tool(self, tool_name, tool_args, data, text_data, images):
+        del self, tool_args, data, text_data, images
+        assert tool_name == "arima_forecast"
+        return ToolResult(
+            success=True,
+            data={"forecast": forecast_values},
+            error=None,
+            metadata={},
         )
 
-        assert "trace_id" in result
-        assert "timeline" in result
-        assert "total_ms" in result
-        assert result["total_ms"] > 0
+    with patch("litellm.acompletion", new_callable=AsyncMock) as mock_acompletion:
+        mock_acompletion.side_effect = _make_executor_response
+        with patch("timeclaw.agents.executor.ExecutorAgent._execute_tool", new=_fake_execute_tool):
 
-        timeline = result["timeline"]
-        assert "plan" in timeline
-        assert "diagnose" in timeline
-        assert "execute" in timeline
-        assert "verify" in timeline
-        assert "deliver" in timeline
+            np.random.seed(42)
+            data = np.arange(100, dtype=float) + np.random.randn(100) * 2
+
+            result = await runner.run(
+                data=data,
+                task_type="forecast",
+                description="Forecast next 10 steps",
+                horizon=10,
+            )
+
+            assert "trace_id" in result
+            assert "timeline" in result
+            assert "total_ms" in result
+            assert result["total_ms"] > 0
+
+            timeline = result["timeline"]
+            assert "preprocess" in timeline
+            assert "execute" in timeline
+            assert "postprocess" in timeline
+            assert "deliver" in timeline
+            assert result["answer"] == forecast_values
 
 
-def _make_mock_litellm_response(*args, **kwargs):
-    """Create a mock litellm response object."""
-    from unittest.mock import MagicMock
-
-    response = MagicMock()
-    response.choices = [MagicMock()]
-    response.choices[0].message.content = (
-        '{"task_type": "forecast", "sub_goals": ["predict"], '
-        '"accepted": true, "reasoning": "ok", '
-        '"fingerprint": {"basic_stats": {}, "stationarity": "stationary", '
-        '"trend": "up", "drift_detected": false}, '
-        '"tool_chain": [{"tool": "arima_forecast", "args": {"horizon": 10}}]}'
+def _make_mock_chat_completion(payload: dict) -> SimpleNamespace:
+    """Create a minimal chat-completions style response object."""
+    response = SimpleNamespace()
+    response.choices = [
+        SimpleNamespace(
+            message=SimpleNamespace(
+                content=json.dumps(payload, ensure_ascii=False)
+            )
+        )
+    ]
+    response.usage = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=50,
+        total_tokens=150,
     )
-    response.choices[0].message.tool_calls = None
-    response.usage = MagicMock()
-    response.usage.prompt_tokens = 100
-    response.usage.completion_tokens = 50
-    response.usage.total_tokens = 150
     return response
 
 
@@ -192,6 +238,62 @@ async def test_pipeline_shutdown_closes_router_even_without_memory(monkeypatch):
     await runner.shutdown()
 
     runner.router.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_runner_accepts_numpy_array_executor_answer(monkeypatch):
+    runner = PipelineRunner(disable_memory=True)
+
+    class _FakeTask:
+        def __init__(self) -> None:
+            self.metadata = {}
+
+    class _FakeEnvelope:
+        def __init__(self) -> None:
+            self.task = _FakeTask()
+
+        def update_environment(self, **kwargs) -> None:
+            return None
+
+        def with_agent(self, agent_name: str):
+            return self
+
+    class _ArrayExecutor:
+        def __init__(self) -> None:
+            self.evidence_log = EvidenceLog()
+
+        async def run(self, envelope):
+            return {
+                "result": {
+                    "answer": np.array([1.0, 2.0, 3.0], dtype=float),
+                    "answer_type": "forecast",
+                    "confidence": 0.9,
+                    "reasoning": "array answer",
+                    "execution_log": [],
+                }
+            }
+
+    async def _fake_preprocess(*args, **kwargs):
+        return {
+            "fingerprint": {"length": 3},
+            "modalities": ["timeseries"],
+            "profiling_results": {},
+        }
+
+    monkeypatch.setattr(runner, "_ensure_tools", AsyncMock())
+    monkeypatch.setattr(runner, "_build_envelope", lambda **kwargs: _FakeEnvelope())
+    monkeypatch.setattr(runner, "_preprocess", _fake_preprocess)
+    monkeypatch.setattr(runner, "_create_executor", lambda: _ArrayExecutor())
+
+    result = await runner.run(
+        data=[1.0, 2.0, 3.0],
+        task_type="forecast",
+        description="array answer path",
+        horizon=3,
+    )
+
+    assert result["answer_type"] == "forecast"
+    assert np.allclose(np.asarray(result["prediction"], dtype=float), np.array([1.0, 2.0, 3.0]))
 
 
 def test_sanitize_reasoning_clause_keeps_evidence_but_drops_framework_preface():
@@ -308,6 +410,96 @@ async def test_rewrite_learning_summary_from_analysis_replaces_control_flow_word
     assert "recent window is flat" in combined
 
 
+@pytest.mark.asyncio
+async def test_rewrite_learning_summary_from_analysis_handles_no_validated_winner(monkeypatch):
+    runner = PipelineRunner(disable_memory=True)
+
+    async def _fake_generate(**_kwargs):
+        return (
+            {
+                "sample_conditions": ["daily means sit close to the stability threshold"],
+                "winner_evidence": [],
+                "failure_signals": [
+                    "explored classification paths all stayed too close to the threshold and flipped labels"
+                ],
+                "reusable_rule": [
+                    "When all explored label paths stay near the decision threshold, verify the aggregation method before trusting any candidate."
+                ],
+            },
+            "ignored",
+        )
+
+    monkeypatch.setattr(runner_mod, "generate_learning_analysis", _fake_generate)
+
+    rewritten, structured, _summary_text = await runner._rewrite_learning_summary_from_analysis(
+        {
+            "insight": "Both explored paths looked reasonable, but GT showed they were wrong.",
+            "recommendation": "Treat this as a failure pattern rather than a reusable win.",
+            "winner_candidate": "",
+            "winner_prediction": None,
+            "winner_tool_chain": [],
+            "winner_metrics": {},
+            "winner_state": "none",
+        },
+        execution_log=[
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "stable",
+                            "execution_log": [
+                                {"tool": "segment"},
+                                {"tool": "llm_reasoning_classification"},
+                            ],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "decreasing",
+                            "execution_log": [
+                                {"tool": "llm_reasoning_classification"},
+                            ],
+                        },
+                    },
+                ],
+            },
+            {
+                "tool": "evaluate_against_gt",
+                "args": {"prediction": "stable"},
+                "observation": {"metrics": {"accuracy": 0.0, "correct": False}},
+            },
+            {
+                "tool": "evaluate_against_gt",
+                "args": {"prediction": "decreasing"},
+                "observation": {"metrics": {"accuracy": 0.0, "correct": False}},
+            },
+        ],
+        task_type="classification",
+        description="trend classification task",
+        domain="weather",
+        scope_keys=["weather_aligned_short_trend"],
+        fingerprint={"length": 96, "trend": "flat"},
+        profiling_results={},
+        horizon=None,
+        reasoning="1. Both explored labels were wrong.",
+    )
+
+    assert structured is not None
+    assert rewritten["winner_candidate"] == ""
+    assert rewritten["winner_prediction"] is None
+    assert rewritten["winner_tool_chain"] == []
+    assert rewritten["winner_metrics"] == {}
+    assert rewritten["winner_state"] == "none"
+    assert "No explored candidate was validated against ground truth" in rewritten["insight"]
+    assert rewritten["recommendation"].startswith(
+        "When all explored label paths stay near the decision threshold"
+    )
+    assert structured["winner_evidence"] == []
+
+
 def test_sanitize_reasoning_clause_drops_packaging_only_language():
     cleaned = PipelineRunner._sanitize_reasoning_clause(
         "Returning the corrected final JSON with unchanged saved label and explicit numbered tool-by-tool reasoning."
@@ -322,3 +514,66 @@ def test_sanitize_reasoning_clause_drops_execution_meta_language():
     )
 
     assert cleaned == ""
+
+
+@pytest.mark.asyncio
+async def test_pipeline_runner_coerces_non_numeric_confidence_before_result_message(monkeypatch):
+    config = TimeClawConfig(workspace_dir="/tmp/timeclaw_confidence_test")
+    runner = PipelineRunner(config, disable_memory=True)
+
+    async def _fake_ensure_tools():
+        return None
+
+    async def _fake_preprocess(_envelope, _data, _text_data, _images):
+        return {
+            "fingerprint": {},
+            "modalities": ["timeseries"],
+            "profiling_results": {},
+        }
+
+    class _FakeExecutor:
+        def __init__(self):
+            self.evidence_log = SimpleNamespace(summary=lambda: "execution summary")
+
+        async def run(self, _envelope):
+            return {
+                "result": {
+                    "answer": "up",
+                    "answer_type": "classification",
+                    "confidence": "high",
+                    "reasoning": "1. `llm_reasoning_classification` returned up.",
+                    "execution_context": {
+                        "tool_chain": ["llm_reasoning_classification"],
+                        "public_reasoning": [
+                            "`llm_reasoning_classification` returned up.",
+                        ],
+                        "evidence_summary": "The classifier output was up.",
+                    },
+                    "control_context": {"completion_notes": ""},
+                    "execution_log": [
+                        {"tool": "llm_reasoning_classification", "success": True},
+                    ],
+                }
+            }
+
+    monkeypatch.setattr(runner, "_ensure_tools", _fake_ensure_tools)
+    monkeypatch.setattr(runner, "_preprocess", _fake_preprocess)
+    monkeypatch.setattr(runner, "_create_executor", lambda: _FakeExecutor())
+    monkeypatch.setattr(
+        runner._quality_gate,
+        "check",
+        lambda prediction, *_args, **_kwargs: SimpleNamespace(
+            accepted=True,
+            rejections=[],
+        ),
+    )
+
+    result = await runner.run(
+        data=np.asarray([1.0, 2.0, 3.0]),
+        task_type="classification",
+        description="Classify the direction",
+    )
+
+    assert result["answer"] == "up"
+    assert result["confidence"] is None
+    assert result["result_message"].confidence is None

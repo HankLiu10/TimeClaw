@@ -48,13 +48,6 @@ def mock_llm_backend():
             model="mock",
         )
     )
-    backend.complete_with_tools = AsyncMock(
-        return_value=LLMResponse(
-            text="",
-            tool_calls=[{"name": "basic_stats", "arguments": {}}],
-            model="mock",
-        )
-    )
     return backend
 
 

@@ -23,7 +23,6 @@ def _make_mock_litellm_response(*args, **kwargs):
 
     response = MagicMock()
     response.choices = [MagicMock()]
-    response.choices[0].message.tool_calls = None
     response.usage = MagicMock()
     response.usage.prompt_tokens = 80 + _CALL_COUNT * 10
     response.usage.completion_tokens = 40 + _CALL_COUNT * 5

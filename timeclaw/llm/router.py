@@ -36,6 +36,7 @@ class ModelRouter:
             azure_api_base=self.config.azure_api_base,
             azure_api_key=self.config.azure_api_key,
             azure_api_version=self.config.azure_api_version,
+            reasoning_effort=self.config.reasoning_effort,
         )
         self._backends[role] = backend
         logger.info(

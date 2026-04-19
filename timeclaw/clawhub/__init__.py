@@ -3,7 +3,6 @@
 from timeclaw.clawhub.tool_base import ClawTool, ToolCategory, ToolIOType, ToolResult
 from timeclaw.clawhub.tool_registry import (
     discover_and_register,
-    get_all_function_schemas,
     get_tool_instance,
     list_tool_instances,
 )
@@ -14,7 +13,6 @@ __all__ = [
     "ToolIOType",
     "ToolResult",
     "discover_and_register",
-    "get_all_function_schemas",
     "get_tool_instance",
     "list_tool_instances",
 ]

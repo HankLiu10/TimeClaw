@@ -216,6 +216,85 @@ async def test_save_learning_outcome_records_winner_prediction_not_learning_summ
 
 
 @pytest.mark.asyncio
+async def test_save_learning_outcome_repairs_late_challenger_before_memory_record():
+    runner = PipelineRunner(disable_memory=True)
+
+    class _MemoryStub:
+        def __init__(self):
+            self.kwargs = None
+
+        async def record(self, **kwargs):
+            self.kwargs = kwargs
+
+    runner.memory = _MemoryStub()
+
+    await runner._save_learning_outcome(
+        answer_type="learning_summary",
+        raw_answer={
+            "winner_candidate": "chronos2_forecast",
+            "winner_prediction": [3.0, 3.0],
+            "winner_tool_chain": ["chronos2_forecast"],
+            "insight": "chronos wins",
+            "recommendation": "prefer chronos",
+        },
+        prediction=[3.0, 3.0],
+        execution_log=[
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": [1.0, 1.0],
+                            "execution_log": [{"tool": "timesfm2_forecast"}],
+                        },
+                    },
+                ],
+            },
+            {
+                "tool": "evaluate_batch_against_gt",
+                "observation": {
+                    "results": [
+                        {
+                            "name": "timesfm2_forecast",
+                            "prediction": [1.0, 1.0],
+                            "metrics": {"mae": 0.0, "rmse": 0.0, "mape": 0.0, "mse": 0.0},
+                        },
+                    ],
+                    "ground_truth": [1.0, 1.0],
+                },
+            },
+            {
+                "tool": "chronos2_forecast",
+                "success": True,
+                "observation": {"forecast": [3.0, 3.0]},
+            },
+        ],
+        task_type="forecast",
+        description="forecast sample",
+        domain="weather",
+        scope_keys=["weather_aligned_short_forecast"],
+        reasoning="",
+        fingerprint={},
+        profiling_results={},
+        horizon=24,
+        source_metadata={},
+        trace_id="trace-forecast-late-repair",
+        ground_truth=[1.0, 1.0],
+    )
+
+    assert runner.memory.kwargs is not None
+    assert runner.memory.kwargs["tool_chain"] == ["timesfm2_forecast"]
+    assert runner.memory.kwargs["predicted"] == "[1.0, 1.0]"
+    assert runner.memory.kwargs["metrics"] == {
+        "mae": 0.0,
+        "rmse": 0.0,
+        "mape": 0.0,
+        "mse": 0.0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_save_learning_outcome_prefers_explicit_reasoned_winner_over_best_metrics():
     runner = PipelineRunner(disable_memory=True)
 
@@ -692,6 +771,7 @@ def test_normalize_learning_summary_answer_adds_winner_fields_from_execution_log
     assert normalized["winner_prediction"] == [1.0, 2.0]
     assert normalized["winner_tool_chain"] == ["chronos2_forecast"]
     assert normalized["winner_metrics"] == {"mae": 1.2}
+    assert normalized["summary_kind"] == "validated_summary"
     assert len(normalized["compared_candidates"]) == 2
 
 
@@ -788,7 +868,7 @@ def test_normalize_learning_summary_answer_uses_failure_first_insight_for_incorr
         execution_log,
     )
 
-    assert normalized["winner_candidate"] == "segment"
+    assert normalized["winner_candidate"] == "segment -> llm_reasoning_classification"
     assert normalized["winner_prediction"] == "stable"
     assert normalized["winner_metrics"] == {"accuracy": 0.0, "correct": False}
     assert normalized["insight"].startswith("Strongest failed path:")
@@ -851,11 +931,211 @@ def test_normalize_learning_summary_answer_prefers_explicit_reasoned_winner_over
         execution_log,
     )
 
-    assert normalized["winner_candidate"] == "prophet_forecast"
+    assert normalized["winner_candidate"] == "prophet_forecast -> llm_reasoning_indicator"
     assert normalized["winner_prediction"] == {"macd": [0.02, 0.06]}
     assert normalized["winner_tool_chain"] == ["prophet_forecast", "llm_reasoning_indicator"]
     assert normalized["winner_metrics"] == {}
     assert "Prophet forecast-led path was the best candidate" in normalized["insight"]
+
+
+def test_normalize_learning_summary_answer_prefers_best_metrics_for_continuous_scored_winner_conflict():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": [13.6, 13.5, 13.4],
+                        "execution_log": [{"tool": "timesfm2_forecast"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": [14.0, 14.1, 14.2],
+                        "execution_log": [{"tool": "sundial_base_128m_forecast"}],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "observation": {
+                "results": [
+                    {
+                        "name": "timesfm2_forecast",
+                        "prediction": [13.6, 13.5, 13.4],
+                        "metrics": {"mae": 1.2, "rmse": 1.8},
+                    },
+                    {
+                        "name": "sundial_base_128m_forecast",
+                        "prediction": [14.0, 14.1, 14.2],
+                        "metrics": {"mae": 2.4, "rmse": 3.1},
+                    },
+                ],
+            },
+        },
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "insight": (
+                "The Sundial branch looked more weather-aware, so it was selected as the winner."
+            ),
+            "recommendation": (
+                "Prefer the Sundial branch when the storm narrative suggests a cooler regime."
+            ),
+            "winner_candidate": "sundial_base_128m_forecast",
+            "winner_prediction": [14.0, 14.1, 14.2],
+            "winner_tool_chain": ["sundial_base_128m_forecast"],
+            "winner_metrics": {"mae": 2.4, "rmse": 3.1},
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_candidate"] == "timesfm2_forecast"
+    assert normalized["winner_prediction"] == [13.6, 13.5, 13.4]
+    assert normalized["winner_tool_chain"] == ["timesfm2_forecast"]
+    assert normalized["winner_metrics"] == {"mae": 1.2, "rmse": 1.8}
+    assert "timesfm2_forecast" in normalized["insight"]
+
+
+def test_normalize_learning_summary_answer_keeps_explicit_unscored_winner_for_continuous_tasks():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": {"macd": [-0.1, -0.05]},
+                        "execution_log": [{"tool": "summarize"}, {"tool": "llm_reasoning_indicator"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": {"macd": [0.02, 0.06]},
+                        "execution_log": [{"tool": "prophet_forecast"}, {"tool": "llm_reasoning_indicator"}],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_against_gt",
+            "args": {"prediction": {"macd": [-0.1, -0.05]}},
+            "observation": {"metrics": {"avg_mae": 0.071}},
+        },
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "insight": (
+                "Across the explored candidates, the Prophet forecast-led path was the best "
+                "candidate because it matched the positive regime best."
+            ),
+            "recommendation": (
+                "Prefer the Prophet-led conversion when the winning branch stays positive from the start."
+            ),
+            "winner_candidate": "prophet_forecast -> llm_reasoning_indicator",
+            "winner_prediction": {"macd": [0.02, 0.06]},
+            "winner_tool_chain": ["prophet_forecast", "llm_reasoning_indicator"],
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_candidate"] == "prophet_forecast -> llm_reasoning_indicator"
+    assert normalized["winner_prediction"] == {"macd": [0.02, 0.06]}
+    assert normalized["winner_tool_chain"] == ["prophet_forecast", "llm_reasoning_indicator"]
+
+
+def test_normalize_learning_summary_answer_overrides_explicit_failed_winner_with_scored_correct_candidate():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "-2% ~ -4%",
+                        "execution_log": [
+                            {"tool": "resample"},
+                            {"tool": "llm_reasoning_classification"},
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "-2% ~ +2%",
+                        "execution_log": [
+                            {"tool": "detect_changepoint"},
+                            {"tool": "slice"},
+                            {"tool": "detect_trend"},
+                            {"tool": "llm_reasoning_classification"},
+                        ],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "observation": {
+                "results": [
+                    {
+                        "name": "resample -> llm_reasoning_classification",
+                        "metrics": {
+                            "accuracy": 0.0,
+                            "correct": False,
+                            "predicted_label": "-2% ~ -4%",
+                            "ground_truth_label": "-2% ~ +2%",
+                        },
+                    },
+                    {
+                        "name": "detect_changepoint -> slice -> detect_trend -> llm_reasoning_classification",
+                        "metrics": {
+                            "accuracy": 1.0,
+                            "correct": True,
+                            "predicted_label": "-2% ~ +2%",
+                            "ground_truth_label": "-2% ~ +2%",
+                        },
+                    },
+                ],
+            },
+        },
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "insight": (
+                "Strongest failed path: `resample -> llm_reasoning_classification` "
+                'with accuracy=0.000, correct=false. Observed output: "-2% ~ -4%".'
+            ),
+            "recommendation": (
+                "Failure pattern: do not trust `resample -> llm_reasoning_classification` alone."
+            ),
+            "winner_candidate": "resample -> llm_reasoning_classification",
+            "winner_prediction": "-2% ~ -4%",
+            "winner_tool_chain": ["resample", "llm_reasoning_classification"],
+            "winner_metrics": {
+                "accuracy": 0.0,
+                "correct": False,
+                "predicted_label": "-2% ~ -4%",
+                "ground_truth_label": "-2% ~ +2%",
+            },
+        },
+        execution_log,
+    )
+
+    assert (
+        normalized["winner_candidate"]
+        == "detect_changepoint -> slice -> detect_trend -> llm_reasoning_classification"
+    )
+    assert normalized["winner_prediction"] == "-2% ~ +2%"
+    assert normalized["winner_metrics"]["correct"] is True
+    assert normalized["insight"].startswith("Strongest path on this sample:")
+    assert "Strongest failed path" not in normalized["insight"]
 
 
 def test_normalize_learning_summary_answer_matches_winner_prediction_without_broadcast_error():
@@ -1372,6 +1652,174 @@ def test_normalize_learning_summary_answer_uses_candidate_reasoning_without_gt_p
     assert "Reusable lesson:" in normalized["recommendation"]
     assert "`slice -> arima_forecast`" in normalized["recommendation"]
     assert "before finishing" not in normalized["recommendation"].lower()
+
+
+def test_normalize_learning_summary_answer_realigns_execution_context_to_grounded_winner():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "stable",
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "thought": "Classify the daily means with the task rule.",
+                                "observation": {"answer": "stable"},
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "winner_candidate": "llm_reasoning_classification",
+            "winner_tool_chain": ["llm_reasoning_classification"],
+            "winner_prediction": "stable",
+            "insight": "stable path won",
+            "recommendation": "prefer the stable path",
+            "execution_context": {
+                "tool_chain": ["segment -> llm_reasoning_classification"],
+                "public_reasoning": ["The last three daily means differ by less than 0.1C."],
+                "evidence_summary": "The near-term daily means are flat.",
+            },
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_tool_chain"] == ["llm_reasoning_classification"]
+    assert normalized["execution_context"]["tool_chain"] == ["llm_reasoning_classification"]
+
+
+def test_normalize_learning_summary_answer_realigns_multistep_execution_context_to_tool_array():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": [1, 2, 3],
+                        "execution_log": [
+                            {
+                                "tool": "ets_forecast",
+                                "thought": "Generate the baseline forecast from the numeric history.",
+                                "observation": {"forecast": [1, 2, 3]},
+                            },
+                            {
+                                "tool": "llm_reasoning_forecast",
+                                "thought": "Adjust the baseline with the text evidence.",
+                                "observation": {"answer": [1, 2, 3]},
+                            },
+                        ],
+                    },
+                }
+            ],
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "observation": {
+                "results": [
+                    {
+                        "name": "slot_0",
+                        "prediction": [1, 2, 3],
+                        "metrics": {"mae": 0.0, "rmse": 0.0, "mape": 0.0, "mse": 0.0},
+                    }
+                ],
+            },
+        },
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "winner_candidate": "ets_forecast -> llm_reasoning_forecast",
+            "winner_tool_chain": ["ets_forecast", "llm_reasoning_forecast"],
+            "winner_prediction": [1, 2, 3],
+            "winner_metrics": {"mae": 0.0, "rmse": 0.0, "mape": 0.0, "mse": 0.0},
+            "insight": "The ets_forecast -> llm_reasoning_forecast path matched the target.",
+            "recommendation": "Reuse ets_forecast -> llm_reasoning_forecast on similar samples.",
+            "execution_context": {
+                "tool_chain": ["ets_forecast -> llm_reasoning_forecast"],
+                "public_reasoning": ["The two-step forecast path matched the observed answer."],
+                "evidence_summary": "The two-step path aligned with the target.",
+            },
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_tool_chain"] == ["ets_forecast", "llm_reasoning_forecast"]
+    assert normalized["execution_context"]["tool_chain"] == [
+        "ets_forecast",
+        "llm_reasoning_forecast",
+    ]
+
+
+def test_normalize_learning_summary_answer_clears_execution_context_when_no_validated_winner():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "stable",
+                        "execution_log": [
+                            {"tool": "segment"},
+                            {"tool": "llm_reasoning_classification"},
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "stable",
+                        "execution_log": [
+                            {"tool": "llm_reasoning_classification"},
+                        ],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_against_gt",
+            "observation": {"metrics": {"accuracy": 0.0, "correct": False}},
+        },
+        {
+            "tool": "evaluate_against_gt",
+            "observation": {"metrics": {"accuracy": 0.0, "correct": False}},
+        },
+    ]
+
+    normalized = PipelineRunner._normalize_learning_summary_answer(
+        {
+            "winner_candidate": "",
+            "winner_prediction": None,
+            "winner_tool_chain": [],
+            "winner_metrics": {},
+            "winner_state": "none",
+            "insight": "No validated path exists.",
+            "recommendation": "Recheck the rule.",
+            "execution_context": {
+                "tool_chain": [
+                    "segment -> llm_reasoning_classification",
+                    "llm_reasoning_classification",
+                ],
+                "public_reasoning": ["Both explored paths returned stable."],
+                "evidence_summary": "Both explored paths failed against ground truth.",
+            },
+        },
+        execution_log,
+    )
+
+    assert normalized["winner_state"] == "none"
+    assert normalized["execution_context"]["tool_chain"] == []
+    assert normalized["execution_context"]["public_reasoning"] == []
+    assert normalized["execution_context"]["evidence_summary"] == ""
 
 
 def test_notes_compact_candidate_reasoning_filters_framework_wording():

@@ -101,7 +101,11 @@ class TextToEventTool(ClawTool):
                 f"as array of objects with keys: type ({types_str}), timestamp (ISO format or null), "
                 f"description (brief).\n\nText: {text[:3000]}"
             )
-            resp = await llm.complete([{"role": "user", "content": prompt}], response_format="json")
+            resp = await llm.complete(
+                [{"role": "user", "content": prompt}],
+                response_format="json",
+                reasoning_effort="none",
+            )
             if resp.parsed and "events" in resp.parsed:
                 return {"events": resp.parsed["events"], "n_events": len(resp.parsed["events"]), "method": "llm"}
         except Exception:

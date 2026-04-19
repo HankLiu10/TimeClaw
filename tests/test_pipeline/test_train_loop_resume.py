@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,13 +13,18 @@ from timeclaw.benchmark.mtbench_support.sample_selection import (
 )
 from timeclaw.benchmark.train_loop import (
     _process_one_task_sample,
+    _build_train_result_trace_payload,
     _build_train_result_row,
     _build_train_result_evidence_preview,
+    _build_failed_result_payload,
     _extract_train_result_reasoning_preview,
     _extract_train_result_tool_chain,
     _load_checkpoint_rows,
     _normalize_train_result_row,
+    _recover_failed_result_from_trace,
+    _run_pipeline_train_call_with_timeout,
     _sanitize_learning_artifact_preview,
+    _summarize_results,
     _train_done_keys,
 )
 from timeclaw.agents.executor import MaxStepsExhaustedError
@@ -118,8 +124,502 @@ def test_build_train_result_row_includes_trace_and_audit_fields():
     assert row["gate"] == "FAIL"
     assert row["gate_accepted"] is False
     assert row["scope_keys"] == ["finance_aligned_short_forecast"]
-    assert row["learning_recommendation"] == "r"
+
+
+def test_build_train_result_row_promotes_learning_summary_candidates_to_top_level():
+    sample = MTBenchSample(
+        file="00000.parquet_row",
+        dataset="finance_aligned_short",
+        domain="finance",
+        task_types=["forecast"],
+        input_window=np.asarray([1.0, 2.0]),
+        output_window=np.asarray([3.0]),
+        text="demo",
+        timestamps=[0.0, 1.0],
+        start_year=2024,
+    )
+
+    row = _build_train_result_row(
+        ds_name="finance_aligned_short",
+        sample_idx=3,
+        sample=sample,
+        task="forecast",
+        pipeline_task="forecast",
+        scope_keys=["finance_aligned_short_forecast"],
+        result={
+            "status": "completed",
+            "answer_type": "learning_summary",
+            "prediction": [3.0],
+            "trace_id": "trace-123",
+            "gate_accepted": True,
+            "confidence": 0.7,
+            "execution_log": [
+                {"tool": "timesfm2_forecast", "success": True, "output": {"forecast": [3.0]}},
+                {
+                    "tool": "evaluate_batch_against_gt",
+                    "observation": {
+                        "results": [
+                            {
+                                "name": "timesfm2_forecast",
+                                "tool_chain": ["timesfm2_forecast"],
+                                "metrics": {"mae": 0.1},
+                                "prediction": [3.0],
+                            },
+                            {
+                                "name": "llm_reasoning_forecast",
+                                "tool_chain": ["llm_reasoning_forecast"],
+                                "metrics": {"mae": 0.2},
+                                "prediction": [3.2],
+                            },
+                        ]
+                    },
+                },
+            ],
+            "tool_chain": ["timesfm2_forecast", "evaluate_batch_against_gt"],
+            "raw_answer": {
+                "insight": "i",
+                "recommendation": "r",
+                "winner_candidate": "timesfm2_forecast",
+                "winner_prediction": [3.0],
+                "winner_tool_chain": ["timesfm2_forecast"],
+                "winner_metrics": {"mae": 0.1},
+                "compared_candidates": [
+                    {
+                        "name": "timesfm2_forecast",
+                        "tool_chain": ["timesfm2_forecast"],
+                        "prediction": [3.0],
+                        "metrics": {"mae": 0.1},
+                    },
+                    {
+                        "name": "llm_reasoning_forecast",
+                        "tool_chain": ["llm_reasoning_forecast"],
+                        "prediction": [3.2],
+                        "metrics": {"mae": 0.2},
+                    },
+                ],
+            },
+        },
+    )
+
+    assert row["winner_candidate"] == "timesfm2_forecast"
+    assert row["winner_prediction"] == [3.0]
+    assert row["winner_metrics"] == {"mae": 0.1}
     assert row["winner_tool_chain"] == ["timesfm2_forecast"]
+    assert [item["name"] for item in row["compared_candidates"]] == [
+        "timesfm2_forecast",
+    ]
+    assert row["prediction"] == [3.0]
+    assert row["metrics"] == {"mae": 0.1}
+    assert row["learning_summary"]["winner_prediction"] == [3.0]
+
+
+def test_normalize_train_result_row_backfills_legacy_learning_summary_fields():
+    normalized = _normalize_train_result_row(
+        {
+            "dataset": "finance_qa_short",
+            "dataset_name": "finance_qa_short",
+            "idx": 0,
+            "abs_idx": 0,
+            "task": "correlation",
+            "pipeline_task": "correlation",
+            "scope_keys": ["finance_qa_short_correlation"],
+            "domain": "finance",
+            "status": "completed",
+            "answer_type": "learning_summary",
+            "raw_answer": {
+                "insight": "window_stats -> llm_reasoning_correlation was strongest.",
+                "recommendation": "Prefer event-window stats before correlation reasoning.",
+                "winner_state": "selected",
+                "summary_kind": "validated_summary",
+                "winner_candidate": "window_stats -> llm_reasoning_correlation",
+                "winner_prediction": "Strong Positive Correlation",
+                "winner_tool_chain": ["window_stats", "llm_reasoning_correlation"],
+                "winner_metrics": {"accuracy": 1.0, "correct": True},
+                "compared_candidates": [
+                    {
+                        "name": "window_stats -> llm_reasoning_correlation",
+                        "tool_chain": ["window_stats", "llm_reasoning_correlation"],
+                        "prediction": "Strong Positive Correlation",
+                        "metrics": {"accuracy": 1.0, "correct": True},
+                    }
+                ],
+            },
+            "execution_log": [],
+        }
+    )
+
+    assert normalized["winner_prediction"] == "Strong Positive Correlation"
+    assert normalized["winner_metrics"] == {"accuracy": 1.0, "correct": True}
+    assert normalized["prediction"] == "Strong Positive Correlation"
+    assert normalized["metrics"] == {"accuracy": 1.0, "correct": True}
+    assert normalized["learning_summary"]["summary_kind"] == "validated_summary"
+
+
+def test_recover_failed_result_from_trace_recovers_content_block_payload(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    trace_dir = tmp_path / ".timeclaw" / "traces"
+    trace_dir.mkdir(parents=True)
+    trace_path = trace_dir / "trace-recover.jsonl"
+    trace_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "event": "content_block",
+                        "payload": {
+                            "kind": "prompt_message/assistant",
+                            "content": json.dumps(
+                                {
+                                    "done": True,
+                                    "thought": "Reason: enough evidence. Action: finish.",
+                                    "answer": {
+                                        "insight": "slice path isolated the decisive post-event drop.",
+                                        "recommendation": "Prefer tail slicing before correlation reasoning when the event window is the real signal.",
+                                    },
+                                    "answer_type": "learning_summary",
+                                    "confidence": "high",
+                                    "reasoning": "1. `slice` isolated the local window.\n2. `llm_reasoning_correlation` matched the sign reversal.",
+                                    "execution_context": {
+                                        "tool_chain": ["slice", "llm_reasoning_correlation"],
+                                        "public_reasoning": [
+                                            "`slice` isolated the post-publication drop.",
+                                        ],
+                                        "evidence_summary": "The sliced path preserved the decisive local move.",
+                                    },
+                                    "control_context": {
+                                        "completion_notes": "Recovered from trace content block.",
+                                    },
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "event": "run_end",
+                        "payload": {
+                            "status": "failed",
+                            "error_type": "ValidationError",
+                            "failure_reason": "ValidationError",
+                            "error": "bad confidence type",
+                        },
+                    }
+                ),
+            ]
+        )
+    )
+
+    recovered = _recover_failed_result_from_trace("trace-recover")
+
+    assert recovered["answer_type"] == "learning_summary"
+    assert recovered["raw_answer"]["insight"].startswith("slice path")
+    assert recovered["execution_context"]["tool_chain"] == ["slice", "llm_reasoning_correlation"]
+    assert recovered["control_context"]["completion_notes"] == "Recovered from trace content block."
+    assert recovered["confidence"] is None
+    assert recovered["trace_recovered"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_train_call_with_timeout_preserves_trace_metadata():
+    async def _never_finishes():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError as exc:
+            setattr(exc, "trace_id", "trace-timeout-123")
+            setattr(exc, "total_ms", 4321)
+            raise
+
+    completed, payload = await _run_pipeline_train_call_with_timeout(
+        _never_finishes(),
+        timeout_s=0.01,
+    )
+
+    assert completed is False
+    assert isinstance(payload, asyncio.TimeoutError)
+    assert getattr(payload, "trace_id") == "trace-timeout-123"
+    assert getattr(payload, "total_ms") == 4321
+    assert getattr(payload, "failure_reason") == "timeout"
+
+
+def test_build_failed_result_payload_coerces_non_numeric_confidence_to_none():
+    exc = RuntimeError("boom")
+    setattr(exc, "failure_reason", "error")
+    setattr(exc, "error_type", "RuntimeError")
+    setattr(exc, "trace_id", "trace-abc")
+
+    payload = _build_failed_result_payload(
+        exc,
+        {
+            "answer_type": "learning_summary",
+            "raw_answer": {"insight": "x", "recommendation": "y"},
+            "confidence": "high",
+            "reasoning": "1. x",
+            "execution_context": {"tool_chain": ["slice"]},
+            "control_context": {"completion_notes": ""},
+            "trace_recovered": True,
+        },
+    )
+
+    assert payload["confidence"] is None
+    assert payload["trace_id"] == "trace-abc"
+    assert payload["raw_answer"]["insight"] == "x"
+    assert payload["raw_answer"]["recommendation"] == "y"
+    assert payload["raw_answer"]["summary_kind"] == "failure_summary"
+    assert payload["raw_answer"]["winner_tool_chain"] == []
+
+
+def test_build_failed_result_payload_normalizes_learning_summary_winner_metadata():
+    exc = RuntimeError("boom")
+    setattr(exc, "failure_reason", "RuntimeError")
+    setattr(exc, "error_type", "RuntimeError")
+    setattr(exc, "trace_id", "trace-xyz")
+    setattr(exc, "partial_result", {
+        "answer_type": "learning_summary",
+        "answer": {
+            "insight": "The winning path was summarize -> llm_reasoning_correlation.",
+            "recommendation": "Keep the summarized article evidence.",
+        },
+        "execution_log": [
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "slot_id": 0,
+                            "answer": "Moderate Negative Correlation",
+                            "answer_type": "correlation",
+                            "reasoning": "1. summarize -> llm_reasoning_correlation captured the mild negative tone.",
+                            "execution_context": {
+                                "tool_chain": ["summarize", "llm_reasoning_correlation"],
+                                "public_reasoning": [
+                                    "summarize highlighted the mildly weaker analyst outlook.",
+                                ],
+                                "evidence_summary": "The summary preserved the slight negative tone before correlation reasoning.",
+                            },
+                            "execution_log": [
+                                {"tool": "summarize", "observation": {"summary": "mildly negative"}},
+                                {"tool": "llm_reasoning_correlation", "observation": {"answer": "Moderate Negative Correlation"}},
+                            ],
+                        },
+                    },
+                ],
+            },
+            {
+                "tool": "evaluate_batch_against_gt",
+                "observation": {
+                    "results": [
+                        {
+                            "name": "slot_0",
+                            "prediction": "Moderate Negative Correlation",
+                            "metrics": {"accuracy": 1.0, "correct": True},
+                        },
+                    ],
+                },
+            },
+        ],
+    })
+
+    payload = _build_failed_result_payload(exc, {})
+
+    assert payload["answer_type"] == "learning_summary"
+    assert payload["raw_answer"]["winner_tool_chain"] == ["summarize", "llm_reasoning_correlation"]
+    assert payload["raw_answer"]["winner_prediction"] == "Moderate Negative Correlation"
+
+
+def test_build_train_result_row_hides_learning_text_for_failed_rows():
+    sample = MTBenchSample(
+        file="demo.json",
+        dataset="demo_ds",
+        domain="finance",
+        task_types=["correlation"],
+        input_window=np.array([1.0, 2.0, 3.0]),
+        output_window=np.array([4.0]),
+        text="demo",
+        timestamps=[0.0, 1.0, 2.0],
+        start_year=2024,
+        labels={},
+    )
+    row = _build_train_result_row(
+        ds_name="demo_ds",
+        sample_idx=0,
+        sample=sample,
+        task="correlation",
+        pipeline_task="correlation",
+        scope_keys=["demo_scope"],
+        train_run_id="run-1",
+        result={
+            "status": "RuntimeError",
+            "answer_type": "learning_summary",
+            "raw_answer": {"insight": "x", "recommendation": "y"},
+            "execution_context": {"tool_chain": ["slice", "llm_reasoning_correlation"]},
+            "execution_log": [],
+        },
+    )
+
+    assert row["learning_insight"] is None
+    assert row["learning_recommendation"] is None
+
+
+def test_summarize_results_counts_only_completed_learning_summaries():
+    summary = _summarize_results([
+        {"task": "forecast", "status": "completed", "answer_type": "learning_summary"},
+        {"task": "forecast", "status": "RuntimeError", "answer_type": "learning_summary"},
+        {"task": "forecast", "status": "completed", "answer_type": "qa"},
+    ])
+
+    assert summary["forecast"]["count"] == 3
+    assert summary["forecast"]["learning_summaries"] == 1
+
+
+def test_summarize_results_exposes_aligned_counts_without_mixing_semantics():
+    summary = _summarize_results([
+        {
+            "task": "forecast",
+            "status": "completed",
+            "answer_type": "learning_summary",
+            "has_prediction": True,
+            "gate_accepted": True,
+            "winner_state": "selected",
+            "winner_metrics": {"mae": 1.2, "rmse": 1.5},
+        },
+        {
+            "task": "forecast",
+            "status": "completed",
+            "answer_type": "learning_summary",
+            "has_prediction": False,
+            "gate_accepted": False,
+            "winner_state": "none",
+            "winner_metrics": {},
+        },
+        {
+            "task": "forecast",
+            "status": "timeout",
+            "answer_type": "",
+            "has_prediction": False,
+            "gate_accepted": False,
+        },
+        {
+            "task": "trend",
+            "status": "completed",
+            "answer_type": "learning_summary",
+            "has_prediction": True,
+            "gate_accepted": True,
+            "winner_state": "selected",
+            "winner_metrics": {"correct": True},
+        },
+    ])
+
+    forecast_counts = summary["forecast"]["aligned_counts"]
+    assert forecast_counts == {
+        "execution_total_n": 3,
+        "execution_completed_n": 2,
+        "execution_failed_n": 1,
+        "prediction_emitted_n": 1,
+        "gate_pass_n": 1,
+        "gate_fail_n": 2,
+        "learning_summary_n": 2,
+        "validated_winner_n": 1,
+        "no_winner_n": 1,
+        "binary_correct_n": 0,
+        "binary_incorrect_n": 0,
+        "continuous_scored_n": 1,
+    }
+    trend_counts = summary["trend"]["aligned_counts"]
+    assert trend_counts["binary_correct_n"] == 1
+    assert trend_counts["validated_winner_n"] == 1
+    assert trend_counts["continuous_scored_n"] == 0
+
+
+def test_build_train_result_row_flattens_summary_kind_from_learning_summary():
+    row = tl._build_train_result_row(
+        ds_name="demo_ds",
+        sample_idx=0,
+        sample=SimpleNamespace(
+            file="demo.json",
+            domain="weather",
+            output_window=np.asarray([1.0, 2.0]),
+        ),
+        task="forecast",
+        pipeline_task="forecast",
+        scope_keys=["demo_ds_forecast"],
+        result={
+            "status": "completed",
+            "answer_type": "learning_summary",
+            "prediction": [1.0, 2.0],
+            "gate_accepted": True,
+            "raw_answer": {
+                "summary_kind": "validated_summary",
+                "winner_state": "selected",
+                "winner_candidate": "chronos2_forecast",
+                "winner_prediction": [1.0, 2.0],
+                "winner_tool_chain": ["chronos2_forecast"],
+                "winner_metrics": {"mae": 1.2},
+                "insight": "chronos won",
+                "recommendation": "prefer chronos",
+            },
+            "execution_log": [{"tool": "chronos2_forecast"}],
+            "execution_context": {"tool_chain": ["chronos2_forecast"]},
+            "control_context": {},
+        },
+        train_run_id="run-1",
+    )
+
+    assert row["summary_kind"] == "validated_summary"
+    assert row["winner_state"] == "selected"
+    assert row["winner_tool_chain"] == ["chronos2_forecast"]
+
+
+def test_build_run_manifest_uses_same_aligned_counts_as_summary():
+    rows = [
+        {
+            "sample_ref": "demo_ds:file:0:forecast",
+            "task": "forecast",
+            "status": "completed",
+            "answer_type": "learning_summary",
+            "has_prediction": True,
+            "gate_accepted": True,
+            "winner_state": "selected",
+            "winner_metrics": {"mae": 1.0},
+        },
+        {
+            "sample_ref": "demo_ds:file:1:forecast",
+            "task": "forecast",
+            "status": "completed",
+            "answer_type": "learning_summary",
+            "has_prediction": False,
+            "gate_accepted": False,
+            "winner_state": "none",
+            "winner_metrics": {},
+        },
+        {
+            "sample_ref": "demo_ds:file:2:forecast",
+            "task": "forecast",
+            "status": "timeout",
+            "answer_type": "",
+            "has_prediction": False,
+            "gate_accepted": False,
+        },
+    ]
+
+    manifest = tl._build_run_manifest(
+        train_run_id="run-1",
+        started_at=10.0,
+        finished_at=12.5,
+        all_results={},
+        task_rows_by_key={("demo_ds", "forecast"): rows},
+        note_view_paths={},
+    )
+
+    task_info = manifest["tasks"]["demo_ds::forecast"]
+    assert task_info["rows"] == 3
+    assert task_info["status_counts"] == {"completed": 2, "timeout": 1}
+    assert task_info["failed_sample_refs"] == [
+        "demo_ds:file:1:forecast",
+        "demo_ds:file:2:forecast",
+    ]
+    assert task_info["aligned_counts"] == tl._aligned_train_counts(rows)
 
 
 def test_save_task_checkpoint_writes_complete_json_without_tmp_leftovers(tmp_path, monkeypatch):
@@ -137,6 +637,7 @@ def test_save_task_checkpoint_writes_complete_json_without_tmp_leftovers(tmp_pat
         "dataset": "demo_ds",
         "dataset_name": "demo_ds",
         "winner_tool_chain": [],
+        "tools_run": 0,
     }]
     assert list(tmp_path.glob("*.tmp")) == []
 
@@ -202,6 +703,69 @@ def test_export_train_note_views_filters_to_current_run(tmp_path, monkeypatch):
     assert "old-run" not in content
 
 
+def test_export_train_note_views_excludes_historical_same_sample_ref_blocks(tmp_path, monkeypatch):
+    monkeypatch.setattr(tl, "TRAIN_RESULTS_DIR", tmp_path)
+
+    sample_ref = "weather_aligned_long:USW00003017_0.json:0:trend_past"
+
+    class _Notes:
+        def get_scope_note_items(self, scope):
+            if scope != "weather_aligned_long_trend_past":
+                return []
+            return [
+                {
+                    "id": "old",
+                    "text": (
+                        "[weather_aligned_long_trend_past] OK\n\n"
+                        "Source:\n"
+                        f"- Sample Ref: {sample_ref}\n"
+                        "- Train Run ID: old-run\n"
+                        "\nCandidates:\n"
+                        "[CANDIDATES_BEGIN]\n"
+                        "- Candidate: llm_reasoning_classification\n"
+                        "  Prediction: spawn_subagent\n"
+                        "[CANDIDATES_END]\n"
+                    ),
+                },
+                {
+                    "id": "new",
+                    "text": (
+                        "[weather_aligned_long_trend_past] OK\n\n"
+                        "Source:\n"
+                        f"- Sample Ref: {sample_ref}\n"
+                        "- Train Run ID: run-123\n"
+                        "\nCandidates:\n"
+                        "[CANDIDATES_BEGIN]\n"
+                        "- Candidate: llm_reasoning_classification\n"
+                        "  Prediction: decreasing\n"
+                        "[CANDIDATES_END]\n"
+                    ),
+                },
+            ]
+
+    pipeline = type(
+        "P",
+        (),
+        {"memory": type("M", (), {"notes": _Notes()})()},
+    )()
+
+    tl._export_train_note_views(
+        pipeline=pipeline,
+        train_run_id="run-123",
+        run_rows_by_task={
+            ("weather_aligned_long", "trend_past"): [
+                {"sample_ref": sample_ref},
+            ],
+        },
+    )
+
+    content = (tmp_path / "train_notes_weather_aligned_long__trend_past.md").read_text()
+    assert "run-123" in content
+    assert "old-run" not in content
+    assert "Prediction: spawn_subagent" not in content
+    assert "Prediction: decreasing" in content
+
+
 def test_normalize_train_result_row_backfills_locator_fields_from_legacy_row():
     normalized = _normalize_train_result_row({
         "idx": 8,
@@ -216,6 +780,423 @@ def test_normalize_train_result_row_backfills_locator_fields_from_legacy_row():
     assert normalized["dataset"] == "finance_aligned_long"
     assert normalized["tool_chain"] == ["chronos2_forecast"]
     assert normalized["winner_tool_chain"] == ["chronos2_forecast"]
+
+
+def test_normalize_train_result_row_repairs_failed_learning_summary_winner_alignment():
+    normalized = _normalize_train_result_row({
+        "idx": 8,
+        "dataset_name": "finance_qa_short",
+        "task": "correlation",
+        "status": "RuntimeError",
+        "answer_type": "learning_summary",
+        "raw_answer": {
+            "insight": "The winning path was summarize -> llm_reasoning_correlation.",
+            "recommendation": "Use summarize before correlation reasoning.",
+        },
+        "execution_context": {
+            "tool_chain": ["summarize", "llm_reasoning_correlation"],
+        },
+        "learning_insight": "The winning path was summarize -> llm_reasoning_correlation.",
+        "learning_recommendation": "Use summarize before correlation reasoning.",
+        "execution_log": [
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "slot_id": 0,
+                            "answer": "No Correlation",
+                            "answer_type": "correlation",
+                            "execution_log": [
+                                {"tool": "summarize", "success": True, "output": {"summary": "slightly negative"}},
+                                {
+                                    "tool": "llm_reasoning_correlation",
+                                    "success": True,
+                                    "output": {"answer": "No Correlation"},
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "slot_id": 1,
+                            "answer": "Moderate Negative Correlation",
+                            "answer_type": "correlation",
+                            "execution_log": [
+                                {"tool": "value_at", "success": True, "output": {"value": 76.065}},
+                                {
+                                    "tool": "llm_reasoning_correlation",
+                                    "success": True,
+                                    "output": {"answer": "Moderate Negative Correlation"},
+                                },
+                            ],
+                        },
+                    },
+                ],
+            },
+            {
+                "tool": "evaluate_batch_against_gt",
+                "observation": {
+                    "results": [
+                        {
+                            "name": "slot_0",
+                            "prediction": "No Correlation",
+                            "metrics": {"accuracy": 0.0, "correct": False},
+                        },
+                        {
+                            "name": "slot_1",
+                            "prediction": "Moderate Negative Correlation",
+                            "metrics": {"accuracy": 1.0, "correct": True},
+                        },
+                    ],
+                },
+            },
+        ],
+    })
+
+    assert normalized["tool_chain"] == ["value_at", "llm_reasoning_correlation"]
+    assert normalized["winner_tool_chain"] == ["value_at", "llm_reasoning_correlation"]
+    assert normalized["raw_answer"]["winner_tool_chain"] == ["value_at", "llm_reasoning_correlation"]
+    assert "value_at -> llm_reasoning_correlation" in normalized["raw_answer"]["insight"]
+    assert normalized["learning_insight"] is None
+    assert normalized["learning_recommendation"] is None
+
+
+def test_normalize_train_result_row_backfills_top_level_winner_fields_from_raw_answer():
+    normalized = _normalize_train_result_row({
+        "idx": 8,
+        "dataset_name": "finance_aligned_long",
+        "task": "trend",
+        "status": "completed",
+        "answer_type": "learning_summary",
+        "raw_answer": {
+            "insight": "i",
+            "recommendation": "r",
+            "winner_candidate": "segment -> llm_reasoning_classification",
+            "winner_prediction": "increasing",
+            "winner_tool_chain": ["slice", "llm_reasoning_classification"],
+            "winner_metrics": {"acc": 1.0},
+            "compared_candidates": [
+                {
+                    "name": "segment -> llm_reasoning_classification",
+                    "tool_chain": ["slice", "llm_reasoning_classification"],
+                    "prediction": "increasing",
+                    "metrics": {"acc": 1.0},
+                },
+                {
+                    "name": "sentiment -> llm_reasoning_classification",
+                    "tool_chain": ["sentiment", "llm_reasoning_classification"],
+                    "prediction": "stable",
+                    "metrics": {"acc": 0.0},
+                },
+            ],
+        },
+        "execution_log": [],
+        "winner_candidate": None,
+        "winner_prediction": None,
+        "winner_metrics": None,
+        "compared_candidates": None,
+    })
+
+    assert normalized["winner_candidate"] == "segment -> llm_reasoning_classification"
+    assert normalized["winner_prediction"] == "increasing"
+    assert normalized["winner_metrics"] == {"acc": 1.0}
+    assert [item["name"] for item in normalized["compared_candidates"]] == [
+        "segment -> llm_reasoning_classification",
+        "sentiment -> llm_reasoning_classification",
+    ]
+
+
+def test_normalize_train_result_row_keeps_indicator_winner_predictions_task_aware():
+    normalized = _normalize_train_result_row({
+        "idx": 11,
+        "dataset_name": "finance_aligned_short",
+        "dataset": "finance_aligned_short",
+        "domain": "finance",
+        "task": "indicator_upper_bb",
+        "pipeline_task": "indicator",
+        "scope_keys": ["finance_aligned_short_indicator_upper_bb"],
+        "status": "completed",
+        "answer_type": "learning_summary",
+        "raw_answer": {
+            "insight": "i",
+            "recommendation": "r",
+        },
+        "execution_log": [
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": [101.5, 102.0],
+                            "execution_log": [
+                                {
+                                    "tool": "compute_bollinger",
+                                    "observation": {"forecast": [101.5, 102.0]},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            {
+                "tool": "evaluate_batch_against_gt",
+                "observation": {
+                    "results": [
+                        {
+                            "name": "compute_bollinger",
+                            "prediction": [101.5, 102.0],
+                            "metrics": {"upper_bb_mae": 0.2},
+                        }
+                    ]
+                },
+            },
+        ],
+    })
+
+    assert normalized["winner_prediction"] == {"upper_bb": [101.5, 102.0]}
+    assert normalized["winner_tool_chain"] == ["compute_bollinger"]
+    assert normalized["raw_answer"]["winner_prediction"] == {"upper_bb": [101.5, 102.0]}
+    assert normalized["raw_answer"]["compared_candidates"][0]["prediction"] == {
+        "upper_bb": [101.5, 102.0]
+    }
+
+
+def test_build_train_result_trace_payload_keeps_indicator_candidates_task_aware():
+    payload = _build_train_result_trace_payload(
+        {
+            "trace_id": "trace-indicator-1",
+            "dataset_name": "finance_aligned_short",
+            "dataset": "finance_aligned_short",
+            "domain": "finance",
+            "task": "indicator_upper_bb",
+            "pipeline_task": "indicator",
+            "scope_keys": ["finance_aligned_short_indicator_upper_bb"],
+            "raw_answer": {
+                "winner_candidate": "compute_bollinger",
+                "winner_prediction": {"upper_bb": [101.5, 102.0]},
+                "winner_tool_chain": ["compute_bollinger"],
+                "winner_metrics": {"upper_bb_mae": 0.2},
+            },
+            "execution_log": [
+                {
+                    "tool": "spawn_subagent",
+                    "output": [
+                        {
+                            "success": True,
+                            "result": {
+                                "answer": [101.5, 102.0],
+                                "execution_log": [
+                                    {
+                                        "tool": "compute_bollinger",
+                                        "observation": {"forecast": [101.5, 102.0]},
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                },
+                {
+                    "tool": "evaluate_batch_against_gt",
+                    "observation": {
+                        "results": [
+                            {
+                                "name": "compute_bollinger",
+                                "prediction": [101.5, 102.0],
+                                "metrics": {"upper_bb_mae": 0.2},
+                            }
+                        ]
+                    },
+                },
+            ],
+        },
+        substantive_tool_chain=["compute_bollinger"],
+    )
+
+    assert payload["candidate_traces"][0]["prediction"] == {"upper_bb": [101.5, 102.0]}
+    assert payload["winner_trace"]["prediction"] == {"upper_bb": [101.5, 102.0]}
+
+
+def test_normalize_train_result_row_forces_fail_when_learning_summary_has_no_winner():
+    normalized = _normalize_train_result_row({
+        "idx": 9,
+        "dataset_name": "weather_aligned_long",
+        "task": "trend_past",
+        "status": "completed",
+        "answer_type": "learning_summary",
+        "has_prediction": True,
+        "gate": "PASS",
+        "gate_accepted": True,
+        "gate_rejections": [],
+        "tool_chain": ["segment", "llm_reasoning_classification"],
+        "winner_tool_chain": ["segment", "llm_reasoning_classification"],
+        "tools_run": 2,
+        "execution_context": {"tool_chain": ["wrong -> path"]},
+        "raw_answer": {
+            "insight": "No validated path exists.",
+            "recommendation": "Recheck the numeric rule.",
+            "winner_state": "none",
+            "winner_candidate": "",
+            "winner_prediction": None,
+            "winner_tool_chain": [],
+            "winner_metrics": {},
+            "execution_context": {
+                "tool_chain": [
+                    "segment -> llm_reasoning_classification",
+                    "llm_reasoning_classification",
+                ],
+                "public_reasoning": [
+                    "Both explored paths returned stable.",
+                ],
+                "evidence_summary": "Both explored paths failed against ground truth.",
+            },
+            "compared_candidates": [
+                {
+                    "name": "segment -> llm_reasoning_classification",
+                    "tool_chain": ["segment", "llm_reasoning_classification"],
+                    "prediction": "stable",
+                    "metrics": {"accuracy": 0.0, "correct": False},
+                },
+                {
+                    "name": "llm_reasoning_classification",
+                    "tool_chain": ["llm_reasoning_classification"],
+                    "prediction": "stable",
+                    "metrics": {"accuracy": 0.0, "correct": False},
+                },
+            ],
+        },
+        "execution_log": [],
+    })
+
+    assert normalized["gate"] == "FAIL"
+    assert normalized["gate_accepted"] is False
+    assert normalized["has_prediction"] is False
+    assert normalized["tool_chain"] == []
+    assert normalized["winner_tool_chain"] == []
+    assert normalized["winner_state"] == "none"
+    assert normalized["tools_run"] == 0
+    assert "prediction is None" in normalized["gate_rejections"]
+    assert normalized["execution_context"]["tool_chain"] == [
+        "segment -> llm_reasoning_classification",
+        "llm_reasoning_classification",
+    ]
+    assert normalized["execution_context"]["public_reasoning"] == [
+        "Both explored paths returned stable.",
+    ]
+    assert normalized["execution_context"]["evidence_summary"] == (
+        "Both explored paths failed against ground truth."
+    )
+
+
+def test_normalize_train_result_row_rebuilds_stale_trace_from_execution_log():
+    normalized = _normalize_train_result_row({
+        "idx": 10,
+        "dataset_name": "weather_aligned_long",
+        "task": "forecast",
+        "status": "completed",
+        "answer_type": "learning_summary",
+        "trace": {
+            "trace_id": "stale-trace",
+            "candidate_traces": [
+                {
+                    "tool_chain": ["slice"],
+                    "prediction": [1.0, 2.0],
+                    "metrics": {"mae": 9.9},
+                }
+            ],
+            "winner_trace": {
+                "tool_chain": ["slice"],
+                "prediction": [1.0, 2.0],
+                "metrics": {"mae": 9.9},
+            },
+        },
+        "raw_answer": {
+            "insight": "TimesFM won over the slice baseline.",
+            "recommendation": "Use TimesFM directly for this forecast.",
+            "winner_candidate": "timesfm2_forecast",
+            "winner_prediction": [3.0, 4.0],
+            "winner_tool_chain": ["timesfm2_forecast"],
+            "winner_metrics": {"mae": 0.1},
+            "compared_candidates": [
+                {
+                    "name": "timesfm2_forecast",
+                    "tool_chain": ["timesfm2_forecast"],
+                    "prediction": [3.0, 4.0],
+                    "metrics": {"mae": 0.1},
+                },
+                {
+                    "name": "slice",
+                    "tool_chain": ["slice"],
+                    "prediction": [1.0, 2.0],
+                    "metrics": {"mae": 1.2},
+                },
+            ],
+        },
+        "execution_log": [
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "slot_id": 0,
+                            "answer": [3.0, 4.0],
+                            "answer_type": "forecast",
+                            "execution_log": [
+                                {
+                                    "tool": "timesfm2_forecast",
+                                    "success": True,
+                                    "output": {"forecast": [3.0, 4.0]},
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "slot_id": 1,
+                            "answer": [1.0, 2.0],
+                            "answer_type": "forecast",
+                            "execution_log": [
+                                {
+                                    "tool": "slice",
+                                    "success": True,
+                                    "output": {"window": [1.0, 2.0]},
+                                },
+                            ],
+                        },
+                    },
+                ],
+            },
+            {
+                "tool": "evaluate_batch_against_gt",
+                "observation": {
+                    "results": [
+                        {
+                            "name": "slot_0",
+                            "prediction": [3.0, 4.0],
+                            "metrics": {"mae": 0.1},
+                        },
+                        {
+                            "name": "slot_1",
+                            "prediction": [1.0, 2.0],
+                            "metrics": {"mae": 1.2},
+                        },
+                    ],
+                },
+            },
+        ],
+    })
+
+    assert [item["tool_chain"] for item in normalized["trace"]["candidate_traces"]] == [
+        ["timesfm2_forecast"],
+        ["slice"],
+    ]
+    assert normalized["trace"]["winner_trace"]["tool_chain"] == ["timesfm2_forecast"]
+    assert normalized["trace"]["winner_trace"]["metrics"] == {"mae": 0.1}
 
 
 def test_load_checkpoint_rows_normalizes_legacy_schema(tmp_path):
@@ -239,6 +1220,7 @@ def test_load_checkpoint_rows_normalizes_legacy_schema(tmp_path):
         "tool_chain": ["timesfm2_forecast"],
         "winner_tool_chain": ["timesfm2_forecast"],
         "status": "completed",
+        "tools_run": 1,
     }]
 
 
@@ -539,6 +1521,63 @@ def test_extract_train_result_tool_chain_prefers_learning_summary_winner_chain()
     ]
 
 
+def test_extract_train_result_tool_chain_respects_explicit_no_winner_state():
+    result = {
+        "raw_answer": {
+            "winner_state": "none",
+            "winner_tool_chain": ["llm_reasoning_classification"],
+            "execution_context": {"tool_chain": ["llm_reasoning_classification"]},
+        },
+        "execution_log": [
+            {"tool": "llm_reasoning_classification"},
+            {"tool": "evaluate_against_gt"},
+        ],
+        "tool_chain": ["llm_reasoning_classification"],
+    }
+
+    assert _extract_train_result_tool_chain(result) == []
+
+
+def test_extract_train_result_tool_chain_prefers_observed_path_when_explicit_winner_chain_is_wrong():
+    result = {
+        "raw_answer": {
+            "winner_candidate": "top_level::llm_reasoning_classification",
+            "winner_tool_chain": ["llm_reasoning_classification"],
+            "winner_prediction": "-2% ~ +2%",
+        },
+        "execution_log": [
+            {
+                "tool": "llm_reasoning_classification",
+                "observation": {"answer": "-2% ~ -4%"},
+            },
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "execution_log": [
+                                {"tool": "value_at", "observation": {"value": 38.98}},
+                                {"tool": "value_at", "observation": {"value": 34.39}},
+                                {"tool": "window_stats", "observation": {"mean": 34.8}},
+                                {"tool": "llm_reasoning_classification", "observation": {"answer": "-2% ~ +2%"}},
+                            ],
+                            "answer": "-2% ~ +2%",
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+
+    assert _extract_train_result_tool_chain(result) == [
+        "value_at",
+        "value_at",
+        "window_stats",
+        "llm_reasoning_classification",
+    ]
+
+
 def test_extract_train_result_tool_chain_can_read_execution_context_winner_chain():
     result = {
         "raw_answer": {
@@ -812,7 +1851,7 @@ def test_build_train_result_evidence_preview_uses_observation_over_mismatched_ac
                                     "tool": "llm_reasoning_correlation",
                                     "thought": (
                                         "Reason: A task-valid label already exists. "
-                                        "Action: Call emit_final_answer to return it."
+                                        "Action: finish with that exact label."
                                     ),
                                     "observation": {"answer": "No Correlation"},
                                 },
@@ -834,7 +1873,7 @@ def test_build_train_result_evidence_preview_uses_observation_over_mismatched_ac
     assert "Step 0: llm_reasoning_correlation" in preview
     assert "Observed:" in preview
     assert "No Correlation" in preview
-    assert "emit_final_answer" not in preview
+    assert "finish with that exact label" not in preview
 
 
 def test_build_train_result_evidence_preview_does_not_truncate_long_step_details():
@@ -1351,6 +2390,123 @@ async def test_run_train_loop_no_merge_checkpoint_still_loads_split(monkeypatch)
 
     assert called["load_split"] is True
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_run_train_loop_manifest_uses_merged_task_rows(tmp_path, monkeypatch):
+    real_pipeline_runner = tl.PipelineRunner
+
+    monkeypatch.setattr(tl, "TRAIN_RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(tl, "TRAIN_SUMMARY_PATH", tmp_path / "train_summary.json")
+    monkeypatch.setattr(tl, "TRAIN_RUN_MANIFEST_PATH", tmp_path / "train_run_manifest.json")
+    monkeypatch.setattr(
+        tl,
+        "expanded_benchmark_task_specs",
+        lambda: [object()] * tl.BENCHMARK_EXPANDED_TASK_TARGET,
+    )
+    monkeypatch.setattr(tl, "datasets_with_benchmark_tasks", lambda: ["finance_aligned_short"])
+    monkeypatch.setattr(tl, "_export_train_note_views", lambda **kwargs: {})
+
+    sample = MTBenchSample(
+        file="00000.parquet_row",
+        dataset="finance_aligned_short",
+        domain="finance",
+        task_types=["forecast"],
+        input_window=np.asarray([1.0, 2.0]),
+        output_window=np.asarray([3.0]),
+        text="demo",
+        timestamps=[0.0, 1.0],
+        start_year=2024,
+    )
+
+    existing_row = {
+        "idx": 0,
+        "abs_idx": 0,
+        "dataset": "finance_aligned_short",
+        "dataset_name": "finance_aligned_short",
+        "sample_ref": "finance_aligned_short:old.parquet_row:0:forecast",
+        "task": "forecast",
+        "status": "completed",
+        "answer_type": "learning_summary",
+        "has_prediction": True,
+        "gate_accepted": True,
+        "winner_state": "selected",
+        "winner_metrics": {"mae": 1.0},
+    }
+
+    def fake_load_train_checkpoint(ds_name, task=None):
+        assert ds_name == "finance_aligned_short"
+        if task in (None, "forecast"):
+            return [dict(existing_row)]
+        return []
+
+    class DummyPipeline(real_pipeline_runner):
+        def __init__(self, config, disable_memory=False):
+            self.config = config
+            self.disable_memory = disable_memory
+
+        async def run(self, **kwargs):
+            return {
+                "status": "completed",
+                "answer_type": "learning_summary",
+                "prediction": [3.0],
+                "trace_id": "trace-new",
+                "gate_accepted": True,
+                "confidence": 0.9,
+                "total_ms": 123,
+                "raw_answer": {
+                    "winner_state": "selected",
+                    "winner_candidate": "timesfm2_forecast",
+                    "winner_prediction": [3.0],
+                    "winner_tool_chain": ["timesfm2_forecast"],
+                    "winner_metrics": {"mae": 0.0},
+                    "insight": "timesfm won",
+                    "recommendation": "prefer timesfm",
+                },
+                "execution_context": {
+                    "tool_chain": ["timesfm2_forecast"],
+                    "public_reasoning": ["timesfm2_forecast stayed on target."],
+                    "evidence_summary": "flat path around 3.0",
+                },
+                "control_context": {},
+                "execution_log": [
+                    {
+                        "tool": "timesfm2_forecast",
+                        "success": True,
+                        "output": {"forecast": [3.0]},
+                    },
+                ],
+            }
+
+        async def shutdown(self):
+            return None
+
+    class DummyConfig:
+        def __init__(self):
+            self.mcp = type("MCP", (), {"enabled": True})()
+
+    monkeypatch.setattr(tl, "PipelineRunner", DummyPipeline)
+    monkeypatch.setattr(tl, "_load_train_checkpoint", fake_load_train_checkpoint)
+    monkeypatch.setattr(tl, "load_split", lambda ds_name, split, config=None: [sample])
+    monkeypatch.setattr(
+        tl,
+        "select_samples_with_original_indices",
+        lambda samples, ds_name, idx_map: [(1, sample)],
+    )
+
+    await tl.run_train_loop(
+        config=DummyConfig(),
+        dataset_name="finance_aligned_short",
+        task_filter="forecast",
+        max_samples=1,
+        merge_checkpoint=True,
+        concurrency=1,
+    )
+
+    manifest = json.loads((tmp_path / "train_run_manifest.json").read_text())
+    task_info = manifest["tasks"]["finance_aligned_short::forecast"]
+    assert task_info["rows"] == 2
+    assert task_info["status_counts"] == {"completed": 2}
 
 
 @pytest.mark.asyncio
