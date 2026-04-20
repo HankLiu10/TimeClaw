@@ -6801,6 +6801,39 @@ def test_build_task_boundary_section_qa_mentions_answer_text_or_option():
     assert "final option label" in text
 
 
+def test_build_task_semantic_guidance_section_future_trend_disallows_full_history_slope_shortcut():
+    text = ExecutorAgent._build_task_semantic_guidance_section(
+        task_type="classification",
+        scope_keys=["weather_aligned_short_trend"],
+    )
+
+    assert "target future window" in text
+    assert "overall slope of the full historical input" in text
+    assert "future-vs-reference comparison" in text
+
+
+def test_build_task_semantic_guidance_section_finance_trend_requires_direction_then_bucket():
+    text = ExecutorAgent._build_task_semantic_guidance_section(
+        task_type="classification",
+        scope_keys=["finance_aligned_long_trend"],
+    )
+
+    assert "future move for the target prediction window" in text
+    assert "direction first, then the magnitude bucket" in text
+    assert "historical regime alone decide the final bucket" in text
+
+
+def test_build_task_semantic_guidance_section_correlation_requires_target_asset_signal():
+    text = ExecutorAgent._build_task_semantic_guidance_section(
+        task_type="correlation",
+        scope_keys=["finance_qa_long_correlation"],
+    )
+
+    assert "target asset" in text
+    assert "post-publication response window" in text
+    assert "industry, competitor, or macro commentary" in text
+
+
 def test_build_parent_branch_metadata_section_renders_short_structured_lines():
     text = ExecutorAgent._build_parent_branch_metadata_section(
         {

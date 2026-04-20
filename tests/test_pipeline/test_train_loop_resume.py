@@ -208,12 +208,13 @@ def test_build_train_result_row_promotes_learning_summary_candidates_to_top_leve
     assert [item["name"] for item in row["compared_candidates"]] == [
         "timesfm2_forecast",
     ]
-    assert row["prediction"] == [3.0]
-    assert row["metrics"] == {"mae": 0.1}
-    assert row["learning_summary"]["winner_prediction"] == [3.0]
+    assert row["has_prediction"] is True
+    assert "prediction" not in row
+    assert "metrics" not in row
+    assert "learning_summary" not in row
 
 
-def test_normalize_train_result_row_backfills_legacy_learning_summary_fields():
+def test_normalize_train_result_row_removes_legacy_learning_summary_fields():
     normalized = _normalize_train_result_row(
         {
             "dataset": "finance_qa_short",
@@ -244,15 +245,19 @@ def test_normalize_train_result_row_backfills_legacy_learning_summary_fields():
                     }
                 ],
             },
+            "prediction": "legacy value",
+            "metrics": {"accuracy": 0.0},
+            "learning_summary": {"summary_kind": "legacy_summary"},
             "execution_log": [],
         }
     )
 
     assert normalized["winner_prediction"] == "Strong Positive Correlation"
     assert normalized["winner_metrics"] == {"accuracy": 1.0, "correct": True}
-    assert normalized["prediction"] == "Strong Positive Correlation"
-    assert normalized["metrics"] == {"accuracy": 1.0, "correct": True}
-    assert normalized["learning_summary"]["summary_kind"] == "validated_summary"
+    assert normalized["has_prediction"] is True
+    assert "prediction" not in normalized
+    assert "metrics" not in normalized
+    assert "learning_summary" not in normalized
 
 
 def test_recover_failed_result_from_trace_recovers_content_block_payload(tmp_path, monkeypatch):
@@ -650,6 +655,49 @@ def test_save_train_summary_replaces_stale_payload(tmp_path, monkeypatch):
     tl._save_train_summary({"weather_aligned_short": {"total": 15}})
 
     assert json.loads(summary_path.read_text()) == {"weather_aligned_short": {"total": 15}}
+
+
+def test_rewrite_train_result_checkpoints_to_canonical_schema(tmp_path, monkeypatch):
+    monkeypatch.setattr(tl, "TRAIN_RESULTS_DIR", tmp_path)
+    path = tmp_path / "train_demo_ds__forecast.json"
+    path.write_text(json.dumps([
+        {
+            "dataset": "demo_ds",
+            "dataset_name": "demo_ds",
+            "idx": 0,
+            "abs_idx": 0,
+            "task": "forecast",
+            "pipeline_task": "forecast",
+            "scope_keys": ["demo_ds_forecast"],
+            "domain": "finance",
+            "status": "completed",
+            "answer_type": "learning_summary",
+            "prediction": [3.0],
+            "metrics": {"mae": 0.1},
+            "learning_summary": {"summary_kind": "legacy_summary"},
+            "raw_answer": {
+                "insight": "i",
+                "recommendation": "r",
+                "winner_state": "selected",
+                "summary_kind": "validated_summary",
+                "winner_candidate": "timesfm2_forecast",
+                "winner_prediction": [3.0],
+                "winner_tool_chain": ["timesfm2_forecast"],
+                "winner_metrics": {"mae": 0.1},
+            },
+            "execution_log": [],
+        }
+    ], indent=2))
+
+    stats = tl.rewrite_train_result_checkpoints_to_canonical_schema()
+    rows = json.loads(path.read_text())
+
+    assert stats == {"files_seen": 1, "files_rewritten": 1, "rows_rewritten": 1}
+    assert rows[0]["winner_prediction"] == [3.0]
+    assert rows[0]["winner_metrics"] == {"mae": 0.1}
+    assert "prediction" not in rows[0]
+    assert "metrics" not in rows[0]
+    assert "learning_summary" not in rows[0]
 
 
 def test_export_train_note_views_filters_to_current_run(tmp_path, monkeypatch):
@@ -1078,7 +1126,10 @@ def test_normalize_train_result_row_forces_fail_when_learning_summary_has_no_win
     assert normalized["winner_tool_chain"] == []
     assert normalized["winner_state"] == "none"
     assert normalized["tools_run"] == 0
-    assert "prediction is None" in normalized["gate_rejections"]
+    assert "no candidate prediction" in normalized["gate_rejections"]
+    assert "prediction" not in normalized
+    assert "metrics" not in normalized
+    assert "learning_summary" not in normalized
     assert normalized["execution_context"]["tool_chain"] == [
         "segment -> llm_reasoning_classification",
         "llm_reasoning_classification",

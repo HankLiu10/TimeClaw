@@ -32,6 +32,7 @@ import numpy as np
 from loguru import logger
 
 from timeclaw.benchmark.dataset_split import load_split
+from timeclaw.benchmark.ground_truth import normalize_numeric_ground_truth
 from timeclaw.benchmark.mtbench_adapter import (
     BENCHMARK_EXPANDED_TASK_TARGET,
     DATASET_REGISTRY,
@@ -94,11 +95,19 @@ def _train_result_task_context(result: dict[str, Any]) -> tuple[str, list[str]]:
     pipeline_task = str(result.get("pipeline_task") or "").strip() or _pipeline_task_for_task_name(task_name)
     scope_keys = result.get("scope_keys") if isinstance(result.get("scope_keys"), list) else None
     domain = str(result.get("domain") or "").strip()
-    indicator_output_keys = PipelineRunner._indicator_output_keys(
-        scope_keys,
-        domain,
-        pipeline_task,
-    )
+    indicator_output_keys_resolver = getattr(PipelineRunner, "_indicator_output_keys", None)
+    if callable(indicator_output_keys_resolver):
+        indicator_output_keys = indicator_output_keys_resolver(
+            scope_keys,
+            domain,
+            pipeline_task,
+        )
+    elif pipeline_task == "indicator":
+        indicator_output_keys = _indicator_output_keys_for_task(task_name)
+        if not indicator_output_keys and domain == "weather":
+            indicator_output_keys = ["max", "min", "diff"]
+    else:
+        indicator_output_keys = []
     return pipeline_task, indicator_output_keys
 
 
@@ -271,13 +280,15 @@ def _normalize_train_result_row(row: dict[str, Any]) -> dict[str, Any]:
     """Normalize persisted train-result rows to a stable top-level schema.
 
     New definition:
-        ``train_results`` rows should always expose the same locating fields at
-        the top level, even if older checkpoints were written before those
-        aliases existed. This keeps filtering, retrying, and winner-chain
-        analysis stable across historical and newly appended samples. Failed
-        legacy learning-summary rows are also re-normalized from their stored
-        ``execution_log`` so stale winner metadata and leaked learning text do
-        not persist forever after a bug fix.
+        ``train_results`` learning rows persist only the canonical winner-aligned
+        fields at the top level: ``winner_prediction``, ``winner_metrics``,
+        ``winner_state``, and ``raw_answer``. Historical aliases such as
+        ``prediction``, ``metrics``, and ``learning_summary`` are stripped during
+        normalization so the stored schema is unique instead of half-legacy and
+        half-canonical. Failed legacy learning-summary rows are also
+        re-normalized from their stored ``execution_log`` so stale winner
+        metadata and leaked learning text do not persist forever after a bug
+        fix.
     """
     normalized = dict(row)
 
@@ -382,24 +393,10 @@ def _normalize_train_result_row(row: dict[str, Any]) -> dict[str, Any]:
                     "metrics": dict(metrics) if isinstance(metrics, dict) else {},
                 })
         normalized["compared_candidates"] = compared_candidates
-        # Backfill legacy top-level fields from the normalized learning summary so
-        # downstream readers do not see empty `prediction` / `metrics` / `learning_summary`
-        # while the winner-aligned fields are populated under the newer schema.
-        normalized["learning_summary"] = dict(normalized_raw_answer)
-        winner_prediction = normalized.get("winner_prediction")
-        winner_metrics = normalized.get("winner_metrics")
-        if winner_prediction is not None:
-            normalized["prediction"] = winner_prediction
-            normalized["metrics"] = (
-                dict(winner_metrics)
-                if isinstance(winner_metrics, dict) and winner_metrics
-                else {}
-            )
-            normalized["has_prediction"] = True
-        else:
-            normalized["prediction"] = None
-            normalized["metrics"] = None
-            normalized["has_prediction"] = False
+        normalized["has_prediction"] = normalized.get("winner_prediction") is not None
+        normalized.pop("prediction", None)
+        normalized.pop("metrics", None)
+        normalized.pop("learning_summary", None)
 
     substantive_tool_chain = _extract_train_result_tool_chain(normalized)
     if substantive_tool_chain:
@@ -420,8 +417,6 @@ def _normalize_train_result_row(row: dict[str, Any]) -> dict[str, Any]:
             normalized["tool_chain"] = []
             normalized["winner_tool_chain"] = []
             normalized["has_prediction"] = False
-            normalized["prediction"] = None
-            normalized["metrics"] = None
             normalized["gate_accepted"] = False
             normalized["gate"] = "FAIL"
             rejections = [
@@ -438,6 +433,11 @@ def _normalize_train_result_row(row: dict[str, Any]) -> dict[str, Any]:
                 execution_context["tool_chain"] = []
                 execution_context["public_reasoning"] = []
                 execution_context["evidence_summary"] = ""
+
+    if answer_type == "learning_summary":
+        normalized.pop("prediction", None)
+        normalized.pop("metrics", None)
+        normalized.pop("learning_summary", None)
 
     normalized["tools_run"] = _count_train_result_tools_run(normalized)
     substantive_tool_chain = list(normalized.get("tool_chain") or [])
@@ -587,13 +587,16 @@ def _sanitize_learning_artifact_preview(value: Any, limit: int | None = 400) -> 
         prefix_match = re.match(r"^(\d+\.\s+)(.*)$", line.strip())
         prefix = prefix_match.group(1) if prefix_match else ""
         body = prefix_match.group(2) if prefix_match else line
-        cleaned_line = str(body).strip()
+        cleaned_line = sanitize_learning_evidence_text(
+            str(body).strip(),
+            drop_imperatives=True,
+        )
         if (
             cleaned_line
-            and body.rstrip().endswith((".", "!", "?", ":"))
+            and str(body).rstrip().endswith((".", "!", "?", ":"))
             and not cleaned_line.endswith((".", "!", "?", ":"))
         ):
-            cleaned_line += body.rstrip()[-1]
+            cleaned_line += str(body).rstrip()[-1]
         if cleaned_line:
             cleaned_lines.append(f"{prefix}{cleaned_line}".strip())
     cleaned = "\n".join(cleaned_lines).strip()
@@ -1817,6 +1820,7 @@ def _build_train_result_row(
         if str(result.get("status") or "completed") == "completed" and isinstance(raw_answer, dict)
         else {}
     )
+    winner_prediction = raw_answer.get("winner_prediction") if isinstance(raw_answer, dict) else None
     sample_ref = f"{ds_name}:{sample.file}:{sample_idx}:{task}"
     substantive_tool_chain = _extract_train_result_tool_chain(result)
 
@@ -1834,7 +1838,7 @@ def _build_train_result_row(
         "domain": sample.domain,
         "status": result.get("status", "completed"),
         "answer_type": result.get("answer_type", ""),
-        "has_prediction": result.get("prediction") is not None,
+        "has_prediction": winner_prediction is not None,
         "trace_id": result.get("trace_id"),
         "trace_recovered": bool(result.get("trace_recovered", False)),
         "gate": "PASS" if result.get("gate_accepted") else "FAIL",
@@ -1912,14 +1916,14 @@ def _repair_learning_summary_with_ground_truth(
 def _extract_ground_truth(sample: MTBenchSample, task: str) -> Any:
     """Extract the ground truth value for a given sample and task type.
 
-    Returns ``None`` when ground truth is unavailable (sample will be skipped).
+    Returns ``None`` when ground truth is unavailable or numerically unusable
+    (sample will be skipped).
     """
     if task == "forecast":
-        return (
-            sample.output_window.tolist()
-            if sample.output_window is not None
-            else None
-        )
+        if sample.output_window is None:
+            return None
+        normalized = normalize_numeric_ground_truth(sample.output_window)
+        return normalized.value if normalized.valid else None
 
     if task == "indicator":
         if sample.domain == "weather" and sample.output_window is not None:
@@ -1928,20 +1932,26 @@ def _extract_ground_truth(sample: MTBenchSample, task: str) -> Any:
             return mt_prompts.weather_indicator_ground_truth(sample.output_window)
         gt: dict[str, Any] = {}
         if sample.labels.get("out_macd") is not None:
-            gt["macd"] = list(np.asarray(sample.labels["out_macd"], dtype=np.float64).ravel())
+            normalized_macd = normalize_numeric_ground_truth(sample.labels["out_macd"])
+            if normalized_macd.valid:
+                gt["macd"] = normalized_macd.value
         if sample.labels.get("out_upper_bb") is not None:
-            gt["upper_bb"] = list(np.asarray(sample.labels["out_upper_bb"], dtype=np.float64).ravel())
+            normalized_bb = normalize_numeric_ground_truth(sample.labels["out_upper_bb"])
+            if normalized_bb.valid:
+                gt["upper_bb"] = normalized_bb.value
         return gt if gt else None
 
     if task == "indicator_macd":
         if sample.labels.get("out_macd") is None:
             return None
-        return {"macd": list(np.asarray(sample.labels["out_macd"], dtype=np.float64).ravel())}
+        normalized = normalize_numeric_ground_truth(sample.labels["out_macd"])
+        return {"macd": normalized.value} if normalized.valid else None
 
     if task == "indicator_upper_bb":
         if sample.labels.get("out_upper_bb") is None:
             return None
-        return {"upper_bb": list(np.asarray(sample.labels["out_upper_bb"], dtype=np.float64).ravel())}
+        normalized = normalize_numeric_ground_truth(sample.labels["out_upper_bb"])
+        return {"upper_bb": normalized.value} if normalized.valid else None
 
     if task == "trend":
         if sample.domain == "weather":
@@ -2263,6 +2273,10 @@ async def run_train_loop(
     cfg.mcp.enabled = False
     trace.configure(verbose)
 
+    from timeclaw.sbm.registry import preload_local_gpu_models
+
+    preload_local_gpu_models(strict=True)
+
     n_specs = len(expanded_benchmark_task_specs())
     if n_specs != BENCHMARK_EXPANDED_TASK_TARGET:
         logger.warning(
@@ -2544,6 +2558,44 @@ def _load_active_task_rows_by_key() -> dict[tuple[str, str], list[dict[str, Any]
     return active_rows
 
 
+def rewrite_train_result_checkpoints_to_canonical_schema() -> dict[str, int]:
+    """Rewrite persisted train-result checkpoints to the canonical row schema.
+
+    New definition:
+        ``checkpoint schema rewrite`` means every persisted learning row is
+        re-saved after ``_normalize_train_result_row`` so old top-level aliases
+        such as ``prediction`` / ``metrics`` / ``learning_summary`` disappear
+        from disk, not only in memory after loading.
+    """
+    stats = {
+        "files_seen": 0,
+        "files_rewritten": 0,
+        "rows_rewritten": 0,
+    }
+    for path in sorted(TRAIN_RESULTS_DIR.glob("train_*.json")):
+        if path.name in {"train_summary.json", "train_run_manifest.json"}:
+            continue
+        if not path.exists() or path.stat().st_size <= 10:
+            continue
+        try:
+            raw_rows = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(raw_rows, list):
+            continue
+        stats["files_seen"] += 1
+        normalized_rows = [
+            _normalize_train_result_row(row)
+            for row in raw_rows
+            if isinstance(row, dict)
+        ]
+        if raw_rows != normalized_rows:
+            _write_json_atomically(path, normalized_rows)
+            stats["files_rewritten"] += 1
+            stats["rows_rewritten"] += len(normalized_rows)
+    return stats
+
+
 def _build_active_train_summary() -> dict[str, Any]:
     dataset_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for (ds_name, _task), rows in _load_active_task_rows_by_key().items():
@@ -2558,8 +2610,8 @@ def _build_active_train_summary() -> dict[str, Any]:
 
 
 def _save_train_summary(summary: dict[str, Any] | None = None) -> None:
-    active_summary = _build_active_train_summary()
-    _write_json_atomically(TRAIN_SUMMARY_PATH, active_summary or dict(summary or {}))
+    payload = _build_active_train_summary() if summary is None else dict(summary)
+    _write_json_atomically(TRAIN_SUMMARY_PATH, payload)
 
 
 def _render_note_block(note_text: str) -> str:
@@ -2696,12 +2748,40 @@ def _build_run_manifest(
     per_task_concurrency: int | None = None,
     indicator_concurrency: int | None = None,
     merge_checkpoint: bool = False,
-    current_run_results: dict[str, Any],
-    current_run_task_rows_by_key: dict[tuple[str, str], list[dict[str, Any]]],
+    current_run_results: dict[str, Any] | None = None,
+    current_run_task_rows_by_key: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
+    all_results: dict[str, Any] | None = None,
+    task_rows_by_key: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
     note_view_paths: dict[str, str],
 ) -> dict[str, Any]:
-    active_summary = _build_active_train_summary()
-    active_task_rows_by_key = _load_active_task_rows_by_key()
+    explicit_results_supplied = current_run_results is not None or all_results is not None
+    explicit_rows_supplied = (
+        current_run_task_rows_by_key is not None
+        or task_rows_by_key is not None
+    )
+    current_run_results = (
+        current_run_results
+        if current_run_results is not None
+        else dict(all_results or {})
+    )
+    current_run_task_rows_by_key = (
+        current_run_task_rows_by_key
+        if current_run_task_rows_by_key is not None
+        else dict(task_rows_by_key or {})
+    )
+    active_summary = (
+        dict(current_run_results)
+        if explicit_results_supplied
+        else _build_active_train_summary()
+    )
+    active_task_rows_by_key = (
+        {
+            key: list(rows)
+            for key, rows in current_run_task_rows_by_key.items()
+        }
+        if explicit_rows_supplied
+        else _load_active_task_rows_by_key()
+    )
     tasks: dict[str, Any] = {}
     for (ds_name, task), rows in sorted(active_task_rows_by_key.items()):
         status_counts: dict[str, int] = defaultdict(int)
@@ -2739,8 +2819,14 @@ def _build_run_manifest(
             for (ds_name, task) in sorted(current_run_task_rows_by_key.keys())
         ],
         "partial_run": bool(
-            active_summary != current_run_results
-            or set(active_task_rows_by_key.keys()) != set(current_run_task_rows_by_key.keys())
+            (
+                not explicit_results_supplied
+                and active_summary != current_run_results
+            )
+            or (
+                not explicit_rows_supplied
+                and set(active_task_rows_by_key.keys()) != set(current_run_task_rows_by_key.keys())
+            )
         ),
         "tasks": tasks,
     }

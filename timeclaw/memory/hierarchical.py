@@ -27,10 +27,17 @@ SKILLS/ (auto-distilled from MEMORY):
     Scene-specific SOPs (Standard Operating Procedures) per (domain, task).
     Step-by-step operational guides.  Corresponds to OpenClaw SKILLS.md.
 
+SKILLS_DECISION/ (auto-distilled from MEMORY):
+    Explanation-oriented decision guides per scope. These are not injected
+    into the agent's execution prompt. They are reserved for user-facing
+    rendering that explains why certain evidence patterns usually support a
+    judgment, while remaining subordinate to the real execution trace.
+
 Distillation chain:
     Notes  ──→  MEMORY (per-scope + task-bucket cross_domain)
                  └──→  TOOLS.md (per-scope cards)
                  └──→  SKILLS/
+                 └──→  SKILLS_DECISION/
 
 New definition:
     ``scope_key`` is the canonical storage and retrieval key for one
@@ -39,7 +46,8 @@ New definition:
 
 New definition:
     ``Notes`` are now a distillation-source layer only. They remain
-    append-only raw records used to distill MEMORY / TOOLS / SKILLS, but
+    append-only raw records used to distill MEMORY / TOOLS / SKILLS /
+    SKILLS_DECISION, but
     they are no longer injected directly into the agent prompt and no
     longer rely on a vector-store retrieval path.
 """
@@ -74,6 +82,7 @@ NOTES_DIR = MEMORY_ROOT / "notes"
 MEMORY_DIR = MEMORY_ROOT / "memory"
 TOOLS_FILE = MEMORY_ROOT / "TOOLS.md"
 SKILLS_DIR = MEMORY_ROOT / "skills"
+SKILLS_DECISION_DIR = MEMORY_ROOT / "skills_decision"
 STATE_DIR = MEMORY_ROOT / "state"
 DISTILL_STATE_FILE = STATE_DIR / "distill_state.json"
 DISTILL_STATE_LOCK_FILE = STATE_DIR / ".distill_state.lock"
@@ -2066,6 +2075,47 @@ class SkillsStore:
         return "\n".join(lines)
 
 
+class SkillsDecisionStore:
+    """SKILLS_DECISION/ — explanation-oriented guides for user-facing rendering.
+
+    These guides are not used to steer execution. They summarize why certain
+    evidence patterns usually support a decision, and are meant to be used only
+    as a rendering aid after real execution evidence has already been gathered.
+    """
+
+    def __init__(self):
+        SKILLS_DECISION_DIR.mkdir(parents=True, exist_ok=True)
+        self._skills_decision: dict[str, str] = {}
+        self._load()
+
+    def _load(self) -> None:
+        for scope, f in _ScopeStorageCodec.iter_scope_paths(SKILLS_DECISION_DIR, ".md"):
+            try:
+                self._skills_decision[scope] = f.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+    def get_skill_decision(self, scope: str) -> str:
+        return self._skills_decision.get(scope, "")
+
+    def total(self) -> int:
+        return len(self._skills_decision)
+
+    def update_skill_decision(self, scope: str, content: str) -> None:
+        self._skills_decision[scope] = content
+        path = _ScopeStorageCodec.path(SKILLS_DECISION_DIR, scope, ".md")
+        path.write_text(content, encoding="utf-8")
+        logger.info(f"[SKILLS_DECISION] Updated decision guide for {scope}")
+
+    def delete_skill_decision(self, scope: str) -> None:
+        if scope in self._skills_decision:
+            del self._skills_decision[scope]
+        path = _ScopeStorageCodec.resolve_existing_path(SKILLS_DECISION_DIR, scope, ".md")
+        if path.exists():
+            path.unlink()
+        logger.info(f"[SKILLS_DECISION] Removed decision guide for {scope}")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Distillation Prompts
 # ═══════════════════════════════════════════════════════════════════════
@@ -2381,41 +2431,125 @@ Use the MEMORY rules as the source of truth.
 - Do not output two skills whose conditions substantially overlap and whose workflows are materially the same
 - Merge nearby conditions into one broader skill when they lead to the same workflow choice and same guardrails
 - Prefer fewer, cleaner skills over many slightly reworded variants
+- Prefer abstract problem-solving language over overly specific sample wording
+- Mention concrete tool names only when MEMORY support is strong enough that the tool choice is genuinely actionable
+- If the real lesson is about problem decomposition rather than one exact tool, state the decomposition first and keep tool naming secondary
+- Keep each skill scannable; put the most decision-useful information first
+- Before writing any workflow, identify the task's real judgment target or comparison target when the MEMORY rules support one
+- If the rules indicate that the task is easy to misread, state what must be judged or compared before naming tools
+- Prefer `Core Idea` wording like "compare future-window X against reference-window Y" or "judge target-asset text signal against post-event price response" before listing concrete tools
 
 **CRITICAL**: The guide must NEVER reference ground truth values, ground
 truth distributions, or label base rates.  The agent will NOT have access
 to ground truth at test time.  All guidance must be based on input data
 characteristics and observed tool behavior, not on output label statistics.
 
-FORMAT: Plain Markdown (not JSON). Keep it under 400 words.
+FORMAT: Plain Markdown (not JSON). Keep it under 350 words.
 
 Required structure:
 For each skill, use exactly this template:
 
 ### Skill N
-Condition:
+Trigger:
 ...
 
-Why:
+Core Idea:
 ...
 
 Workflow:
 1. ...
 2. ...
 
-Guardrails:
+Avoid:
 - ...
 
+Evidence:
+- Support: ...
+
 Rules:
-- Every skill must have `Condition`, `Why`, and `Workflow`
+- Every skill must have `Trigger`, `Core Idea`, and `Workflow`
 - `Workflow` should have 2-4 concrete steps
-- `Guardrails` is optional; include it only when MEMORY rules clearly support hard constraints or failure warnings for that workflow
-- `Condition` must describe the trigger for choosing this workflow, not the general task definition
-- `Why` must explain the rationale from MEMORY rules, not generic prose
+- `Avoid` is optional; include it only when MEMORY rules clearly support failure warnings or invalid shortcuts
+- `Evidence` is required and must be short, e.g. `Support: strong (12 notes, 3 rules)` or `Support: medium (5 notes, 2 rules)`
+- `Trigger` must describe the trigger for choosing this workflow, not the general task definition
+- `Core Idea` must explain the task-solving idea first; only mention tool names when they materially change the workflow
+- `Core Idea` should name the task's real judgment/comparison target when the MEMORY rules support that interpretation
 - `Workflow` must describe what to do, not just what tool is preferred
+- Put the task-solving abstraction before the concrete tool choice whenever possible
+- Do not leak raw rule ids into the final skill text
 - Do not create a catch-all skill that simply restates all rules
 - Before writing, deduplicate candidate skills by condition overlap + workflow overlap
 - Do not include an introduction or conclusion outside the skill list
+"""
+
+
+MEMORY_TO_SKILLS_DECISION_PROMPT = """\
+You are creating a decision-explanation guide for a time-series agent.
+Based on the structured MEMORY rules learned for this specific scope,
+produce a small set of explanation skills for user-facing rendering.
+
+## Scope: {scope}
+
+## Structured MEMORY Rules
+{memory_entries}
+
+## Existing Decision Skill Guide (review and update)
+{existing_skill_decision}
+
+## Your Task
+Write a concise Markdown guide describing why certain evidence patterns
+usually support a judgment for this scope.
+
+Use the MEMORY rules as the source of truth.
+- Prefer rules with higher `support_count`
+- Prefer rules where `injectable=true`
+- Focus on evidence logic and decision rationale, not execution prompting
+- Prefer abstract evidence patterns over tool-by-tool execution advice
+- Mention concrete tool names only when the tool materially affects what evidence is visible
+- Keep the guide faithful to MEMORY; do not invent unsupported rationale
+- Output at most 5 decision skills
+- Prefer fewer, cleaner decision skills over many overlapping paraphrases
+- State the task's real judgment target or comparison target before describing supporting evidence when the MEMORY rules support one
+- If the scope is easy to confuse, explain what is being judged first, then explain why a certain evidence pattern supports that judgment
+- Prefer evidence logic such as "target-window direction aligns with article signal" over path summaries such as "tool A then tool B usually works"
+
+Hard constraints:
+- This guide is NOT for execution-time planning
+- Do NOT present idealized workflow steps as if they were guaranteed to occur in every run
+- Do NOT include ground-truth values, label frequencies, or sample-specific answers
+- Do NOT leak raw rule ids into the final text
+
+FORMAT: Plain Markdown (not JSON). Keep it under 450 words.
+
+Required structure:
+For each decision skill, use exactly this template:
+
+### Decision Skill N
+When:
+...
+
+Why This Usually Supports The Judgment:
+...
+
+How To Explain It To A User:
+- ...
+- ...
+
+Do Not Overclaim:
+- ...
+
+Evidence Strength:
+- Support: ...
+
+Rules:
+- Every decision skill must have all five sections
+- `When` must describe when this explanation pattern applies
+- `Why This Usually Supports The Judgment` must explain the evidence logic, not execution mechanics
+- `Why This Usually Supports The Judgment` should name the actual judgment/comparison target when the MEMORY rules support that interpretation
+- `How To Explain It To A User` must be phrased as user-facing explanation points, not hidden chain-of-thought
+- `Do Not Overclaim` must warn against turning the guide into fake execution facts
+- `Evidence Strength` must be short, e.g. `Support: strong (12 notes, 4 rules)`
+- Do not include an introduction or conclusion outside the decision skill list
 """
 
 
@@ -2488,6 +2622,7 @@ class DistillStateStore:
         for payload in self._data["scopes"].values():
             payload["notes_to_memory_inflight"] = False
             payload["memory_to_skills_inflight"] = False
+            payload["memory_to_skills_decision_inflight"] = False
             payload["memory_to_tools_inflight"] = False
         for payload in self._data["buckets"].values():
             payload["memory_to_cross_inflight"] = False
@@ -2506,6 +2641,8 @@ class DistillStateStore:
         payload.setdefault("memory_history_seq", 0)
         payload.setdefault("memory_to_skills_done_fingerprint", "")
         payload.setdefault("memory_to_skills_inflight", False)
+        payload.setdefault("memory_to_skills_decision_done_fingerprint", "")
+        payload.setdefault("memory_to_skills_decision_inflight", False)
         payload.setdefault("memory_to_tools_done_fingerprint", "")
         payload.setdefault("memory_to_tools_inflight", False)
         payload.setdefault("pending_snapshot_notes_from_seq", 0)
@@ -2526,6 +2663,8 @@ class DistillStateStore:
             payload.setdefault("memory_history_seq", 0)
             payload.setdefault("memory_to_skills_done_fingerprint", "")
             payload.setdefault("memory_to_skills_inflight", False)
+            payload.setdefault("memory_to_skills_decision_done_fingerprint", "")
+            payload.setdefault("memory_to_skills_decision_inflight", False)
             payload.setdefault("memory_to_tools_done_fingerprint", "")
             payload.setdefault("memory_to_tools_inflight", False)
             payload.setdefault("pending_snapshot_notes_from_seq", 0)
@@ -2576,6 +2715,7 @@ class DistillationAgent:
         Notes  ──→  MEMORY (per-scope + cross_domain)
                      └──→  TOOLS.md
                      └──→  SKILLS/
+                     └──→  SKILLS_DECISION/
 
     Note:
         ``cross_domain`` is a distilled storage scope. It is not injected into
@@ -2583,11 +2723,13 @@ class DistillationAgent:
     """
 
     def __init__(self, notes: Notes, memory: MemoryStore,
-                 tools: ToolsStore, skills: SkillsStore):
+                 tools: ToolsStore, skills: SkillsStore,
+                 skills_decision: SkillsDecisionStore):
         self.notes = notes
         self.memory = memory
         self.tools = tools
         self.skills = skills
+        self.skills_decision = skills_decision
         self._state = DistillStateStore()
         self._state_lock = asyncio.Lock()
         self._scope_workers: dict[str, asyncio.Task] = {}
@@ -2731,6 +2873,7 @@ class DistillationAgent:
         entries = self.memory.get_entries(scope_name)
         tool_notes = self.tools.get_notes(scope_name)
         skill_content = self.skills.get_skill(scope_name)
+        skill_decision_content = self.skills_decision.get_skill_decision(scope_name)
         bucket = _task_bucket_from_scope(scope_name)
         cross_domain_entries = self.memory.get_cross_domain_entries(bucket) if bucket else []
         source_notes = [
@@ -2759,6 +2902,8 @@ class DistillationAgent:
             "tool_notes": tool_notes,
             "has_skill": bool(str(skill_content or "").strip()),
             "skill_content": str(skill_content or ""),
+            "has_skill_decision": bool(str(skill_decision_content or "").strip()),
+            "skill_decision_content": str(skill_decision_content or ""),
             "cross_domain_scope": _cross_domain_scope_for_bucket(bucket) if bucket else "",
             "cross_domain_rule_count": len(cross_domain_entries),
             "cross_domain_entries": cross_domain_entries,
@@ -2766,6 +2911,7 @@ class DistillationAgent:
                 "notes_total_seq": int(state.get("notes_total_seq", 0) or 0),
                 "notes_to_memory_done_seq": int(state.get("notes_to_memory_done_seq", 0) or 0),
                 "memory_to_skills_done_fingerprint": str(state.get("memory_to_skills_done_fingerprint", "") or ""),
+                "memory_to_skills_decision_done_fingerprint": str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""),
                 "memory_to_tools_done_fingerprint": str(state.get("memory_to_tools_done_fingerprint", "") or ""),
             },
         }
@@ -2937,6 +3083,27 @@ class DistillationAgent:
                         cleared = True
                     if str(state.get("memory_to_skills_done_fingerprint", "") or ""):
                         await self._update_scope_state(scope, memory_to_skills_done_fingerprint="")
+                        cleared = True
+                    if cleared:
+                        progressed = True
+
+                state = await self._get_scope_state(scope)
+                if memory_fp and memory_fp != str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""):
+                    await self._update_scope_state(scope, memory_to_skills_decision_inflight=True)
+                    success = await self.maybe_distill_memory_to_skills_decision(scope)
+                    await self._update_scope_state(scope, memory_to_skills_decision_inflight=False)
+                    if success:
+                        await self._update_scope_state(scope, memory_to_skills_decision_done_fingerprint=memory_fp)
+                        progressed = True
+                    else:
+                        break
+                elif not memory_fp:
+                    cleared = False
+                    if self.skills_decision.get_skill_decision(scope):
+                        self.skills_decision.delete_skill_decision(scope)
+                        cleared = True
+                    if str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""):
+                        await self._update_scope_state(scope, memory_to_skills_decision_done_fingerprint="")
                         cleared = True
                     if cleared:
                         progressed = True
@@ -4225,6 +4392,67 @@ class DistillationAgent:
             logger.warning(f"[Distill MEMORY→SKILLS] {scope} failed: {e}")
         return False
 
+    async def maybe_distill_memory_to_skills_decision(self, scope: str) -> bool:
+        """Rebuild a SKILLS_DECISION/ guide from the current full MEMORY view."""
+        entries = self.memory.get_entries(scope)
+        if len(entries) < 3:
+            self.skills_decision.delete_skill_decision(scope)
+            return True
+
+        decision_entries: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            evidence = entry.get("evidence") or {}
+            conditions = entry.get("conditions") or []
+            if not isinstance(conditions, list):
+                conditions = [str(conditions)]
+            preferred_tools = entry.get("preferred_tools") or []
+            avoid_tools = entry.get("avoid_tools") or []
+            preferred_tool_chains = entry.get("preferred_tool_chains") or []
+            avoid_tool_chains = entry.get("avoid_tool_chains") or []
+            decision_entries.append(
+                "\n".join(
+                    [
+                        f"- rule_id: {entry.get('rule_id', '')}",
+                        f"  kind: {entry.get('kind', '')}",
+                        f"  summary: {entry.get('summary', '')}",
+                        f"  conditions: {json.dumps([str(c) for c in conditions if str(c).strip()], ensure_ascii=False)}",
+                        f"  rationale: {entry.get('rationale', '')}",
+                        f"  preferred_tools: {json.dumps(preferred_tools, ensure_ascii=False, default=str)}",
+                        f"  avoid_tools: {json.dumps(avoid_tools, ensure_ascii=False, default=str)}",
+                        f"  preferred_tool_chains: {json.dumps(preferred_tool_chains, ensure_ascii=False, default=str)}",
+                        f"  avoid_tool_chains: {json.dumps(avoid_tool_chains, ensure_ascii=False, default=str)}",
+                        f"  support_count: {self._entry_support_count(entry)}",
+                        f"  injectable: {entry.get('injectable', True)}",
+                        f"  evidence_refs: {json.dumps(evidence.get('sample_refs', []), ensure_ascii=False, default=str)}",
+                    ]
+                )
+            )
+        entries_text = "\n\n".join(decision_entries)
+        existing_skill_decision = self.skills_decision.get_skill_decision(scope)
+
+        prompt = MEMORY_TO_SKILLS_DECISION_PROMPT.format(
+            scope=scope,
+            memory_entries=entries_text,
+            existing_skill_decision=existing_skill_decision or "(none yet)",
+        )
+
+        llm = await self._get_llm()
+        try:
+            resp = await llm.complete(
+                [{"role": "system",
+                  "content": "You write concise decision-explanation guides for a time-series agent. Return plain Markdown."},
+                 {"role": "user", "content": prompt}],
+            )
+            if resp.text and len(resp.text.strip()) > 50:
+                self.skills_decision.update_skill_decision(scope, resp.text.strip())
+                logger.info(f"[Distill MEMORY→SKILLS_DECISION] Updated decision guide for {scope}")
+                return True
+        except Exception as e:
+            logger.warning(f"[Distill MEMORY→SKILLS_DECISION] {scope} failed: {e}")
+        return False
+
     # ── Orchestration ─────────────────────────────────────────────────
 
     async def on_new_note(self, scope: str) -> None:
@@ -4255,6 +4483,8 @@ class DistillationAgent:
                 memory_fingerprint="",
                 memory_to_skills_done_fingerprint="",
                 memory_to_skills_inflight=False,
+                memory_to_skills_decision_done_fingerprint="",
+                memory_to_skills_decision_inflight=False,
                 memory_to_tools_done_fingerprint="",
                 memory_to_tools_inflight=False,
                 pending_snapshot_notes_from_seq=0,
@@ -4320,6 +4550,9 @@ class DistillationAgent:
                 if memory_fp != str(state.get("memory_to_skills_done_fingerprint", "") or ""):
                     tails_left = True
                     break
+                if memory_fp != str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""):
+                    tails_left = True
+                    break
                 if memory_fp != str(state.get("memory_to_tools_done_fingerprint", "") or ""):
                     tails_left = True
                     break
@@ -4381,7 +4614,7 @@ class DistillationAgent:
 # ═══════════════════════════════════════════════════════════════════════
 
 class HierarchicalMemory:
-    """Unified interface for TimeClaw's five-component memory system.
+    """Unified interface for TimeClaw's six-component memory system.
 
     Components (aligned with OpenClaw naming):
         soul_text   — Fixed SOUL.md (agent identity)
@@ -4390,6 +4623,7 @@ class HierarchicalMemory:
                        cross_domain rules are distilled/stored only)
         tools       — ToolsStore (per-tool usage experience notes)
         skills      — SkillsStore (scene-specific SOPs)
+        skills_decision — SkillsDecisionStore (user-facing decision guides)
     """
 
     def __init__(self, enabled: bool = True):
@@ -4403,20 +4637,22 @@ class HierarchicalMemory:
             self.memory = MemoryStore()
             self.tools = ToolsStore()
             self.skills = SkillsStore()
+            self.skills_decision = SkillsDecisionStore()
             self.distiller = DistillationAgent(
                 self.notes, self.memory,
-                self.tools, self.skills,
+                self.tools, self.skills, self.skills_decision,
             )
             n_notes = self.notes.total
             n_memory = self.memory.total()
             n_cross = len(self.memory.get_cross_domain_entries())
             n_tools = self.tools.total()
             n_skills = self.skills.total()
+            n_skills_decision = self.skills_decision.total()
             if n_notes + n_memory > 0:
                 logger.info(
                     f"[AgentMemory] Loaded: "
                     f"notes={n_notes}, MEMORY={n_memory} (cross_domain={n_cross}), "
-                    f"TOOLS={n_tools}, SKILLS={n_skills}"
+                    f"TOOLS={n_tools}, SKILLS={n_skills}, SKILLS_DECISION={n_skills_decision}"
                 )
         else:
             self.soul_text = ""
@@ -4424,6 +4660,7 @@ class HierarchicalMemory:
             self.memory = None
             self.tools = None
             self.skills = None
+            self.skills_decision = None
             self.distiller = None
 
     # Backward compatibility aliases
@@ -4558,6 +4795,23 @@ class HierarchicalMemory:
         """Backward compatibility alias for get_skill."""
         return self.get_skill(domain, task)
 
+    def get_skill_decision(
+        self,
+        domain: str,
+        task: str,
+        scope_keys: list[str] | None = None,
+    ) -> str:
+        if not self.enabled or not self.skills_decision:
+            return ""
+        if scope_keys:
+            parts = [
+                self.skills_decision.get_skill_decision(scope=scope)
+                for scope in scope_keys
+            ]
+            return "\n\n".join(p for p in parts if p)
+        scope = f"{domain}_{task}" if domain and task else ""
+        return self.skills_decision.get_skill_decision(scope)
+
     async def flush(self) -> None:
         if self.enabled and self.distiller:
             await self.distiller.distill_pending_all()
@@ -4584,4 +4838,5 @@ class HierarchicalMemory:
             "cross_domain_insights": len(self.memory.get_cross_domain_entries()),
             "tool_notes": self.tools.total(),
             "skills": self.skills.total(),
+            "skills_decision": self.skills_decision.total(),
         }

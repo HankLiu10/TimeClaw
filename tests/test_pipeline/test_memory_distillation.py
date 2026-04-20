@@ -90,6 +90,24 @@ class _FakeSkills:
         return None
 
 
+class _FakeSkillsDecision:
+    def get_skill_decision(self, scope):
+        return ""
+
+    def delete_skill_decision(self, scope):
+        return None
+
+
+def _make_agent(*, notes=None, memory=None, tools=None, skills=None, skills_decision=None):
+    return DistillationAgent(
+        notes=notes or _FakeNotes(),
+        memory=memory or _FakeMemory(),
+        tools=tools or _FakeTools(),
+        skills=skills or _FakeSkills(),
+        skills_decision=skills_decision or _FakeSkillsDecision(),
+    )
+
+
 def _note(scope: str) -> str:
     return f"""### [00:00:00] {scope} — SCORED
 [{scope}] SCORED
@@ -114,6 +132,22 @@ def test_distill_state_store_writes_atomically_without_tmp_leftovers(tmp_path, m
     assert hm.DISTILL_STATE_FILE.exists()
     assert json.loads(hm.DISTILL_STATE_FILE.read_text())["scopes"]["scope_a"]["memory_fingerprint"] == "fp"
     assert list(hm.STATE_DIR.glob(".*.tmp")) == []
+
+
+def test_memory_to_skills_prompt_requires_judgment_target_before_tools():
+    prompt = hm.MEMORY_TO_SKILLS_PROMPT
+
+    assert "real judgment target or comparison target" in prompt
+    assert "state what must be judged or compared before naming tools" in prompt
+    assert "`Core Idea` should name the task's real judgment/comparison target" in prompt
+
+
+def test_memory_to_skills_decision_prompt_requires_judgment_target_before_evidence_logic():
+    prompt = hm.MEMORY_TO_SKILLS_DECISION_PROMPT
+
+    assert "real judgment target or comparison target" in prompt
+    assert "explain what is being judged first" in prompt
+    assert "`Why This Usually Supports The Judgment` should name the actual judgment/comparison target" in prompt
 
 
 @pytest.mark.asyncio
@@ -145,12 +179,7 @@ async def test_notes_scope_storage_is_reversible_for_custom_scope_names(tmp_path
 
 @pytest.mark.asyncio
 async def test_notes_to_memory_uses_scoped_note_threshold():
-    agent = DistillationAgent(
-        notes=_FakeNotes(total=100, scoped={"scope_a": 4}),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent(notes=_FakeNotes(total=100, scoped={"scope_a": 4}))
 
     assert await agent.maybe_distill_notes_to_memory("scope_a") is False
 
@@ -163,12 +192,7 @@ def test_notes_for_scope_collects_unique_scoped_notes_only():
             _note("scope_a"),
         ]
     )
-    agent = DistillationAgent(
-        notes=notes,
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent(notes=notes)
 
     assert agent._notes_for_scope("scope_a") == [
         {"id": "note_0", "text": _note("scope_a")},
@@ -259,12 +283,7 @@ async def test_shutdown_skips_memory_drain_when_disabled_for_test_mode():
 
 @pytest.mark.asyncio
 async def test_distill_pending_scopes_limits_flush_to_selected_scope_and_bucket(monkeypatch):
-    agent = DistillationAgent(
-        notes=_FakeNotes(scoped={"scope_a": 3, "scope_b": 4}),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent(notes=_FakeNotes(scoped={"scope_a": 3, "scope_b": 4}))
     seen_scopes: list[str] = []
     seen_buckets: list[str] = []
 
@@ -272,6 +291,7 @@ async def test_distill_pending_scopes_limits_flush_to_selected_scope_and_bucket(
         return {
             "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
             "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_skills_decision_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
         }
 
@@ -279,6 +299,7 @@ async def test_distill_pending_scopes_limits_flush_to_selected_scope_and_bucket(
         return {
             "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
             "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_skills_decision_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
         }
 
@@ -301,17 +322,13 @@ async def test_distill_pending_scopes_limits_flush_to_selected_scope_and_bucket(
 
 @pytest.mark.asyncio
 async def test_distill_pending_scopes_waits_for_scope_flush_before_bucket_flush(monkeypatch):
-    agent = DistillationAgent(
-        notes=_FakeNotes(scoped={"scope_b": 4}),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent(notes=_FakeNotes(scoped={"scope_b": 4}))
     scope_state = {
         "scope_b": {
             "notes_total_seq": 0,
             "notes_to_memory_done_seq": 0,
             "memory_to_skills_done_fingerprint": "",
+            "memory_to_skills_decision_done_fingerprint": "",
             "memory_to_tools_done_fingerprint": "",
         }
     }
@@ -353,6 +370,7 @@ async def test_distill_pending_scopes_waits_for_scope_flush_before_bucket_flush(
                 scope,
                 notes_to_memory_done_seq=agent.notes.scoped_total(scope),
                 memory_to_skills_done_fingerprint="scope-fp",
+                memory_to_skills_decision_done_fingerprint="scope-fp",
                 memory_to_tools_done_fingerprint="scope-fp",
             )
             events.append(f"scope_end:{scope}")
@@ -391,17 +409,13 @@ async def test_distill_pending_scopes_waits_for_scope_flush_before_bucket_flush(
 
 @pytest.mark.asyncio
 async def test_distill_pending_scopes_does_not_wait_for_unrelated_scope_worker(monkeypatch):
-    agent = DistillationAgent(
-        notes=_FakeNotes(scoped={"scope_a": 4, "scope_b": 4}),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent(notes=_FakeNotes(scoped={"scope_a": 4, "scope_b": 4}))
 
     async def fake_update_scope_state(scope, **kwargs):
         return {
             "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
             "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_skills_decision_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "pending_snapshot_notes_to_seq": 0,
         }
@@ -410,6 +424,7 @@ async def test_distill_pending_scopes_does_not_wait_for_unrelated_scope_worker(m
         return {
             "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
             "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_skills_decision_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "pending_snapshot_notes_to_seq": 0,
         }
@@ -436,17 +451,13 @@ async def test_distill_pending_scopes_does_not_wait_for_unrelated_scope_worker(m
 
 @pytest.mark.asyncio
 async def test_distill_pending_scopes_does_not_wait_for_unrelated_bucket_worker(monkeypatch):
-    agent = DistillationAgent(
-        notes=_FakeNotes(scoped={"scope_b": 4}),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent(notes=_FakeNotes(scoped={"scope_b": 4}))
 
     async def fake_update_scope_state(scope, **kwargs):
         return {
             "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
             "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_skills_decision_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "pending_snapshot_notes_to_seq": 0,
         }
@@ -455,6 +466,7 @@ async def test_distill_pending_scopes_does_not_wait_for_unrelated_bucket_worker(
         return {
             "notes_to_memory_done_seq": agent.notes.scoped_total(scope),
             "memory_to_skills_done_fingerprint": agent._scope_memory_fingerprint(scope),
+            "memory_to_skills_decision_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "memory_to_tools_done_fingerprint": agent._scope_memory_fingerprint(scope),
             "pending_snapshot_notes_to_seq": 0,
         }
@@ -483,18 +495,14 @@ async def test_distill_pending_scopes_does_not_wait_for_unrelated_bucket_worker(
 async def test_force_flush_upgrades_existing_scope_worker(monkeypatch):
     initial_note_count = hm._DISTILL_L1_TO_L2
     notes = _FakeNotes(scoped={"scope_b": initial_note_count})
-    agent = DistillationAgent(
-        notes=notes,
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent(notes=notes)
     scope_state = {
         "scope_b": {
             "notes_total_seq": 0,
             "notes_to_memory_done_seq": 0,
             "memory_fingerprint": "",
             "memory_to_skills_done_fingerprint": "",
+            "memory_to_skills_decision_done_fingerprint": "",
             "memory_to_tools_done_fingerprint": "",
             "pending_snapshot_notes_from_seq": 0,
             "pending_snapshot_notes_to_seq": 0,
@@ -558,12 +566,7 @@ async def test_force_flush_upgrades_existing_scope_worker(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_force_bucket_worker_rebuilds_only_once(monkeypatch):
-    agent = DistillationAgent(
-        notes=_FakeNotes(),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent()
     bucket_state = {
         "scope_b": {
             "memory_fingerprint": "",
@@ -749,23 +752,13 @@ def test_source_rule_note_refs_dedupes_across_source_rules():
         {"rule_id": "r1", "evidence": {"sample_refs": ["n1", "n2"]}},
         {"rule_id": "r2", "evidence": {"sample_refs": ["n2", "n3"]}},
     ]
-    agent = DistillationAgent(
-        notes=_FakeNotes(),
-        memory=memory,
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent(memory=memory)
 
     assert agent._source_rule_note_refs(["r1", "r2"]) == ["n1", "n2", "n3"]
 
 
 def test_apply_memory_update_decision_merges_near_duplicate_result_constraint():
-    agent = DistillationAgent(
-        notes=_FakeNotes(),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent()
     existing_entries = [
         {
             "rule_id": "scope_a::001",
@@ -814,12 +807,7 @@ def test_apply_memory_update_decision_merges_near_duplicate_result_constraint():
 
 
 def test_apply_memory_update_decision_keeps_distinct_domain_heuristic():
-    agent = DistillationAgent(
-        notes=_FakeNotes(),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent()
     existing_entries = [
         {
             "rule_id": "scope_a::001",
@@ -954,18 +942,14 @@ async def test_record_allows_parallel_scope_local_commits_for_different_scopes(t
 
 @pytest.mark.asyncio
 async def test_scope_worker_clears_stale_done_fingerprints_when_memory_is_empty():
-    agent = DistillationAgent(
-        notes=_FakeNotes(scoped={"scope_a": 5}),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent(notes=_FakeNotes(scoped={"scope_a": 5}))
     await agent._update_scope_state(
         "scope_a",
         notes_total_seq=5,
         notes_to_memory_done_seq=15,
         memory_fingerprint="",
         memory_to_skills_done_fingerprint="stale-skill-fp",
+        memory_to_skills_decision_done_fingerprint="stale-skill-decision-fp",
         memory_to_tools_done_fingerprint="stale-tool-fp",
     )
 
@@ -973,17 +957,13 @@ async def test_scope_worker_clears_stale_done_fingerprints_when_memory_is_empty(
 
     state = await agent._get_scope_state("scope_a")
     assert state["memory_to_skills_done_fingerprint"] == ""
+    assert state["memory_to_skills_decision_done_fingerprint"] == ""
     assert state["memory_to_tools_done_fingerprint"] == ""
 
 
 @pytest.mark.asyncio
 async def test_bucket_worker_clears_stale_cross_domain_done_fingerprint_when_memory_is_empty():
-    agent = DistillationAgent(
-        notes=_FakeNotes(),
-        memory=_FakeMemory(),
-        tools=_FakeTools(),
-        skills=_FakeSkills(),
-    )
+    agent = _make_agent()
     await agent._update_bucket_state(
         "bucket_a",
         memory_fingerprint="",

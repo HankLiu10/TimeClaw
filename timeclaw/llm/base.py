@@ -10,6 +10,7 @@ import base64
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -65,6 +66,7 @@ class LLMBackend:
         max_tokens: int = 4096,
         max_retries: int = 3,
         timeout: float = 120.0,
+        first_token_timeout: float | None = None,
         api_base: str | None = None,
         api_key: str | None = None,
         azure_api_base: str | None = None,
@@ -80,6 +82,7 @@ class LLMBackend:
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.timeout = timeout
+        self.first_token_timeout = first_token_timeout
         self.api_base = api_base
         self.api_key = api_key
         self.azure_api_base = azure_api_base
@@ -318,8 +321,13 @@ class LLMBackend:
             by the same proxy for the same payload.
         """
         if not hasattr(self, "_oai_client") or self._oai_client is None:
+            timeout: float | httpx.Timeout
+            if self.first_token_timeout is None:
+                timeout = self.timeout
+            else:
+                timeout = httpx.Timeout(self.timeout, read=self.first_token_timeout)
             self._oai_client = httpx.AsyncClient(
-                timeout=self.timeout,
+                timeout=timeout,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
@@ -333,7 +341,15 @@ class LLMBackend:
         response_format: str | None, messages: list[dict[str, Any]],
         reasoning_effort: str | None = None,
     ) -> LLMResponse | None:
-        """Call the proxy's Responses API without the OpenAI SDK fingerprint."""
+        """Call the proxy's Responses API as an SSE stream.
+
+        New definition:
+            Native ``openai/`` proxy calls now request ``stream=True`` and read
+            the Responses API server-sent event stream incrementally instead of
+            waiting for one full buffered body. This avoids our client being the
+            buffering point for long responses and matches the provider's
+            intended delivery mode more closely.
+        """
         client = self._get_openai_client()
 
         raw_model = call_kwargs["model"]
@@ -360,13 +376,22 @@ class LLMBackend:
 
         for attempt in range(_MAX_RETRIES):
             try:
-                http_response = await client.post(self._responses_endpoint(), json=oai_kwargs)
-                if http_response.status_code >= 400:
-                    raise RuntimeError(http_response.text.strip() or f"HTTP {http_response.status_code}")
+                raw_body = ""
+                async with client.stream(
+                    "POST",
+                    self._responses_endpoint(),
+                    json={**oai_kwargs, "stream": True},
+                    headers={"Accept": "text/event-stream"},
+                ) as http_response:
+                    async for chunk in http_response.aiter_text():
+                        if chunk:
+                            raw_body += chunk
+                    if http_response.status_code >= 400:
+                        raise RuntimeError(raw_body.strip() or f"HTTP {http_response.status_code}")
                 try:
-                    response = http_response.json()
+                    response = json.loads(raw_body)
                 except json.JSONDecodeError:
-                    response = http_response.text
+                    response = raw_body
                 parsed = self._parse_response(response, model_label)
                 if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
                     delay = _retry_delay_seconds(attempt)
@@ -397,51 +422,83 @@ class LLMBackend:
         return None
 
     @staticmethod
-    async def _stream_to_completion(client, oai_kwargs: dict, model: str):
-        """Collect a streaming response into a fake ChatCompletion object."""
-        oai_kwargs_stream = {**oai_kwargs, "stream": True}
-        stream = await client.chat.completions.create(**oai_kwargs_stream)
+    async def _collect_chat_completion_stream(stream: Any, model: str):
+        """Collect a chat-completions stream into a fake completion object.
+
+        New definition:
+            This helper normalizes an async iterable of chunk objects into the
+            same shape as a non-streaming chat-completions response, so upper
+            layers keep seeing the same ``LLMResponse`` contract.
+        """
         content_parts: list[str] = []
+        usage_obj: Any = None
         async for chunk in stream:
+            usage_obj = getattr(chunk, "usage", None) or usage_obj
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
-            if delta.content:
-                content_parts.append(delta.content)
+            content = getattr(delta, "content", None)
+            if not content:
+                continue
+            if isinstance(content, str):
+                content_parts.append(content)
+                continue
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, str):
+                        content_parts.append(item)
+                        continue
+                    if isinstance(item, dict):
+                        text_value = item.get("text")
+                        if text_value:
+                            content_parts.append(str(text_value))
+                        continue
+                    text_value = getattr(item, "text", None)
+                    if text_value:
+                        content_parts.append(str(text_value))
+                continue
+            content_parts.append(str(content))
 
-        class _Msg:
-            def __init__(self):
-                self.content = "".join(content_parts)
-                self.role = "assistant"
-
-        class _Choice:
-            def __init__(self):
-                self.message = _Msg()
-                self.finish_reason = "stop"
-
-        class _FakeResp:
-            def __init__(self):
-                self.choices = [_Choice()]
-                self.model = model
-                self.usage = None
-
-        return _FakeResp()
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="".join(content_parts),
+                        role="assistant",
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            model=model,
+            usage=usage_obj,
+        )
 
     async def _call_with_retry(
         self, call_kwargs: dict[str, Any], model_label: str,
         response_format: str | None, messages: list[dict[str, Any]],
         reasoning_effort: str | None = None,
     ) -> LLMResponse | None:
-        """Execute a litellm call with automatic retry on transient errors."""
+        """Execute a litellm call with automatic retry using stream mode.
+
+        New definition:
+            We request chat-completions style streaming for completion calls and
+            reassemble the chunks locally. This makes the transport incremental
+            while preserving the existing non-streaming ``LLMResponse`` contract
+            for the rest of the codebase.
+        """
         import litellm
 
         effective_kwargs = dict(call_kwargs)
         if reasoning_effort and str(call_kwargs.get("model", "")).startswith(("openai/", "azure/")):
             effective_kwargs["reasoning_effort"] = reasoning_effort
+        effective_kwargs["stream"] = True
+        effective_kwargs["stream_options"] = {"include_usage": True}
 
         for attempt in range(_MAX_RETRIES):
             try:
                 response = await litellm.acompletion(**effective_kwargs)
+                if hasattr(response, "__aiter__"):
+                    response = await self._collect_chat_completion_stream(response, model_label)
                 parsed = self._parse_response(response, model_label)
                 if _is_empty(parsed) and attempt < _MAX_RETRIES - 1:
                     delay = _retry_delay_seconds(attempt)

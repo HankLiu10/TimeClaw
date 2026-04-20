@@ -31,6 +31,7 @@ class ModelRouter:
             max_tokens=self.config.max_tokens,
             max_retries=self.config.max_retries,
             timeout=self.config.timeout,
+            first_token_timeout=self.config.first_token_timeout,
             api_base=self.config.api_base,
             api_key=self.config.api_key,
             azure_api_base=self.config.azure_api_base,

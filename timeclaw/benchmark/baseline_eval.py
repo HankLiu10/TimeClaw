@@ -18,6 +18,7 @@ import numpy as np
 from loguru import logger
 
 from timeclaw.benchmark.dataset_split import load_split
+from timeclaw.benchmark.ground_truth import normalize_numeric_ground_truth
 from timeclaw.benchmark.mtbench_adapter import (
     DATASET_REGISTRY,
     MTBenchSample,
@@ -157,6 +158,11 @@ def _prefixed_metrics(prefix: str, metrics: dict[str, float]) -> dict[str, float
     return {f"{prefix}_{k}": v for k, v in metrics.items()}
 
 
+def _normalized_numeric_gt(value: Any) -> list[float] | None:
+    normalized = normalize_numeric_ground_truth(value)
+    return normalized.value if normalized.valid else None
+
+
 # ── Per-task baseline handlers ────────────────────────────────────────
 
 async def _baseline_weather_forecast(
@@ -164,15 +170,18 @@ async def _baseline_weather_forecast(
 ) -> dict[str, Any]:
     if sample.output_window is None:
         return {"error": "no output_window"}
+    gt_window = _normalized_numeric_gt(sample.output_window)
+    if gt_window is None:
+        return {"metrics": {"skipped": "invalid_ground_truth"}}
     resp = await llm.complete(_prompt_messages(sample, "forecast"))
     raw = resp.text or ""
     pred = prompts.parse_weather_forecast_output(raw)
     if pred is None:
         parsed = _parse_json_from_text(raw)
-        pred_arr = _extract_number_array(parsed, len(sample.output_window), raw)
+        pred_arr = _extract_number_array(parsed, len(gt_window), raw)
         pred = pred_arr.tolist() if pred_arr is not None else None
     if pred is not None:
-        metrics = _forecast_metrics(sample.output_window, pred)
+        metrics = _forecast_metrics(gt_window, pred)
         return {"metrics": metrics, "pred_len": len(pred)}
     return {"metrics": {"error": "parse_fail"}}
 
@@ -203,7 +212,10 @@ async def _baseline_weather_indicator(
 ) -> dict[str, Any]:
     if sample.output_window is None:
         return {"metrics": {"error": "no output_window"}}
-    gt = prompts.weather_indicator_ground_truth(sample.output_window)
+    gt_window = _normalized_numeric_gt(sample.output_window)
+    if gt_window is None:
+        return {"metrics": {"skipped": "invalid_ground_truth"}}
+    gt = prompts.weather_indicator_ground_truth(gt_window)
     gt_max = gt["max"]
     gt_min = gt["min"]
     gt_diff = gt["diff"]
@@ -247,7 +259,10 @@ async def _baseline_stock_forecast(
 ) -> dict[str, Any]:
     if sample.output_window is None:
         return {"metrics": {"error": "no output_window"}}
-    horizon = len(sample.output_window)
+    gt_window = _normalized_numeric_gt(sample.output_window)
+    if gt_window is None:
+        return {"metrics": {"skipped": "invalid_ground_truth"}}
+    horizon = len(gt_window)
     resp = await llm.complete(_prompt_messages(sample, "forecast"))
     raw = resp.text or ""
     pred = prompts.parse_finance_value_output(raw)
@@ -256,7 +271,7 @@ async def _baseline_stock_forecast(
         pred_arr = _extract_number_array(parsed, horizon, raw)
         pred = pred_arr.tolist() if pred_arr is not None else None
     if pred is not None:
-        metrics = _forecast_metrics(sample.output_window, pred)
+        metrics = _forecast_metrics(gt_window, pred)
         return {"metrics": metrics, "pred_len": len(pred)}
     return {"metrics": {"error": "parse_fail"}}
 
@@ -286,8 +301,8 @@ async def _baseline_stock_trend(
 async def _baseline_stock_indicator(
     sample: MTBenchSample, llm: Any,
 ) -> dict[str, Any]:
-    gt_macd = sample.labels.get("out_macd")
-    gt_bb = sample.labels.get("out_upper_bb")
+    gt_macd = _normalized_numeric_gt(sample.labels.get("out_macd"))
+    gt_bb = _normalized_numeric_gt(sample.labels.get("out_upper_bb"))
     if gt_macd is None and gt_bb is None:
         return {"metrics": {"error": "no_indicator_labels"}}
 
@@ -598,7 +613,10 @@ async def _llm_reasoning_call(llm: Any, sample: MTBenchSample, question: str, ou
 async def _llmr_forecast(sample: MTBenchSample, llm: Any) -> dict[str, Any]:
     if sample.output_window is None:
         return {"metrics": {"error": "no output_window"}}
-    horizon = len(sample.output_window)
+    gt_window = _normalized_numeric_gt(sample.output_window)
+    if gt_window is None:
+        return {"metrics": {"skipped": "invalid_ground_truth"}}
+    horizon = len(gt_window)
     horizon_days = max(1, horizon // 24)
     ds = getattr(sample, "dataset", "")
     if sample.domain == "weather":
@@ -614,7 +632,7 @@ async def _llmr_forecast(sample: MTBenchSample, llm: Any) -> dict[str, Any]:
     parsed = await _llm_reasoning_call(llm, sample, question, f'{{"forecast": [array of {horizon} numbers]}}')
     pred = _extract_number_array(parsed, horizon)
     if pred is not None:
-        return {"metrics": _forecast_metrics(sample.output_window, pred)}
+        return {"metrics": _forecast_metrics(gt_window, pred)}
     return {"metrics": {"error": "parse_fail"}}
 
 
@@ -657,7 +675,10 @@ async def _llmr_indicator(sample: MTBenchSample, llm: Any) -> dict[str, Any]:
     if sample.output_window is None:
         return {"metrics": {"error": "no output_window"}}
     if sample.domain == "weather":
-        gt = prompts.weather_indicator_ground_truth(sample.output_window)
+        gt_window = _normalized_numeric_gt(sample.output_window)
+        if gt_window is None:
+            return {"metrics": {"skipped": "invalid_ground_truth"}}
+        gt = prompts.weather_indicator_ground_truth(gt_window)
         n_days = 1
         gt_max = gt["max"]
         gt_min = gt["min"]
@@ -680,8 +701,8 @@ async def _llmr_indicator(sample: MTBenchSample, llm: Any) -> dict[str, Any]:
             }}
         return {"metrics": {"error": "parse_fail"}}
     else:
-        gt_macd = sample.labels.get("out_macd")
-        gt_upper_bb = sample.labels.get("out_upper_bb")
+        gt_macd = _normalized_numeric_gt(sample.labels.get("out_macd"))
+        gt_upper_bb = _normalized_numeric_gt(sample.labels.get("out_upper_bb"))
         if gt_macd is None and gt_upper_bb is None:
             return {"metrics": {"error": "no indicator labels"}}
         question = (

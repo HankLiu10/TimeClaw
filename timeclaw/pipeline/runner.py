@@ -319,6 +319,7 @@ class PipelineRunner:
                 envelope.task.metadata["skill_prompt"] = skill_prompt
 
             envelope.task.metadata["domain"] = domain
+            envelope.task.metadata["scope_keys"] = list(scope_keys or [])
             envelope.task.metadata["modality"] = (
                 detected_modalities[0] if len(detected_modalities) == 1 else "multimodal"
             )

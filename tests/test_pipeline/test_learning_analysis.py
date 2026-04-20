@@ -69,6 +69,28 @@ def test_render_learning_summary_from_analysis_uses_data_characteristics_not_con
     assert "winner for this run" not in insight.lower()
 
 
+def test_learning_analysis_task_semantic_focus_marks_future_trend_comparison_target():
+    text = learning_analysis_mod._learning_analysis_task_semantic_focus(
+        task_type="classification",
+        scope_keys=["weather_aligned_short_trend"],
+    )
+
+    assert "future-window trend" in text
+    assert "observed reference window" in text
+    assert "full-history slope" in text
+
+
+def test_learning_analysis_task_semantic_focus_marks_finance_bucket_target():
+    text = learning_analysis_mod._learning_analysis_task_semantic_focus(
+        task_type="classification",
+        scope_keys=["finance_aligned_long_trend"],
+    )
+
+    assert "future return bucket" in text
+    assert "prediction window" in text
+    assert "direction first, then the magnitude bucket" in text
+
+
 def test_daily_note_labels_winner_tool_section():
     note = Notes._build_note(  # type: ignore[misc]
         Notes.__new__(Notes),
@@ -523,6 +545,43 @@ async def test_generate_learning_analysis_prompt_uses_scope_targets_for_multi_sc
 
     assert "Scope targets:" in captured["user"]
     assert "weather_aligned_short_indicator_macd" in captured["user"]
+
+
+@pytest.mark.asyncio
+async def test_generate_learning_analysis_prompt_includes_task_semantic_focus_for_confusable_tasks():
+    captured: dict[str, str] = {}
+
+    class _Resp:
+        parsed = {
+            "text_signals": [],
+            "sample_conditions": ["future mean versus recent mean is the real comparison"],
+            "winner_evidence": ["segment preserved the daily phase before forecast comparison"],
+            "failure_signals": [],
+            "reusable_rule": ["When the task defines a future-versus-reference comparison, name that comparison before choosing tools."],
+        }
+
+    class _LLM:
+        async def complete(self, messages, **_kwargs):
+            captured["system"] = messages[0]["content"]
+            captured["user"] = messages[1]["content"]
+            return _Resp()
+
+    await generate_learning_analysis(
+        scope_key="weather_aligned_short_trend",
+        task_type="classification",
+        domain="weather",
+        task_description="trend task",
+        sample_fingerprint="length=168",
+        candidate_traces=[],
+        best_metrics={"accuracy": 1.0},
+        fallback_summary="fallback summary",
+        llm=_LLM(),
+    )
+
+    assert "Task Semantic Focus:" in captured["user"]
+    assert "future-window trend relative to the required observed reference window" in captured["user"]
+    assert "future mean versus recent mean" in captured["user"]
+    assert "real judgment/comparison target" in captured["system"]
 
 
 @pytest.mark.asyncio

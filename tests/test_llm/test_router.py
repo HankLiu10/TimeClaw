@@ -42,6 +42,18 @@ class TestModelRouter:
         b2 = router.get_backend("manager")
         assert b1 is b2
 
+    def test_router_passes_first_token_timeout_to_backend(self):
+        router = ModelRouter(
+            LLMConfig(
+                models=LLMModelConfig(manager="openai/gpt-5.4"),
+                timeout=300,
+                first_token_timeout=60,
+            )
+        )
+        backend = router.get_backend("manager")
+        assert backend.timeout == 300
+        assert backend.first_token_timeout == 60
+
     def test_fallback_is_disabled_by_default_even_when_configured(self):
         router = ModelRouter(
             LLMConfig(

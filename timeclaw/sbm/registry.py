@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from loguru import logger
@@ -82,6 +83,162 @@ class SBMRegistry:
 _global_registry = SBMRegistry()
 
 
+def _register_local_adapter(
+    registry: SBMRegistry,
+    *,
+    name: str,
+    adapter_cls: type[SBMBase],
+    default_config: SBMConfig,
+    force: bool = False,
+) -> None:
+    """Register one local adapter on the global registry.
+
+    New definition:
+    - ``force=True`` means "replace any existing instance for this model name"
+      before re-registering. This matters when a previous call inserted an HTTP
+      client placeholder with the same model name, but the current workflow now
+      requires the real local GPU-backed adapter.
+    """
+    if force and name in registry._instances:
+        registry.unload(name)
+    registry.register(name, adapter_cls, configured_default_config(name, default_config))
+
+
+def register_local_adapters(*, force: bool = False) -> list[str]:
+    """Register all built-in local SBM adapters.
+
+    New definition:
+    - This function always targets local adapters only.
+    - It does not probe or prefer the optional SBM HTTP server.
+    - Returned names are the successfully registered local model names.
+    """
+    registry = get_global_registry()
+    registered: list[str] = []
+
+    try:
+        from timeclaw.sbm.chronos_adapter import ChronosAdapter, CHRONOS_DEFAULT_CONFIG
+        _register_local_adapter(
+            registry,
+            name="chronos2",
+            adapter_cls=ChronosAdapter,
+            default_config=CHRONOS_DEFAULT_CONFIG,
+            force=force,
+        )
+        registered.append("chronos2")
+    except ImportError:
+        logger.debug("Chronos adapter not available (missing dependencies)")
+
+    try:
+        from timeclaw.sbm.moirai_adapter import MoiraiAdapter, MOIRAI_DEFAULT_CONFIG
+        _register_local_adapter(
+            registry,
+            name="moirai1_1_r_base",
+            adapter_cls=MoiraiAdapter,
+            default_config=MOIRAI_DEFAULT_CONFIG,
+            force=force,
+        )
+        registered.append("moirai1_1_r_base")
+    except ImportError:
+        logger.debug("Moirai adapter not available (missing dependencies)")
+
+    try:
+        from timeclaw.sbm.timesfm_adapter import TimesFMAdapter, TIMESFM_DEFAULT_CONFIG
+        _register_local_adapter(
+            registry,
+            name="timesfm2",
+            adapter_cls=TimesFMAdapter,
+            default_config=TIMESFM_DEFAULT_CONFIG,
+            force=force,
+        )
+        registered.append("timesfm2")
+    except ImportError:
+        logger.debug("TimesFM adapter not available (missing dependencies)")
+
+    try:
+        from timeclaw.sbm.timer_adapter import TimerAdapter, TIMER_DEFAULT_CONFIG
+        _register_local_adapter(
+            registry,
+            name="sundial_base_128m",
+            adapter_cls=TimerAdapter,
+            default_config=TIMER_DEFAULT_CONFIG,
+            force=force,
+        )
+        registered.append("sundial_base_128m")
+    except ImportError:
+        logger.debug("Timer adapter not available (missing dependencies)")
+
+    try:
+        from timeclaw.sbm.aurora_adapter import AuroraAdapter, AURORA_DEFAULT_CONFIG
+        _register_local_adapter(
+            registry,
+            name="aurora",
+            adapter_cls=AuroraAdapter,
+            default_config=AURORA_DEFAULT_CONFIG,
+            force=force,
+        )
+        registered.append("aurora")
+    except ImportError:
+        logger.debug("Aurora adapter not available (missing dependencies)")
+
+    return registered
+
+
+def preload_local_gpu_models(
+    *,
+    model_names: Iterable[str] | None = None,
+    strict: bool = True,
+) -> list[dict[str, Any]]:
+    """Register and eagerly load all requested local GPU SBM adapters.
+
+    New definition:
+    - This is the benchmark-side "explicit deployment" entry point.
+    - It bypasses the optional HTTP-server auto-discovery path on purpose,
+      because training/evaluation here require the real local models to be
+      placed onto the configured GPUs rather than remote client stubs.
+    - When ``strict=True``, any registered GPU model that fails to load aborts
+      the workflow immediately instead of silently falling back to lazy loading.
+    """
+    registry = get_global_registry()
+    local_names = register_local_adapters(force=True)
+    requested = list(model_names) if model_names is not None else list(local_names)
+    ready: list[dict[str, Any]] = []
+    failures: list[str] = []
+
+    for name in requested:
+        if name not in local_names:
+            continue
+        adapter = registry.get(name)
+        if not getattr(adapter, "requires_gpu", False):
+            continue
+        try:
+            if not adapter.is_loaded:
+                adapter.load()
+            ready.append(
+                {
+                    "name": name,
+                    "device": adapter.config.device,
+                    "adapter": adapter.__class__.__name__,
+                }
+            )
+        except Exception as e:
+            failures.append(f"{name} ({adapter.config.device}): {e}")
+
+    if failures:
+        joined = "; ".join(failures)
+        if strict:
+            raise RuntimeError(f"Local GPU SBM preload failed: {joined}")
+        logger.warning(f"Local GPU SBM preload failed: {joined}")
+
+    if ready:
+        logger.info(
+            "Local GPU SBM preload ready: "
+            + ", ".join(f"{item['name']}@{item['device']}" for item in ready)
+        )
+    else:
+        logger.warning("Local GPU SBM preload found no loadable local GPU adapters")
+    return ready
+
+
 def configured_default_config(name: str, default_config: SBMConfig) -> SBMConfig:
     """Apply TimeClaw's SBM runtime device mapping to one adapter config."""
     try:
@@ -131,60 +288,7 @@ def auto_register(server_url: str = "http://localhost:8100") -> int:
     except Exception as e:
         logger.debug(f"SBM HTTP server not available: {e}")
 
-    try:
-        from timeclaw.sbm.chronos_adapter import ChronosAdapter, CHRONOS_DEFAULT_CONFIG
-        registry.register(
-            "chronos2",
-            ChronosAdapter,
-            configured_default_config("chronos2", CHRONOS_DEFAULT_CONFIG),
-        )
-        count += 1
-    except ImportError:
-        logger.debug("Chronos adapter not available (missing dependencies)")
-
-    try:
-        from timeclaw.sbm.moirai_adapter import MoiraiAdapter, MOIRAI_DEFAULT_CONFIG
-        registry.register(
-            "moirai1_1_r_base",
-            MoiraiAdapter,
-            configured_default_config("moirai1_1_r_base", MOIRAI_DEFAULT_CONFIG),
-        )
-        count += 1
-    except ImportError:
-        logger.debug("Moirai adapter not available (missing dependencies)")
-
-    try:
-        from timeclaw.sbm.timesfm_adapter import TimesFMAdapter, TIMESFM_DEFAULT_CONFIG
-        registry.register(
-            "timesfm2",
-            TimesFMAdapter,
-            configured_default_config("timesfm2", TIMESFM_DEFAULT_CONFIG),
-        )
-        count += 1
-    except ImportError:
-        logger.debug("TimesFM adapter not available (missing dependencies)")
-
-    try:
-        from timeclaw.sbm.timer_adapter import TimerAdapter, TIMER_DEFAULT_CONFIG
-        registry.register(
-            "sundial_base_128m",
-            TimerAdapter,
-            configured_default_config("sundial_base_128m", TIMER_DEFAULT_CONFIG),
-        )
-        count += 1
-    except ImportError:
-        logger.debug("Timer adapter not available (missing dependencies)")
-
-    try:
-        from timeclaw.sbm.aurora_adapter import AuroraAdapter, AURORA_DEFAULT_CONFIG
-        registry.register(
-            "aurora",
-            AuroraAdapter,
-            configured_default_config("aurora", AURORA_DEFAULT_CONFIG),
-        )
-        count += 1
-    except ImportError:
-        logger.debug("Aurora adapter not available (missing dependencies)")
+    count = len(register_local_adapters())
 
     logger.info(f"SBM auto-register: {count} local adapters available")
     return count

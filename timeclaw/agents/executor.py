@@ -674,6 +674,7 @@ class ExecutorAgent(AgentBase):
             "memory_l2": envelope.task.metadata.get("memory_l2", ""),
             "tool_notes": envelope.task.metadata.get("tool_notes", {}),
             "domain": envelope.task.metadata.get("domain", ""),
+            "scope_keys": envelope.task.metadata.get("scope_keys", []),
             "reanalysis_context": envelope.task.metadata.get("reanalysis_context"),
             "_mode": envelope.task.metadata.get("_mode", "test"),
             "_defer_learning_record": envelope.task.metadata.get("_defer_learning_record", False),
@@ -837,6 +838,7 @@ class ExecutorAgent(AgentBase):
             "fingerprint": perception["fingerprint"],
             "horizon": perception.get("horizon"),
             "domain": perception.get("domain", ""),
+            "scope_keys": perception.get("scope_keys", []),
             "reanalysis_section": reanalysis_section,
             "_mode": run_mode,
             "_defer_learning_record": bool(perception.get("_defer_learning_record", False)),
@@ -898,6 +900,17 @@ class ExecutorAgent(AgentBase):
                 indicator_output_keys=plan.get("indicator_output_keys", []),
             ),
         )
+        task_semantic_section = self._render_prompt_section(
+            "Task Semantic Guidance",
+            self._build_task_semantic_guidance_section(
+                task_type=plan["task_type"],
+                scope_keys=plan.get("scope_keys", []),
+            ),
+        )
+        objective_sections = self._join_prompt_sections(
+            task_boundary_section,
+            task_semantic_section,
+        )
         execution_context_section = self._render_prompt_section(
             "Execution Context",
             "",
@@ -948,7 +961,7 @@ class ExecutorAgent(AgentBase):
 
         first_user = executor_prompt.REACT_FIRST_TURN.format(
             task_prompt=plan.get("task_description", ""),
-            task_boundary_section=task_boundary_section,
+            task_boundary_section=objective_sections,
             fingerprint=self._format_prompt_payload(
                 self._prepare_prompt_fingerprint(
                     plan["fingerprint"],
@@ -973,6 +986,7 @@ class ExecutorAgent(AgentBase):
                     self._build_prompt_section_audit(name="system_prompt", text=system_prompt),
                     self._build_prompt_section_audit(name="first_user", text=first_user),
                     self._build_prompt_section_audit(name="task_boundary_section", text=task_boundary_section),
+                    self._build_prompt_section_audit(name="task_semantic_section", text=task_semantic_section),
                     self._build_prompt_section_audit(name="execution_context_section", text=execution_context_section),
                     self._build_prompt_section_audit(name="control_context_section", text=control_context_section),
                     self._build_prompt_section_audit(name="output_contract_section", text=output_contract_section),
@@ -5986,6 +6000,13 @@ class ExecutorAgent(AgentBase):
                 indicator_output_keys=plan.get("indicator_output_keys", []),
             ),
         )
+        task_semantic_section = self._render_prompt_section(
+            "Task Semantic Guidance",
+            self._build_task_semantic_guidance_section(
+                task_type=plan["task_type"],
+                scope_keys=plan.get("scope_keys", []),
+            ),
+        )
         execution_context_section = self._render_prompt_section(
             "Execution Context",
             "",
@@ -6025,10 +6046,14 @@ class ExecutorAgent(AgentBase):
             allow_finish=True,
             spawn_available=False,
         )
+        objective_sections = self._join_prompt_sections(
+            task_boundary_section,
+            task_semantic_section,
+        )
 
         first_user = executor_prompt.SUBAGENT_FIRST_TURN.format(
             task_prompt=plan.get("task_description", ""),
-            task_boundary_section=task_boundary_section,
+            task_boundary_section=objective_sections,
             fingerprint=self._format_prompt_payload(
                 self._prepare_prompt_fingerprint(
                     plan["fingerprint"],
@@ -6061,6 +6086,7 @@ class ExecutorAgent(AgentBase):
                     self._build_prompt_section_audit(name="system_prompt", text=system_prompt),
                     self._build_prompt_section_audit(name="first_user", text=first_user),
                     self._build_prompt_section_audit(name="task_boundary_section", text=task_boundary_section),
+                    self._build_prompt_section_audit(name="task_semantic_section", text=task_semantic_section),
                     self._build_prompt_section_audit(name="execution_context_section", text=execution_context_section),
                     self._build_prompt_section_audit(name="control_context_section", text=control_context_section),
                     self._build_prompt_section_audit(name="output_contract_section", text=output_contract_section),
@@ -7277,6 +7303,76 @@ class ExecutorAgent(AgentBase):
                 "- Core task: judge the correlation/relationship label requested by the task from the provided evidence.\n"
                 "- Task-valid candidate output: one correlation label string, or a minimal JSON object containing that label.\n"
                 "- Not valid for this task: forecast arrays, indicator JSON objects, or long QA-style answers unrelated to the requested label.\n"
+            )
+        return ""
+
+    @staticmethod
+    def _scope_keys_match_suffix(
+        scope_keys: list[str] | None,
+        suffix: str,
+    ) -> bool:
+        suffix_text = str(suffix or "").strip()
+        if not suffix_text:
+            return False
+        return any(
+            str(scope).strip().endswith(suffix_text)
+            for scope in (scope_keys or [])
+            if str(scope).strip()
+        )
+
+    @classmethod
+    def _build_task_semantic_guidance_section(
+        cls,
+        *,
+        task_type: str,
+        scope_keys: list[str] | None = None,
+    ) -> str:
+        """Return benchmark-specific semantic requirements for judgment, not output shape.
+
+        New definition:
+            `Task Semantic Guidance` is a prompt-only section for the few tasks
+            whose task meaning is easy to confuse. It constrains what must be
+            established before answering, but it does not require extra output
+            fields and does not prescribe a fixed tool order.
+        """
+        if cls._scope_keys_match_suffix(scope_keys, "_correlation"):
+            return (
+                "- Separately assess the directional signal from the text/news context and from the time-series behavior.\n"
+                "- Choose the final correlation label from their alignment, opposition, or lack of meaningful relationship; do not decide from only one modality.\n"
+                "- Judge only the signal about the target asset and its post-publication response window; do not treat industry, competitor, or macro commentary as a direct target signal unless the text clearly ties it to the target asset.\n"
+            )
+        if (
+            task_type == "classification"
+            and any(str(scope).strip().startswith("finance_aligned_") for scope in (scope_keys or []))
+            and cls._scope_keys_match_suffix(scope_keys, "_trend")
+        ):
+            return (
+                "- Estimate the future move for the target prediction window, then map it to the required return bucket.\n"
+                "- Determine the direction first, then the magnitude bucket; do not let a bearish or bullish historical regime alone decide the final bucket.\n"
+            )
+        if (
+            task_type == "classification"
+            and cls._scope_keys_match_suffix(scope_keys, "_trend")
+            and not cls._scope_keys_match_suffix(scope_keys, "_trend_past")
+        ):
+            return (
+                "- This task asks for the trend of the target future window relative to the required observed reference window, not the overall slope of the full historical input.\n"
+                "- Base the label on the task-defined future-vs-reference comparison before using broader history or context as supporting evidence.\n"
+            )
+        if cls._scope_keys_match_suffix(scope_keys, "_trend_past"):
+            return (
+                "- This task asks for the trend of the observed input window itself, not a forecast of what happens next.\n"
+                "- If text context is useful, use it only to interpret the observed past pattern, not as a future signal.\n"
+            )
+        if task_type == "indicator" and cls._scope_keys_match_suffix(scope_keys, "_indicator_macd"):
+            return (
+                "- The target object is the future MACD sequence, not the raw future price series.\n"
+                "- Intermediate reasoning may use price behavior, but the final task answer must be MACD values for the required horizon.\n"
+            )
+        if task_type == "indicator" and cls._scope_keys_match_suffix(scope_keys, "_indicator_upper_bb"):
+            return (
+                "- The target object is the future upper Bollinger Band sequence, not the raw future price series and not another indicator.\n"
+                "- Intermediate reasoning may use price behavior or volatility, but the final task answer must be upper Bollinger Band values for the required horizon.\n"
             )
         return ""
 

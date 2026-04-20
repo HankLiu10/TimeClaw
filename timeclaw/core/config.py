@@ -29,6 +29,13 @@ class LLMConfig(BaseModel):
     allow_fallback: bool = False
     max_retries: int = 3
     timeout: float = 180.0
+    # New definition:
+    # - ``first_token_timeout`` is the maximum wait for the first streamed chunk,
+    #   and thereafter the maximum idle gap between streamed chunks, on the native
+    #   OpenAI-compatible SSE path.
+    # - It does not replace ``timeout``; ``timeout`` remains the total request
+    #   timeout budget.
+    first_token_timeout: float | None = None
     temperature: float = 0.1
     max_tokens: int = 4096
     api_base: str | None = "https://asure-test-openai-004.openai.azure.com/"
@@ -44,7 +51,6 @@ class LLMConfig(BaseModel):
     # - Default is ``medium`` for main planning / execution / synthesis calls.
     # - Lightweight extraction / summarization helpers may explicitly override this per call to ``none``.
     reasoning_effort: str | None = "medium"
-
 
 class ReasoningConfig(BaseModel):
     """Three-layer reasoning engine parameters."""

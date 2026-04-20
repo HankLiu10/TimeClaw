@@ -8,6 +8,7 @@ from loguru import logger
 
 from timeclaw.core.config import TimeClawConfig
 from timeclaw.core.candidate_labels import canonical_candidate_label, strip_branch_prefix
+from timeclaw.core.learning_text import sanitize_learning_evidence_text
 from timeclaw.llm.router import ModelRouter
 
 _analysis_llm = None
@@ -62,6 +63,8 @@ Rules:
 - Do not use labels like "candidate A", "candidate B", "winner", or "runner-up" in the returned bullets.
 - In reusable_rule, write exactly one bullet that starts with "When".
 - Keep each bullet short and factual.
+- When the prompt provides a Task Semantic Focus section, use it to state the real judgment/comparison target for this sample before turning that into tool advice.
+- For tasks whose meaning is easy to confuse, make `sample_conditions` or `reusable_rule` explicitly mention what must be compared or judged, not just which path looked stronger.
 - If no clear failure signal exists, return an empty list for failure_signals.
 - For candidate_evidence, return a list of objects with keys:
   - path: exact tested path label from the Candidates block when possible
@@ -82,6 +85,73 @@ Rules:
 
 Return ONLY JSON with keys:
 text_signals, sample_conditions, winner_evidence, failure_signals, reusable_rule, candidate_evidence"""
+
+
+def _scope_keys_match_suffix(scope_keys: list[str] | None, suffix: str) -> bool:
+    suffix_text = str(suffix or "").strip()
+    if not suffix_text:
+        return False
+    return any(
+        str(scope).strip().endswith(suffix_text)
+        for scope in (scope_keys or [])
+        if str(scope).strip()
+    )
+
+
+def _learning_analysis_task_semantic_focus(
+    *,
+    task_type: str,
+    scope_keys: list[str] | None = None,
+) -> str:
+    lines: list[str] = []
+    if _scope_keys_match_suffix(scope_keys, "_correlation"):
+        lines.extend(
+            [
+                "- Judge the relationship between the target asset's text signal and the target asset's post-publication response window.",
+                "- Do not treat competitor, sector, or macro commentary as the target signal unless the text clearly ties it to the target asset.",
+            ]
+        )
+    elif (
+        task_type == "classification"
+        and any(str(scope).strip().startswith("finance_aligned_") for scope in (scope_keys or []))
+        and _scope_keys_match_suffix(scope_keys, "_trend")
+    ):
+        lines.extend(
+            [
+                "- The real target is the future return bucket for the prediction window, not the historical regime label.",
+                "- Explain the future-window direction first, then the magnitude bucket that follows from it.",
+            ]
+        )
+    elif (
+        task_type == "classification"
+        and _scope_keys_match_suffix(scope_keys, "_trend")
+        and not _scope_keys_match_suffix(scope_keys, "_trend_past")
+    ):
+        lines.extend(
+            [
+                "- The real target is the future-window trend relative to the required observed reference window, not the full-history slope.",
+                "- If the task defines a specific comparison such as future mean versus recent mean, name that comparison explicitly.",
+            ]
+        )
+    elif _scope_keys_match_suffix(scope_keys, "_trend_past"):
+        lines.extend(
+            [
+                "- The real target is the trend of the observed input window itself, not a future forecast.",
+            ]
+        )
+    elif task_type == "indicator" and _scope_keys_match_suffix(scope_keys, "_indicator_macd"):
+        lines.extend(
+            [
+                "- The target object is the future MACD sequence, not the raw price forecast.",
+            ]
+        )
+    elif task_type == "indicator" and _scope_keys_match_suffix(scope_keys, "_indicator_upper_bb"):
+        lines.extend(
+            [
+                "- The target object is the future upper Bollinger Band sequence, not the raw price forecast.",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _get_analysis_llm():
@@ -196,11 +266,33 @@ def _candidate_alias_map(candidate_traces: list[dict[str, Any]]) -> dict[str, st
 
 
 def _sanitize_analysis_item(text: Any, alias_map: dict[str, str]) -> str:
-    # Temporary probe mode:
-    # keep the analysis text as close as possible to the raw LLM output so we
-    # can inspect whether later post-processing, rather than the analysis LLM
-    # itself, is responsible for malformed note wording.
-    return _short_text(text, 500).strip()
+    cleaned = _short_text(text, 500).strip()
+    if not cleaned:
+        return ""
+
+    for raw_alias, canonical in sorted(
+        alias_map.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        alias = str(raw_alias).strip()
+        canonical_name = str(canonical).strip()
+        if not alias or not canonical_name:
+            continue
+        cleaned = re.sub(re.escape(alias), canonical_name, cleaned, flags=re.IGNORECASE)
+
+    cleaned = sanitize_learning_evidence_text(cleaned)
+    cleaned = re.sub(
+        r"(?i)^the real tool output for (?:this )?branch was\s+",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"(?i)\b([a-z][a-z0-9_]+)\s+using\s+\1\b",
+        r"\1",
+        cleaned,
+    )
+    return cleaned.strip()
 
 
 def _normalize_candidate_evidence(
@@ -244,15 +336,26 @@ def _normalize_candidate_evidence(
 
         cleaned_evidence: list[str] = []
         seen_evidence: set[str] = set()
+        raw_cleaned_evidence: list[str] = []
         for evidence in evidence_items:
-            cleaned = _short_text(evidence, 500).strip()
+            cleaned = _sanitize_analysis_item(evidence, alias_map)
             if not cleaned:
                 continue
+            raw_cleaned_evidence.append(cleaned)
             lowered = cleaned.lower()
             if lowered in seen_evidence:
                 continue
             seen_evidence.add(lowered)
             cleaned_evidence.append(cleaned)
+
+        if len(raw_cleaned_evidence) > 1:
+            cleaned_evidence = [
+                item for item in cleaned_evidence
+                if not re.match(
+                    r"(?i)^(?:the\s+)?(?:option|answer|label|prediction|forecast|result)\b",
+                    item,
+                )
+            ] or cleaned_evidence
 
         if not cleaned_evidence:
             continue
@@ -547,19 +650,30 @@ async def generate_learning_analysis(
         scope = str(raw_scope).strip()
         if scope and scope not in normalized_scope_keys:
             normalized_scope_keys.append(scope)
-    user_prompt = (
+    semantic_focus = _learning_analysis_task_semantic_focus(
+        task_type=task_type,
+        scope_keys=normalized_scope_keys or ([scope_key] if scope_key else []),
+    )
+    user_prompt_parts = [
         f"Scope targets: {_short_text(normalized_scope_keys or ['(unknown)'], 2000)}\n"
         f"Task type: {task_type}\n"
-        f"Domain: {domain}\n\n"
-        f"Task description:\n{_short_text(task_description, 12000)}\n\n"
-        f"Text/Context Source for text_signals ONLY:\n{_short_text(text_context or '(none)', 12000)}\n\n"
-        f"Sample fingerprint:\n{_short_text(sample_fingerprint, 2000)}\n\n"
-        f"Candidates:\n{_candidate_prompt_block(candidate_traces)}\n\n"
-        f"Final accepted winner:\n{_candidate_prompt_block([selected_winner_trace] if selected_winner_trace else [])}\n\n"
-        f"Best evaluated metrics (may belong to a non-winning compared candidate):\n{_short_text(best_metrics, 800)}\n\n"
-        f"Winner correctness:\n{winner_correct if winner_correct is not None else 'unknown'}\n\n"
-        f"Fallback summary:\n{_short_text(fallback_summary, 3000)}"
+        f"Domain: {domain}\n\n",
+        f"Task description:\n{_short_text(task_description, 12000)}\n\n",
+    ]
+    if semantic_focus:
+        user_prompt_parts.append(f"Task Semantic Focus:\n{semantic_focus}\n\n")
+    user_prompt_parts.extend(
+        [
+            f"Text/Context Source for text_signals ONLY:\n{_short_text(text_context or '(none)', 12000)}\n\n",
+            f"Sample fingerprint:\n{_short_text(sample_fingerprint, 2000)}\n\n",
+            f"Candidates:\n{_candidate_prompt_block(candidate_traces)}\n\n",
+            f"Final accepted winner:\n{_candidate_prompt_block([selected_winner_trace] if selected_winner_trace else [])}\n\n",
+            f"Best evaluated metrics (may belong to a non-winning compared candidate):\n{_short_text(best_metrics, 800)}\n\n",
+            f"Winner correctness:\n{winner_correct if winner_correct is not None else 'unknown'}\n\n",
+            f"Fallback summary:\n{_short_text(fallback_summary, 3000)}",
+        ]
     )
+    user_prompt = "".join(user_prompt_parts)
     try:
         resp = await llm.complete(
             [

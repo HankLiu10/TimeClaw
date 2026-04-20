@@ -58,12 +58,25 @@ class TimesFMAdapter(SBMBase):
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        backend = "gpu" if str(device).startswith("cuda") and torch.cuda.is_available() else "cpu"
-        logger.info(f"Loading TimesFM 2.0 from {model_path} on {device} (backend={backend})")
+        use_gpu = str(device).startswith("cuda") and torch.cuda.is_available()
+        init_backend = "cpu"
+        runtime_backend = "gpu" if use_gpu else "cpu"
+        logger.info(
+            "Loading TimesFM 2.0 from "
+            f"{model_path} on {device} "
+            f"(init_backend={init_backend}, runtime_backend={runtime_backend})"
+        )
 
         model = timesfm.TimesFm(
             hparams=timesfm.TimesFmHparams(
-                backend=backend,
+                # Real cause:
+                # the official torch TimesFM implementation hard-codes `cuda:0`
+                # inside `__post_init__()` whenever `backend='gpu'`, and its
+                # constructor immediately loads weights onto that device. If we
+                # initialize directly with GPU backend and then move the model,
+                # the process touches both cuda:0 and the target GPU. Load on
+                # CPU first, then move exactly once to the configured device.
+                backend=init_backend,
                 context_len=self.config.context_length,
                 horizon_len=self.config.prediction_length,
                 per_core_batch_size=max(1, int(self.config.batch_size)),
@@ -78,6 +91,7 @@ class TimesFMAdapter(SBMBase):
         if model._device != target_device:
             model._model.to(target_device)
             model._device = target_device
+        model.backend = runtime_backend
 
         self._model = model
         self._device = target_device

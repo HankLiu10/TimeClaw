@@ -1,0 +1,415 @@
+% TimeClaw — NeurIPS 2026 Draft (Introduction + Related Work + Problem Definition + Methodology)
+% Generated: 2026-04-20
+%
+% NOTE: This file contains ONLY the body content (\section onwards).
+%       Paste into your existing Overleaf project after \begin{document} / \maketitle / \begin{abstract}...\end{abstract}.
+%       All packages, theorem environments, and custom commands are assumed from your existing preamble.
+
+
+%% ========================================================================
+%%  SECTION 1 — INTRODUCTION
+%% ========================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Large language model (LLM) agents are evolving from one-shot assistants into persistent systems that interact with tools, maintain external state, and support increasingly complex workflows. This trend is especially promising for scientific domains such as time-series analysis, where solving a task often requires combining statistical computation, contextual reasoning, and structured decision making. Recent work has made substantial progress on time-series benchmarks and tool-augmented time-series agents~\cite{mtbench,temporalbench,timeart,tsagent,tssci}. However, most existing time-series agent systems still focus primarily on \emph{execution-time capability}: they improve how an agent solves the current task, but only partially address how experience from exploratory execution should be accumulated and reused across future tasks.
+
+This limitation is particularly important for numeric and verifiable time-series tasks. In forecasting, indicator prediction, and related settings, multiple execution paths may all produce task-valid answers, yet differ substantially in quantitative quality under metrics such as MAE or RMSE. In such cases, binary notions of success are insufficient for learning. Most existing agentic systems evaluate execution outcomes through completion-only supervision---a binary signal indicating whether the task was solved---but this collapses quantitatively unequal paths into the same label. The question is not merely whether an agent can complete a task, but whether it can identify, preserve, and reuse \emph{better execution paths}. Note that this challenge is specific to the agentic setting: deep learning models can directly optimize a loss function via gradient descent, but agents cannot backpropagate through their execution paths. This suggests that agent learning in time-series domains should move beyond completion-only supervision toward \textbf{path-quality-aware learning}, where the learning signal reflects quantitative differences between valid candidate paths~\cite{timeart,tsagent,tssci,castr1}.
+
+A second challenge is that exploratory learning itself is unstable. During training, an agent often prematurely develops a strong bias toward a small set of familiar tools that frequently succeed early, then overcommits to them and suppresses further exploration. We refer to this failure mode as \textbf{tool-prior collapse}: the premature concentration of tool usage on a narrow subset before sufficient comparative evidence has been gathered. Once this happens, candidate diversity shrinks, comparative supervision weakens, and external distillation becomes less informative. It is important to distinguish this from inference-time tool preference: after learning, an agent may reasonably favor certain tools based on accumulated evidence---that is a consequence of learning, not a failure. Tool-prior collapse is specifically an exploration-phase pathology, where entropy in the tool-usage distribution decreases before the agent has explored broadly enough to justify convergence.
+
+In this paper, we propose \textbf{TimeClaw}, an external learning framework for time-series agents. Rather than treating each task instance as an isolated execution problem, TimeClaw turns exploration-time execution into a reusable source of scientific experience. Its core design is an external learning loop: the agent explores multiple candidate execution paths, compares them under task-valid supervision, distills the resulting experience into editable external artifacts, and reinjects those artifacts into future problem solving. In this way, execution becomes not only an evaluation target, but also a metric-supervised learning process. Crucially, TimeClaw separates learning from inference: learning happens during a dedicated exploration phase, while downstream inference reuses distilled artifacts without further online adaptation.
+
+We use the term \textbf{external learning} to describe this paradigm. In external learning, the learning process occurs in a dedicated exploration phase; the results are deposited into external artifacts (structured memory, tool guidance, reusable skills) rather than model parameters; and inference reuses these artifacts via prompt injection without further learning. This distinguishes external learning from several superficially related paradigms. \textbf{In-context learning (ICL)} also injects information through the context window at inference time, but ICL directly uses whatever examples are provided---it has no active learning process that generates the injected content. TimeClaw shares the injection mechanism with ICL but adds an active explore-compare-distill loop that produces the artifacts. \textbf{Meta-learning} typically learns a parameter initialization or learning rule that enables fast adaptation to new tasks; TimeClaw does not modify model parameters. \textbf{Continual learning} updates model parameters on a stream of new data while mitigating catastrophic forgetting; TimeClaw stores all learning outcomes externally. \textbf{Retrieval-augmented generation (RAG)} retrieves from a pre-existing knowledge base to augment generation; TimeClaw's external artifacts are not pre-existing but are actively constructed through exploratory execution and comparative learning.
+
+TimeClaw is built around three key ideas. First, we introduce \textbf{metric-supervised path learning} for numeric and verifiable time-series tasks, enabling the agent to learn not only whether a task is solvable, but which candidate path achieves better quantitative outcomes. Second, to mitigate tool-prior collapse, we propose a \textbf{forced exploration protocol} with \textbf{scope-aware tool dropout}, which improves exploratory tool learning by reducing overreliance on dominant tools and increasing candidate-path diversity. Third, we externalize learning through a hierarchical artifact stack that stores reusable experience outside model weights, including path-level lessons, tool guidance, and higher-level reusable skills. In this sense, TimeClaw intersects with tool learning, but goes beyond tool-use correctness by learning from comparative path quality and reusing distilled experience across tasks~\cite{toolformer,gorilla,toolllm,memskill,asda,skillsd}. % [Add experimental teaser sentence once results are fixed.]
+
+More broadly, TimeClaw can be viewed as a scientific-domain instantiation of the broader move from stateless tool use toward persistent, learning-enabled agent systems. Unlike open-world agent runtimes that emphasize continuous operation, personalization, or computer-use autonomy, TimeClaw specializes this broader systems philosophy to a verifiable scientific setting, where experience accumulation is comparable, verifiable, and reusable. This positioning allows us to study not only whether a time-series agent can solve benchmark tasks, but whether it can \emph{learn from exploratory execution in a measurable and interpretable way}~\cite{openclawrl,cuaskill,clawkeeper}.
+
+Our contributions are summarized as follows:
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+    \item We formulate external learning for time-series agents, and instantiate it in TimeClaw as a learning architecture that separates exploration-time experience acquisition from inference-time reuse.
+    \item We identify path-quality supervision as a more suitable learning signal than completion-only supervision for numeric and verifiable time-series tasks, and operationalize this insight through metric-supervised path learning.
+    \item We identify tool-prior collapse---the premature concentration on familiar tools during exploration before sufficient comparative evidence is gathered---as a major obstacle to exploratory tool learning and propose forced exploration with scope-aware tool dropout to improve candidate-path diversity and supervision quality.
+    \item We build a dedicated exploratory learning setup for time-series agents and show that distilled external artifacts improve downstream reasoning without parameter updates or online adaptation.
+\end{enumerate}
+
+% ── Table 1 ───────────────────────────────────────────────────────────────
+\begin{table}[t]
+\centering
+\caption{Positioning TimeClaw against representative neighboring lines of work. TimeClaw is distinguished not by having more components, but by jointly combining exploration-time learning, external artifact distillation, path-level comparative learning, and cross-task reuse in a time-series agent setting. {\footnotesize $\checkmark$ = core design target; $\triangle$ = partially addressed but not the main methodological focus.}}
+\label{tab:positioning}
+\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Work}
+  & \rotatebox{55}{\textbf{Tool-Aug. Exec.}}
+  & \rotatebox{55}{\textbf{Exploration-Time Learn.}}
+  & \rotatebox{55}{\textbf{External Artifact Learn.}}
+  & \rotatebox{55}{\textbf{Path-Level Comp. Learn.}}
+  & \rotatebox{55}{\textbf{Cross-Task Reuse}} \\
+\midrule
+TimeART                     & $\checkmark$ &              & $\triangle$  &              &              \\
+TS-Agent                    & $\checkmark$ &              &              &              &              \\
+TimeSeriesScientist         & $\checkmark$ &              &              &              &              \\
+Cast-R1                     & $\checkmark$ & $\triangle$  & $\triangle$  & $\triangle$  & $\triangle$  \\
+MemSkill / ASDA / Skill-SD  & $\triangle$  &              & $\checkmark$ &              & $\checkmark$ \\
+OpenClaw-style runtimes     & $\checkmark$ &              & $\checkmark$ &              & $\checkmark$ \\
+\midrule
+\textbf{TimeClaw}           & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ & $\checkmark$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+%% ========================================================================
+%%  SECTION 2 — RELATED WORK
+%% ========================================================================
+\section{Related Work}
+\label{sec:related}
+
+Recent work related to TimeClaw spans three closely connected directions: time-series agent systems, agent learning through tools and external artifacts, and persistent open agent runtimes.
+
+\paragraph{Time-series agent systems.}
+Recent work has substantially strengthened time-series agents through tool use, iterative reasoning, forecasting workflow orchestration, and multi-agent collaboration. TimeART~\cite{timeart} teaches a time-series reasoning model to use tools through expert trajectories; TimeClaw teaches an executing agent to learn from comparative tool-use outcomes and externalize the result into reusable artifacts. TS-Agent~\cite{tsagent} emphasizes grounded reasoning over raw numeric sequences through iterative evidence gathering, while TimeSeriesScientist~\cite{tssci} and other forecasting-oriented frameworks focus on automating forecasting pipelines and improving end-to-end workflow quality. In parallel, systems such as TS-Debate~\cite{tsdebate} and MAS4TS~\cite{mas4ts} improve performance through debate, modality specialization, or multi-agent decomposition within a single task instance. Cast-R1~\cite{castr1} brings learning-based tool use closer to time-series forecasting by formulating forecasting as sequential decision making with reflective tool use. These approaches primarily optimize execution-time capability. TimeClaw differs in objective: it treats exploratory execution itself as a reusable learning signal, and asks how experience from exploration should be accumulated, distilled, and reused across future tasks.
+
+\paragraph{Tool learning, external memory, and skill distillation.}
+Beyond the time-series domain, recent work has increasingly treated tool use, external memory, and skill artifacts as explicit learning media for agents. Toolformer~\cite{toolformer}, Gorilla~\cite{gorilla}, and ToolLLM~\cite{toolllm} study how models can invoke external tools more effectively, but mainly focus on tool-use competence and API grounding. A complementary line of work studies persistent learning through external artifacts. MemSkill~\cite{memskill} explores evolving memory skills; ASDA~\cite{asda} distills structured skill files that can be injected at inference time; Skill-SD~\cite{skillsd} shows how multi-turn trajectories can be compressed into reusable guidance. TimeClaw is complementary to these directions: it is not the first work on tool learning or external artifact learning in general, but it is among the first to combine them into an external learning process for time-series agents, where candidate execution paths are explicitly compared under metric supervision, distilled into structured artifacts, and reused at inference time without online adaptation.
+
+\paragraph{Persistent open agent runtimes.}
+At the systems level, 2026 has also seen the rapid rise of persistent open agent runtimes, exemplified by OpenClaw-style ecosystems~\cite{openclawrl,cuaskill,clawkeeper,clawsafety,safeclawr} and related work on online training, skill development, runtime governance, and safety. These systems are characterized by long-lived state, reusable skills, plugins, and runtime control layers, but are typically designed for open-world automation rather than verifiable scientific reasoning. TimeClaw shares the broader systems philosophy of persistence and reusable external intelligence, but specializes it to a verifiable scientific setting, where persistence serves experience accumulation grounded in task metrics rather than open-world autonomy.
+
+Finally, TimeClaw is built on benchmark substrates such as MTBench~\cite{mtbench} and TemporalBench~\cite{temporalbench}, but does not aim to contribute another evaluation benchmark. Instead, it asks how execution on such benchmarks should be turned into a reusable learning process. Its novelty lies in combining tool-augmented execution, path-level comparative learning, external artifact distillation, and cross-task reuse into a single external learning framework for time-series agents.
+
+
+%% ========================================================================
+%%  SECTION 3 — PROBLEM DEFINITION
+%% ========================================================================
+\section{Problem Definition}
+\label{sec:problem}
+
+We study \textbf{external learning} for time-series agents. Each task instance is written as
+\begin{equation}
+x = (z,\, c,\, \tau,\, s),
+\end{equation}
+where $z$ denotes the time-series input, $c$ denotes optional multimodal context such as text, $\tau$ is the task type, and $s$ is the scope under which reusable experience is stored. Rather than committing to a single execution chain, the agent may explore a set of candidate paths
+\begin{equation}
+\Pi(x) = \{\pi_1,\ldots,\pi_K\},
+\end{equation}
+where each path $\pi_k$ is a structured trajectory of tool selections, intermediate observations, and a final task output. Let
+\begin{equation}
+\hat{y}_k = \mathrm{Exec}(x,\pi_k)
+\end{equation}
+denote the output produced by path $\pi_k$. A path is \textbf{task-valid} if $\hat{y}_k$ satisfies the output contract of task $\tau$, \eg a forecast array for forecasting, a structured JSON object for indicator prediction, or a legal label for trend and correlation tasks.
+
+The key methodological issue is that, for numeric and verifiable time-series tasks, multiple paths may all be task-valid while still differing substantially in quality. We therefore distinguish \emph{completion} from \emph{path quality}. Given task-valid supervision, the quality of a candidate path is written as
+\begin{equation}
+q(\pi_k;\, x) = -\mathcal{L}_{\tau}(\hat{y}_k,\, y^\star),
+\end{equation}
+where $y^\star$ is the task target and $\mathcal{L}_{\tau}$ is task-dependent, \eg MAE or RMSE for continuous outputs and a correctness-based loss for discrete outputs. The preferred path is then
+\begin{equation}
+\pi^\star(x) = \argmax_{\pi_k \in \Pi_{\mathrm{valid}}(x)} q(\pi_k;\, x),
+\end{equation}
+where $\Pi_{\mathrm{valid}}(x)\subseteq \Pi(x)$ is the set of task-valid candidates. If no candidate is validated, the learning episode records failure evidence rather than forcing an artificial winner.
+
+This formalization clarifies why completion-only supervision is insufficient. If two paths $\pi_a$ and $\pi_b$ both yield task-valid outputs, then a binary success signal maps both to the same supervision value even when
+\begin{equation}
+\mathcal{L}_{\tau}(\hat{y}_a,\, y^\star) \neq \mathcal{L}_{\tau}(\hat{y}_b,\, y^\star).
+\end{equation}
+Thus, completion-only supervision cannot distinguish paths that are all executable but quantitatively unequal. This limitation is specific to the agentic setting. Deep learning models can directly optimize a differentiable loss function via gradient descent, so the distinction between ``task completed'' and ``task completed well'' is naturally captured by the loss landscape. Agents, however, cannot backpropagate through their execution paths---tool calls, branching decisions, and intermediate observations form a non-differentiable trajectory. The only way for an agent to learn which path is better is through explicit comparison of execution outcomes. TimeClaw therefore learns from \textbf{path-quality supervision}, not only from completion.
+
+This is not a standalone theory claim; it is a methodological justification for the learning signal. For metric-evaluable tasks, any learning rule that aims to preserve stronger future execution must distinguish between valid-but-unequal paths rather than collapsing them into the same binary success label.
+
+TimeClaw separates the agent lifecycle into two phases. In the \textbf{exploration phase}, the agent generates and compares candidate execution paths under task-valid supervision. In the \textbf{inference phase}, the agent does not learn online; instead, it reuses distilled external artifacts accumulated during exploration. This separation keeps the learning process auditable, reusable, and grounded in verifiable task metrics.
+
+\begin{remark}[Relation to existing learning paradigms]
+\label{rem:paradigms}
+TimeClaw's external learning shares the context-injection mechanism with in-context learning (ICL), but differs in that ICL directly uses whatever examples are provided at inference time without an active learning process, whereas TimeClaw generates its injected artifacts through a dedicated explore-compare-distill loop. External learning also differs from meta-learning, which typically learns parameter initializations or learning rules for fast adaptation; from continual learning, which updates model parameters on streaming data while mitigating forgetting; and from retrieval-augmented generation (RAG), which retrieves from a pre-existing knowledge base. In TimeClaw, the external artifacts are not pre-existing but are actively constructed through exploratory execution and comparative learning, and no model parameters are modified.
+\end{remark}
+
+
+%% ========================================================================
+%%  SECTION 4 — METHODOLOGY
+%% ========================================================================
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Data Protocol}
+\label{sec:data}
+
+TimeClaw adopts a two-corpus protocol. For learning, we construct an \textbf{independent MTBench-compatible corpus} whose task contracts, schemas, and scope structure are aligned with MTBench, but whose samples are disjoint from the official benchmark. This corpus is used only for exploration-time experience acquisition. For evaluation, all reported experiments use a \textbf{TimeART-aligned subset of MTBench}. The role of the independent corpus is to expose whether the agent can acquire reusable execution knowledge; the role of the MTBench subset is to provide a stable and directly comparable evaluation target.
+
+This protocol is preferable to simply splitting MTBench into train and test subsets. A benchmark split is sufficient for measuring temporal generalization, but it is less well suited for isolating whether exploratory agent learning transfers beyond the benchmark samples themselves. By learning on an aligned but disjoint corpus and evaluating on the same MTBench subset used by TimeART, TimeClaw centers the methodology on reusable learning while preserving direct head-to-head comparability. Legacy benchmark-split utilities may still be used for ablations, but they are not the primary protocol of this paper.
+
+\subsection{TimeClaw Learning Framework}
+\label{sec:framework}
+
+TimeClaw instantiates external learning as a four-stage loop:
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+    \item \textbf{Explore}: generate multiple candidate execution paths for the same task.
+    \item \textbf{Compare}: evaluate task-valid candidates under metric-supervised comparison.
+    \item \textbf{Distill}: compress path-level evidence into reusable external artifacts.
+    \item \textbf{Reinject}: reuse the distilled artifacts during later inference without online adaptation.
+\end{enumerate}
+
+This \emph{Explore\,$\to$\,Compare\,$\to$\,Distill\,$\to$\,Reinject} loop is the main methodological object of the paper. Prior time-series agent systems mainly strengthen execution-time capability within a task instance. TimeClaw instead treats execution itself as a reusable learning signal. The key transition is from candidate-path exploration to artifact update. For a single training instance $x$, TimeClaw first constructs a sample-level learning record
+\begin{equation}
+n_x = \mathrm{Summarize}\!\bigl(x,\,\Pi(x),\, \{q(\pi_k;x)\}_{k=1}^{K},\, \pi^\star(x)\bigr),
+\end{equation}
+which captures the strongest validated path, decisive evidence, and failure signals from weaker paths. However, the stored learning signal is not the raw reflective text emitted by the agent. TimeClaw further rewrites the candidate-level comparison into reusable execution evidence:
+\begin{equation}
+e_x = \mathrm{Clean}(n_x),
+\end{equation}
+where $\mathrm{Clean}(\cdot)$ removes task-answer leakage, framework-control language, and orchestration-specific wording that would not transfer to future tasks. The cleaned evidence is then used to update the external artifact state associated with scope $s$:
+\begin{equation}
+\mathcal{A}_{s}^{(m+1)} = \mathrm{Distill}\!\bigl(\mathcal{A}_{s}^{(m)},\, e_x\bigr),
+\end{equation}
+where $\mathcal{A}_{s}$ denotes the current external state for that scope. The update target is not a model parameter vector but a structured artifact state containing notes, reusable rules, tool guidance, and operational procedures. This is precisely why TimeClaw is an \textbf{external learning} framework rather than an online parameter-learning runtime.
+
+We summarize the full learning and inference protocol in \algoref{alg:learn} and \algoref{alg:infer}.
+
+% ── Algorithm 1 ───────────────────────────────────────────────────────────
+\begin{algorithm2e}[t]
+\caption{TimeClaw External Learning Loop}
+\label{alg:learn}
+\KwIn{Training corpus $\mathcal{D}=\{x_1,\dots,x_N\}$; initial artifact state $\mathcal{A}_s^{0}$ for each scope $s$; task-valid supervision oracle $\mathcal{L}_\tau$}
+\KwOut{Learned artifact states $\{\mathcal{A}_s\}$ for all scopes}
+\ForEach{training instance $x=(z,c,\tau,s)\in\mathcal{D}$}{
+    Retrieve current artifact state $\mathcal{A}_s$\;
+    Run executor in training mode with exploration-enabled tools\;
+    Generate $K\!\ge\!2$ candidate paths $\Pi(x)=\{\pi_1,\dots,\pi_K\}$\;
+    Filter to task-valid subset: $\Pi_{\mathrm{valid}}(x)\!\leftarrow\!\{\pi_k : \hat{y}_k \text{ satisfies contract of } \tau\}$\;
+    \uIf{$|\Pi_{\mathrm{valid}}(x)|\ge 2$}{
+        Compute path quality: $q(\pi_k;x)=-\mathcal{L}_\tau(\hat{y}_k,y^\star)$ for each $\pi_k\!\in\!\Pi_{\mathrm{valid}}(x)$\;
+        Select preferred path: $\pi^\star(x)=\argmax q(\pi_k;x)$\;
+    }
+    \uElseIf{$|\Pi_{\mathrm{valid}}(x)|= 1$}{
+        Record single-path evidence (no comparative signal)\;
+    }
+    \Else{
+        Record failure evidence; skip distillation for this instance\;
+        \textbf{continue}\;
+    }
+    Construct sample-level learning record: $n_x=\mathrm{Summarize}(x,\Pi(x),\{q\},\pi^\star)$\;
+    Clean to reusable evidence: $e_x=\mathrm{Clean}(n_x)$\;
+    Update artifact state: $\mathcal{A}_s \leftarrow \mathrm{Distill}(\mathcal{A}_s, e_x)$\;
+}
+\Return{$\{\mathcal{A}_s\}$ for all scopes}
+\end{algorithm2e}
+
+% ── Algorithm 2 ───────────────────────────────────────────────────────────
+\begin{algorithm2e}[t]
+\caption{TimeClaw Inference-Time Reuse}
+\label{alg:infer}
+\KwIn{New task instance $x'=(z',c',\tau',s')$; learned artifact states $\{\mathcal{A}_s\}$; runtime-compatible tool set $\mathcal{T}(x')$}
+\KwOut{Task prediction $\hat{y}$}
+Retrieve learned artifacts for scope $s'$: $\mathcal{R}_{s'}=\mathrm{Retrieve}(\mathcal{A}_{s'})$\;
+Filter to prompt-eligible subset: $\mathcal{R}_{s'}(x')=\{r\in\mathcal{M}_{s'}:\iota(r)\!=\!1,\;\mathrm{Match}(\chi(r),\phi(x'))\!=\!1\}$\;
+Assemble prompt from:
+(i)~official task description for $\tau'$;
+(ii)~task boundary and output contract;
+(iii)~sample fingerprint $\phi(x')$ and profiling signals;
+(iv)~system-level artifacts: \textsc{Soul} + scope-local \textsc{Memory} from $\mathcal{R}_{s'}(x')$;
+(v)~user-side support: tool notes + skills from $\mathcal{A}_{s'}$\;
+Expose only runtime-compatible tools $\mathcal{T}(x')$ (exploration-only tools removed)\;
+Execute agent: $\hat{y}=f_{\mathrm{agent}}(x';\,\mathcal{R}_{s'},\,\mathcal{T}(x'))$\;
+\Return{$\hat{y}$}
+\end{algorithm2e}
+
+\subsection{Exploration-Time Agent Learning}
+\label{sec:exploration}
+
+The exploration phase is implemented through a constrained executor that converts autonomous execution into explicit candidate-path learning. In training mode, the main agent is allowed to access exploration-only orchestration tools, including \texttt{spawn\_subagent} for branch generation and \texttt{evaluate\_*} tools for post-hoc comparison against ground truth. However, this is not unconstrained free-form exploration. TimeClaw enforces a structured training contract:
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+    \item the main agent must produce \textbf{at least two task-valid candidate paths};
+    \item these candidates must arise from genuine branch exploration rather than stylistic paraphrases of the same path;
+    \item when a prior successful path family already exists for the scope, the first exploration round must include both a prior-guided candidate and an alternative candidate;
+    \item candidate comparison must occur before training completion;
+    \item \texttt{evaluate\_*} tools are only meaningful after candidate generation, and \texttt{learning\_summary} is gated on completed comparison;
+    \item the agent may finish only by returning a \texttt{learning\_summary}, not by treating the training run as ordinary inference.
+\end{itemize}
+
+This contract matters because it turns what would otherwise be a loose exploratory run into a controlled learning episode. A trajectory is considered complete only after candidate generation and task-valid comparison are already satisfied. The resulting \texttt{learning\_summary} is not the final task answer. Instead, it records the selected path, the decisive evidence behind that selection, and a concise reusable lesson that can later be distilled into external artifacts.
+
+To keep candidate paths semantically comparable, intermediate tool outputs are also tracked as typed artifacts with coordinate provenance. In practice, this means downstream operations are conditioned on the current artifact space rather than blindly reusing indices from the original series. This constraint is especially important for sliced sequences, derived windows, and forecast artifacts, where the meaning of an index depends on the transformation history.
+
+\paragraph{Fallback behavior.} When the executor cannot produce the minimum required number of task-valid candidates ($\mathrm{MIN\_TRAINING\_CANDIDATES}=2$), the system does not discard the episode entirely. If exactly one valid candidate exists, the episode records single-path evidence without comparative signal. If no valid candidate exists, the episode records failure evidence (\eg which tools were attempted, what went wrong) that can still inform future tool guidance. This fallback ensures that even unsuccessful exploration contributes to the learning process, albeit with weaker signal.
+
+The importance of this protocol is methodological rather than procedural: it ensures that the learned signal is grounded in explicit path competition rather than in post-hoc rationalization of a single execution.
+
+\subsection{Tool-Prior Collapse and Scope-Aware Tool Dropout}
+\label{sec:dropout}
+
+A major obstacle to exploratory tool learning is that the agent prematurely develops strong preferences for a small subset of familiar tools. We refer to this phenomenon as \textbf{tool-prior collapse}: during exploration, historically frequent or often-successful tools can dominate future branch generation before sufficient comparative evidence has been gathered, reducing path diversity and weakening subsequent comparison and distillation.
+
+It is important to distinguish tool-prior collapse from inference-time tool preference. After learning, an agent may reasonably favor certain tools based on accumulated evidence---that is a consequence of learning, not a failure. Tool-prior collapse is specifically an exploration-phase pathology: the goal of exploration is broad tool coverage and diverse candidate generation, so entropy decrease in the tool-usage distribution during this phase signals premature convergence rather than informed narrowing.
+
+Let $n_i(s)$ denote the historical usage count of tool $i$ under scope $s$, and let $p_i(s)$ be the normalized usage distribution over competing tools in that scope:
+\begin{equation}
+p_i(s)=\frac{n_i(s)}{\sum_j n_j(s)}.
+\end{equation}
+Then one operational signature of collapse is decreasing tool-support diversity, which can be tracked by the scope-level entropy
+\begin{equation}
+\mathcal{H}(s) = - \sum_i p_i(s)\log p_i(s).
+\end{equation}
+When a small number of tools dominate, $\mathcal{H}(s)$ decreases and the explored candidate set becomes structurally narrower. In that regime, path comparison becomes less informative because multiple branches differ only superficially while relying on the same dominant tool family.
+
+TimeClaw mitigates this problem with \textbf{scope-aware tool dropout}. The mechanism operates during \emph{training-time sub-agent tool exposure}. For each scope, the system tracks historical tool usage and computes a keep probability for each candidate tool relative to the competing tools in that scope. Frequently used tools receive a lower keep probability, while underused tools remain more visible. Task-critical tools and explicitly hinted tools are protected through a \texttt{never\_drop} rule. The purpose is not regularization for its own sake, but to preserve branch diversity so that the agent can continue to generate meaningfully different candidate paths rather than repeatedly collapsing onto the same familiar execution pattern.
+
+\paragraph{Theoretical motivation.} The keep probability is designed as a frequency-aware rule anchored at the least-explored tool. For each non-protected tool $i$ in scope $s$, we compute its relative over-exploration ratio compared to the least-used tool. A tool that has been used $n_i$ times when the least-used tool has been used $n_{\min}$ times has an over-exploration ratio of $(1+n_i)/(1+n_{\min})$. The keep probability is the inverse of this ratio raised to a power $\alpha$, yielding a power-law suppression that is strongest for the most over-explored tools and exactly~1 for the least-explored tools. This ensures that the mechanism never drops under-explored tools---it only suppresses tools that have been used disproportionately more than the cold edge of the scope.
+
+Concretely, for tool $i$ in a candidate pool under scope $s$, the keep probability is
+\begin{equation}
+\label{eq:keep}
+p_{\mathrm{keep}}(i \mid s)=
+\left(\frac{1+n_{\min}(s)}{1+n_i(s)}\right)^{\!\alpha},
+\end{equation}
+where $n_{\min}(s)$ is the minimum usage count among the competing non-protected tools in that scope, and $\alpha > 0$ controls the strength of reweighting. This form has two important properties. First, it is monotone decreasing in $n_i(s)$, so historically dominant tools are more likely to be suppressed. Second, tools at the cold edge of the scope, \ie $n_i(s)=n_{\min}(s)$, receive keep probability~1, so the mechanism explicitly protects under-explored tool families rather than merely injecting uniform randomness. Protected tools bypass dropout altogether:
+\begin{equation}
+p_{\mathrm{keep}}(i \mid s)=1 \quad \text{for } i \in \mathcal{T}_{\mathrm{protected}}(s).
+\end{equation}
+
+\begin{proposition}[Monotonicity]
+\label{prop:mono}
+For non-protected tools $i$ and $j$ in the same scope $s$, if $n_i(s) > n_j(s)$, then
+\begin{equation}
+p_{\mathrm{keep}}(i \mid s) < p_{\mathrm{keep}}(j \mid s)
+\quad \text{for } \alpha > 0.
+\end{equation}
+\end{proposition}
+\begin{proof}
+Since $n_i(s)>n_j(s)\ge n_{\min}(s)$, we have $1+n_i(s)>1+n_j(s)$, hence $\frac{1+n_{\min}(s)}{1+n_i(s)} < \frac{1+n_{\min}(s)}{1+n_j(s)}$. Both ratios lie in $(0,1]$, and raising to a positive power $\alpha$ preserves the strict inequality.
+\end{proof}
+
+The least-used non-protected tools in the scope satisfy $p_{\mathrm{keep}}=1$. This makes scope-aware dropout a targeted anti-collapse mechanism rather than a generic regularizer: it suppresses dominant tools while guaranteeing visibility of under-explored ones.
+
+\subsection{Hierarchical Distillation, Conflict-Aware Memory, and Inference-Time Reuse}
+\label{sec:distillation}
+
+TimeClaw externalizes learning into a hierarchical artifact stack rather than updating model parameters. The stack contains several layers with different semantic roles:
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+    \item \textbf{Soul}: a fixed human-authored identity and behavior layer;
+    \item \textbf{Notes}: sample-level experience records produced from individual exploration runs;
+    \item \textbf{Memory}: scope-local structured reusable rules distilled from repeated notes;
+    \item \textbf{Tools}: tool-specific usage guidance summarized from scope-local learning;
+    \item \textbf{Skills}: scope-local operational procedures or task-solving SOPs;
+    \item \textbf{Cross-domain}: task-bucket abstractions synthesized across multiple scopes.
+\end{itemize}
+
+This hierarchy gives TimeClaw a concrete medium for persistent learning. Notes capture raw experience at sample granularity, but they are not the main runtime memory surface. Instead, they serve as distillation sources from which more stable scope-level artifacts are derived. The key runtime layer is \textsc{Memory}, whose entries are structured reusable rules rather than free-form reflections. A memory rule can be written abstractly as a 9-tuple:
+\begin{equation}
+\label{eq:rule}
+r = (\kappa,\,\sigma,\,\chi,\,\mathcal{T}^{+},\,\mathcal{T}^{-},\,\rho,\,\mathcal{E},\,c,\,\iota),
+\end{equation}
+where $\kappa$ is the rule kind (\eg tool preference, condition-action, avoidance), $\sigma$ is a concise summary, $\chi$ denotes applicability conditions (\eg data characteristics, task subtypes), $\mathcal{T}^{+}$ and $\mathcal{T}^{-}$ are preferred and avoided tool sets, $\rho$ is the rationale, $\mathcal{E}$ is supporting evidence from exploration episodes, $c\in[0,1]$ is confidence, and $\iota\in\{0,1\}$ indicates whether the rule is currently safe to inject into the prompt.
+
+This representation is important because TimeClaw does not update memory by naive append. Given cleaned evidence $e_x$, the scope-local memory state is updated through a conflict-aware operator
+\begin{equation}
+\mathcal{M}_{s}^{(m+1)} = \mathrm{Update}\!\bigl(\mathcal{M}_{s}^{(m)},\, e_x\bigr),
+\end{equation}
+where $\mathrm{Update}$ may append a new rule, merge near-duplicate evidence into an existing rule, strengthen a supported rule, or register a conflict relation between competing rules. When an item is not yet stable enough for prompt-time reuse, it can remain stored but be marked non-injectable through $\iota=0$. This separation between storage and injection is the core mechanism by which TimeClaw preserves long-horizon experience without forcing every intermediate belief into the runtime prompt.
+
+The same logic extends beyond \textsc{Memory}. \textsc{Tools} distills tool-specific usage advice from repeated execution evidence, while \textsc{Skills} compresses stronger scope-local procedures into reusable SOP-like guidance. To preserve learning over time, the system also records historical snapshots of notes, current memory state, tool notes, skill text, and cross-domain abstractions. These snapshots provide a long-term audit trail of how reusable experience evolves rather than reducing learning to the latest prompt state.
+
+During inference, the system reuses these artifacts without online learning. Formally, inference on a new instance $x'$ under scope $s$ is written as
+\begin{equation}
+\hat{y} = f_{\mathrm{agent}}\!\bigl(x';\, \mathrm{Retrieve}(\mathcal{A}_{s}),\, \mathcal{T}(x')\bigr),
+\end{equation}
+where $\mathrm{Retrieve}(\mathcal{A}_{s})$ returns the relevant learned artifacts for the scope and $\mathcal{T}(x')$ is the runtime-compatible visible tool set. In the present implementation, retrieval is filtered by scope, applicability, and injection status. Abstractly, the prompt-eligible memory subset is
+\begin{equation}
+\mathcal{R}_{s}(x')=
+\bigl\{r \in \mathcal{M}_{s} : \iota(r)=1,\; \mathrm{Match}(\chi(r),\, \phi(x'))=1\bigr\},
+\end{equation}
+where $\phi(x')$ denotes the sample fingerprint and profiling view of the current instance. Prompt construction first assembles an official task description, then provides the task boundary and output contract, then injects the sample fingerprint and profiling signals, and finally reinjects the learned artifact layers. In the present implementation, \textsc{Soul} and scope-local \textsc{Memory} are injected at the system level, while tool notes and skills are injected as reusable support guidance; the visible tool catalog is further filtered by modality and runtime compatibility.
+
+The train-test difference is crucial. Training exposes exploration-only tools such as \texttt{spawn\_subagent} and \texttt{evaluate\_*} because the goal is to compare candidate paths. Inference removes these training-only tools and retains only the tools needed to solve the task itself. Thus, the runtime agent is not continuing to learn; it is solving the task under a prompt enriched by previously distilled experience. The \textsc{Cross-domain} layer exists in storage and distillation, but it is not the main runtime injection path in the present implementation. Accordingly, the primary reuse mechanism is best understood as \emph{scope-local artifact reinjection}, not as a fully cross-domain reasoning controller.
+
+
+%% ========================================================================
+%%  BIBLIOGRAPHY
+%% ========================================================================
+% Use your existing .bib file. Below are placeholder entries for reference.
+% Replace with \bibliography{your_bib_file} when ready.
+
+\bibliography{references}
+
+% If you prefer inline entries for now, uncomment below and comment out \bibliography above:
+% \begin{thebibliography}{99}
+%
+% \bibitem{mtbench}
+% MTBench: A Multimodal Time Series Benchmark for Temporal Reasoning and Question Answering.
+% \textit{arXiv:2503.16858}, 2025.
+%
+% \bibitem{temporalbench}
+% TemporalBench: A Benchmark for Evaluating LLM-Based Agents on Contextual and Event-Informed Time Series Tasks.
+% \textit{arXiv:2602.13272}, 2026.
+%
+% \bibitem{timeart}
+% TimeART: Towards Agentic Time Series Reasoning via Tool-Augmentation.
+% \textit{arXiv:2601.13653}, 2026.
+%
+% \bibitem{tsagent}
+% TS-Agent: A Time Series Reasoning Agent with Iterative Statistical Insight Gathering.
+% \textit{arXiv:2510.07432}, 2025.
+%
+% \bibitem{tssci}
+% TimeSeriesScientist: A General-Purpose AI Agent for Time Series Analysis.
+% \textit{arXiv:2510.01538}, 2025.
+%
+% \bibitem{castr1}
+% Cast-R1: Learning Tool-Augmented Sequential Decision Policies for Time Series Forecasting.
+% \textit{arXiv:2602.13802}, 2026.
+%
+% \bibitem{tsdebate}
+% TS-Debate: Multimodal Collaborative Debate for Zero-Shot Time Series Reasoning.
+% \textit{arXiv:2601.19151}, 2026.
+%
+% \bibitem{mas4ts}
+% Visual Reasoning over Time Series via Multi-Agent System.
+% \textit{arXiv:2602.03026}, 2026.
+%
+% \bibitem{toolformer}
+% Toolformer: Language Models Can Teach Themselves to Use Tools.
+% \textit{arXiv:2302.04761}, 2023.
+%
+% \bibitem{gorilla}
+% Gorilla: Large Language Model Connected with Massive APIs.
+% \textit{arXiv:2305.15334}, 2023.
+%
+% \bibitem{toolllm}
+% ToolLLM: Facilitating Large Language Models to Master 16000+ Real-world APIs.
+% \textit{arXiv:2307.16789}, 2023.
+%
+% \bibitem{memskill}
+% MemSkill: Learning and Evolving Memory Skills for Self-Evolving Agents.
+% \textit{arXiv:2602.02474}, 2026.
+%
+% \bibitem{asda}
+% ASDA: Automated Skill Distillation and Adaptation.
+% \textit{arXiv:2603.16112}, 2026.
+%
+% \bibitem{skillsd}
+% Skill-SD: Skill-Conditioned Self-Distillation for Multi-turn LLM Agents.
+% \textit{arXiv:2604.10674}, 2026.
+%
+% \bibitem{openclawrl}
+% OpenClaw-RL: Train Any Agent Simply by Talking.
+% \textit{arXiv:2603.10165}, 2026.
+%
+% \bibitem{cuaskill}
+% CUA-Skill: Develop Skills for Computer Using Agent.
+% \textit{arXiv:2601.21123}, 2026.
+%
+% \bibitem{clawkeeper}
+% ClawKeeper: Comprehensive Safety Protection for OpenClaw Agents Through Skills, Plugins, and Watchers.
+% \textit{arXiv:2603.24414}, 2026.
+%
+% \bibitem{clawsafety}
+% ClawSafety: ``Safe'' LLMs, Unsafe Agents.
+% \textit{arXiv:2604.01438}, 2026.
+%
+% \bibitem{safeclawr}
+% SafeClaw-R: Towards Safe and Secure Multi-Agent Personal Assistants.
+% \textit{arXiv:2603.28807}, 2026.
+%
+% \end{thebibliography}

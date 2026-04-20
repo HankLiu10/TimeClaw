@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -w '\\\\nHTTP: %{http_code} | Time: %{time_total}s' -m 30 https://www.testvideo.site/responses -H 'Authorization: Bearer sk-5875d3fb867628d2fc1fb71bae47c2c3e3386285c3896906388fb646fecaa7e3' -H 'Content-Type: application/json' -d '{\"model\":\"gpt-5.4\",\"input\":\"hi\"}')",
+      "Bash(curl -s -w '\\\\nHTTP: %{http_code} | Time: %{time_total}s' -m 30 https://www.testvideo.site/v1/chat/completions -H 'Authorization: Bearer sk-5875d3fb867628d2fc1fb71bae47c2c3e3386285c3896906388fb646fecaa7e3' -H 'Content-Type: application/json' -d '{\"model\":\"gpt-5.4\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":10}')",
+      "Bash(curl -s -w '\\\\nHTTP: %{http_code} | Time: %{time_total}s' -m 30 https://www.testvideo.site/v1/models -H 'Authorization: Bearer sk-5875d3fb867628d2fc1fb71bae47c2c3e3386285c3896906388fb646fecaa7e3')",
+      "Bash(curl -s -w '\\\\nHTTP: %{http_code} | Time: %{time_total}s' -m 30 https://testvideo.site/responses -H 'Authorization: Bearer sk-5875d3fb867628d2fc1fb71bae47c2c3e3386285c3896906388fb646fecaa7e3' -H 'Content-Type: application/json' -d '{\"model\":\"gpt-5.4\",\"input\":\"hi\"}')",
+      "Bash(curl -s -w '\\\\nHTTP: %{http_code} | Time: %{time_total}s' -m 30 https://testvideo.site/chat/completions -H 'Authorization: Bearer sk-5875d3fb867628d2fc1fb71bae47c2c3e3386285c3896906388fb646fecaa7e3' -H 'Content-Type: application/json' -d '{\"model\":\"gpt-5.4\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":10}')",
+      "Bash(curl -s -w '\\\\nHTTP: %{http_code} | Time: %{time_total}s' -m 15 https://testvideo.site/models -H 'Authorization: Bearer sk-5875d3fb867628d2fc1fb71bae47c2c3e3386285c3896906388fb646fecaa7e3')",
+      "Bash(env)",
+      "Bash(curl -sv -m 15 https://jp.testvideo.site/v1/responses -H 'Authorization: Bearer sk-5875d3fb867628d2fc1fb71bae47c2c3e3386285c3896906388fb646fecaa7e3' -H 'Content-Type: application/json' -d '{\"model\":\"gpt-5.4\",\"input\":\"hi\"}')"
+    ]
+  }
+}

@@ -25,6 +25,7 @@ import numpy as np
 from loguru import logger
 
 from timeclaw.benchmark.dataset_split import load_split
+from timeclaw.benchmark.ground_truth import normalize_numeric_ground_truth
 from timeclaw.benchmark.mtbench_adapter import (
     DATASET_REGISTRY,
     MTBenchSample,
@@ -178,11 +179,7 @@ def _official_error_result(
 
 
 def _is_valid_numeric_ground_truth(value: Any) -> bool:
-    try:
-        arr = np.asarray(value, dtype=np.float64).ravel()
-    except (TypeError, ValueError):
-        return False
-    return arr.size > 0 and bool(np.isfinite(arr).all())
+    return normalize_numeric_ground_truth(value).valid
 
 
 def _trend_3way_accuracy(gt_label: str, pred_label: str) -> float:
@@ -663,7 +660,8 @@ async def _eval_forecast(
 ) -> dict[str, Any]:
     if sample.output_window is None:
         return _official_error_result("no output_window")
-    if not _is_valid_numeric_ground_truth(sample.output_window):
+    normalized_gt = normalize_numeric_ground_truth(sample.output_window)
+    if not normalized_gt.valid:
         return {
             "predicted": None,
             "ground_truth": sample.output_window,
@@ -675,8 +673,9 @@ async def _eval_forecast(
             ),
             "metrics": {"skipped": "invalid_ground_truth"},
         }
+    gt_window = np.asarray(normalized_gt.value, dtype=np.float64).ravel()
 
-    horizon = len(sample.output_window)
+    horizon = len(gt_window)
     text_data = None
     if sample.text:
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
@@ -699,7 +698,7 @@ async def _eval_forecast(
     pred_arr = _extract_forecast_array(prediction)
 
     if pred_arr is not None:
-        metrics = _forecast_metrics(sample.output_window, pred_arr)
+        metrics = _forecast_metrics(gt_window, pred_arr)
         if sample.domain == "weather":
             metrics.pop("mape", None)
         if _pipeline_ref and _record_enabled:
@@ -723,7 +722,7 @@ async def _eval_forecast(
                     scope_keys=scope_keys_for_dataset_task(getattr(sample, "dataset", ""), "forecast"),
                 ),
                 predicted=json.dumps([float(x) for x in pred_arr[:50]]),
-                ground_truth=json.dumps([float(x) for x in sample.output_window[:50]]),
+                ground_truth=json.dumps([float(x) for x in gt_window[:50]]),
                 correct=_record_correctness("forecast", metrics),
                 metrics={k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
                 pipeline_summary=analysis_text,
@@ -740,7 +739,7 @@ async def _eval_forecast(
         return {
             "metrics": metrics,
             "predicted": pred_arr.tolist(),
-            "ground_truth": np.asarray(sample.output_window, dtype=np.float64).ravel().tolist(),
+            "ground_truth": gt_window.tolist(),
             "task_prompt": desc,
             **_apply_official_metric_policy(
                 domain=sample.domain,
@@ -751,7 +750,7 @@ async def _eval_forecast(
         }
     return {
         "predicted": None,
-        "ground_truth": np.asarray(sample.output_window, dtype=np.float64).ravel().tolist(),
+        "ground_truth": gt_window.tolist(),
         "task_prompt": desc,
         **_result_artifact_fields(result),
         **_official_error_result("no prediction", summary_skip_reason="parse_fail"),
@@ -1134,7 +1133,8 @@ async def _eval_weather_indicator(
 ) -> dict[str, Any]:
     if sample.output_window is None:
         return _official_error_result("no output_window")
-    if not _is_valid_numeric_ground_truth(sample.output_window):
+    normalized_gt = normalize_numeric_ground_truth(sample.output_window)
+    if not normalized_gt.valid:
         return {
             "predicted": None,
             "ground_truth": sample.output_window,
@@ -1146,14 +1146,15 @@ async def _eval_weather_indicator(
             ),
             "metrics": {"skipped": "invalid_ground_truth"},
         }
+    gt_window = np.asarray(normalized_gt.value, dtype=np.float64).ravel()
 
     text_data = None
     if sample.text:
         text_data = [{"content": sample.text, "source": sample.domain, "timestamp": ""}]
 
-    gt = prompts.weather_indicator_ground_truth(sample.output_window)
+    gt = prompts.weather_indicator_ground_truth(gt_window)
 
-    n_hours = prompts.weather_indicator_horizon_hours(sample.output_window)
+    n_hours = prompts.weather_indicator_horizon_hours(gt_window)
     result = await pipeline.run(
         data=sample.input_window,
         task_type="indicator",
@@ -1275,10 +1276,20 @@ async def _eval_stock_indicator(
     verbose: bool,
     indicator_field: str | None = None,
 ) -> dict[str, Any]:
-    gt_macd = sample.labels.get("out_macd")
-    gt_bb = sample.labels.get("out_upper_bb")
-    if gt_macd is None and gt_bb is None:
+    raw_gt_macd = sample.labels.get("out_macd")
+    raw_gt_bb = sample.labels.get("out_upper_bb")
+    if raw_gt_macd is None and raw_gt_bb is None:
         return _official_error_result("no_indicator_labels")
+    gt_macd_norm = (
+        normalize_numeric_ground_truth(raw_gt_macd)
+        if raw_gt_macd is not None else None
+    )
+    gt_bb_norm = (
+        normalize_numeric_ground_truth(raw_gt_bb)
+        if raw_gt_bb is not None else None
+    )
+    gt_macd = gt_macd_norm.value if gt_macd_norm and gt_macd_norm.valid else None
+    gt_bb = gt_bb_norm.value if gt_bb_norm and gt_bb_norm.valid else None
 
     text_data = None
     if sample.text:
@@ -1291,10 +1302,10 @@ async def _eval_stock_indicator(
         indicator_names.append("upper Bollinger Band")
     if not indicator_names:
         return _official_error_result("indicator_label_missing")
-    if indicator_field == "macd" and not _is_valid_numeric_ground_truth(gt_macd):
+    if indicator_field == "macd" and (gt_macd_norm is None or not gt_macd_norm.valid):
         return {
             "predicted": None,
-            "ground_truth": {"macd": gt_macd},
+            "ground_truth": {"macd": raw_gt_macd},
             "task_prompt": build_task_description(sample, "indicator_macd"),
             **_official_result_fields(
                 recorded=False,
@@ -1303,10 +1314,10 @@ async def _eval_stock_indicator(
             ),
             "metrics": {"skipped": "invalid_ground_truth"},
         }
-    if indicator_field == "upper_bb" and not _is_valid_numeric_ground_truth(gt_bb):
+    if indicator_field == "upper_bb" and (gt_bb_norm is None or not gt_bb_norm.valid):
         return {
             "predicted": None,
-            "ground_truth": {"upper_bb": gt_bb},
+            "ground_truth": {"upper_bb": raw_gt_bb},
             "task_prompt": build_task_description(sample, "indicator_upper_bb"),
             **_official_result_fields(
                 recorded=False,
@@ -1695,6 +1706,10 @@ async def run_pipeline_eval(
     cfg.mcp.enabled = False
     trace.configure(verbose)
 
+    from timeclaw.sbm.registry import preload_local_gpu_models
+
+    preload_local_gpu_models(strict=True)
+
     global _pipeline_ref
 
     try:
@@ -1710,22 +1725,6 @@ async def run_pipeline_eval(
             if isinstance(sample_indices, (str, Path))
             else sample_indices
         )
-
-        try:
-            from timeclaw.sbm.registry import get_global_registry, auto_register
-            reg = get_global_registry()
-            if not reg.list_available():
-                auto_register()
-            for name in reg.list_available():
-                adapter = reg.get(name)
-                if not adapter.is_loaded:
-                    try:
-                        adapter.load()
-                    except Exception as e:
-                        logger.warning(f"[Model pre-load] {name} failed: {e}")
-            logger.info(f"[Model pre-load] {len(reg.list_available())} models ready")
-        except Exception as e:
-            logger.warning(f"[Model pre-load] skipped: {e}")
 
         global _record_enabled
         _record_enabled = (split == "train")
