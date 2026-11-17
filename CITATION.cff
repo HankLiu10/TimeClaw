@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: If you use TimeClaw, please cite the paper below. The default task and
+message: If you use TimeClaw, please cite our NeurIPS 2026 paper below. The default task and
   metric inventory matches arXiv v1; historical numerical reproduction is not certified.
 type: software
 title: TimeClaw
@@ -10,7 +10,7 @@ repository-code: https://github.com/HankLiu10/TimeClaw
 url: https://github.com/HankLiu10/TimeClaw
 license: MIT
 preferred-citation:
-  type: article
+  type: conference-paper
   title: 'TimeClaw: A Time-Series AI Agent with Exploratory Execution Learning'
   authors:
   - given-names: Hangchen
@@ -25,7 +25,6 @@ preferred-citation:
     family-names: Sekimoto
   - given-names: Renhe
     family-names: Jiang
-  journal: arXiv
+  collection-title: Advances in Neural Information Processing Systems
   year: 2026
-  doi: 10.48550/arXiv.2605.10038
-  url: https://arxiv.org/abs/2605.10038
+  url: https://neurips.cc/virtual/2026/poster/153295

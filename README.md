@@ -4,19 +4,30 @@
 
 ### A Time-Series AI Agent with Exploratory Execution Learning
 
+**NeurIPS 2026 · Official Implementation**
+
 **Explore alternative tool paths. Learn from execution. Reuse experience.**
 
-[![Paper](https://img.shields.io/badge/arXiv-2605.10038-b31b1b)](https://arxiv.org/abs/2605.10038)
+[![NeurIPS 2026](https://img.shields.io/badge/NeurIPS_2026-Accepted-6D28D9)](https://neurips.cc/virtual/2026/poster/153295)
+[![Official implementation](https://img.shields.io/badge/Implementation-Author_maintained-0F766E)](docs/PROJECT_IDENTITY.md)
+[![Preprint](https://img.shields.io/badge/arXiv-2605.10038-b31b1b)](https://arxiv.org/abs/2605.10038)
 [![Tests](https://github.com/HankLiu10/TimeClaw/actions/workflows/tests.yml/badge.svg)](https://github.com/HankLiu10/TimeClaw/actions/workflows/tests.yml)
 [![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](#quick-start)
 [![License](https://img.shields.io/badge/License-MIT-0D9488)](LICENSE)
 
-[**Paper**](https://arxiv.org/abs/2605.10038) · [**Quick start**](#quick-start) · [**Tasks**](#tasks-and-evaluation) · [**Documentation**](#documentation)
+[**NeurIPS paper**](https://neurips.cc/virtual/2026/poster/153295) · [**OpenReview**](https://openreview.net/forum?id=MK0e2fxdTl) · [**Quick start**](#quick-start) · [**Tasks**](#tasks-and-evaluation) · [**Documentation**](#documentation)
+
+Hangchen Liu · Dongyuan Li · Jiewen Deng · Weiwei Ye · Yoshihide Sekimoto · Renhe Jiang
 
 </div>
 
+> **Official, author-maintained code** for the **NeurIPS 2026** paper
+> [*TimeClaw: A Time-Series AI Agent with Exploratory Execution Learning*](https://neurips.cc/virtual/2026/poster/153295).
+> The [first arXiv preprint](https://arxiv.org/abs/2605.10038v1) was submitted on **May 11, 2026**.
+> The canonical repository is **[HankLiu10/TimeClaw](https://github.com/HankLiu10/TimeClaw)**.
+
 TimeClaw combines **time-series tools, language-model reasoning and reusable
-experience**. Rather than relying on a single prediction call, its ReAct
+experience**. Its ReAct
 controller repeatedly chooses a tool, executes it and reads the observation.
 During learning, it explores alternative paths, compares their outcomes and
 distills experience into hierarchical memory. At inference time, that frozen
@@ -186,6 +197,19 @@ read the [scoring protocol](docs/SCORING.md) before interpreting results.
 
 </details>
 
+<details>
+<summary><strong>Which TimeClaw project is this?</strong></summary>
+
+This is the official implementation of the NeurIPS 2026 paper
+*TimeClaw: A Time-Series AI Agent with Exploratory Execution Learning*, first
+released as arXiv:2605.10038. It is maintained by the paper's authors and is
+distinct from independently developed projects sharing the name TimeClaw.
+Use the full paper title and canonical repository URL when linking or citing
+this work. See [project identity](docs/PROJECT_IDENTITY.md) for the publication
+links and citation details.
+
+</details>
+
 ## Documentation
 
 | I want to… | Start here |
@@ -197,29 +221,32 @@ read the [scoring protocol](docs/SCORING.md) before interpreting results.
 | Set up forecasting models and weights | [Model setup](docs/MODELS.md) |
 | Understand evaluation and known scoring differences | [Scoring protocol](docs/SCORING.md) |
 | Check validation evidence and reproduction limits | [Release validation](docs/RELEASE_STATUS.md) · [Paper alignment](docs/PAPER_ALIGNMENT.md) |
+| Identify the official paper and implementation | [Project identity](docs/PROJECT_IDENTITY.md) · [NeurIPS 2026](https://neurips.cc/virtual/2026/poster/153295) |
 | Report a bug or contribute | [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/HankLiu10/TimeClaw/issues) |
 
 ## Citation
 
-If TimeClaw is useful for your research, please cite the paper:
+If TimeClaw is useful for your research, please cite our **NeurIPS 2026** paper:
 
 ```bibtex
-@article{liu2026timeclaw,
+@inproceedings{liu2026timeclaw,
   title={TimeClaw: A Time-Series AI Agent with Exploratory Execution Learning},
   author={Liu, Hangchen and Li, Dongyuan and Deng, Jiewen and Ye, Weiwei and Sekimoto, Yoshihide and Jiang, Renhe},
-  journal={arXiv preprint arXiv:2605.10038},
+  booktitle={Advances in Neural Information Processing Systems},
   year={2026},
-  doi={10.48550/arXiv.2605.10038}
+  url={https://neurips.cc/virtual/2026/poster/153295}
 }
 ```
 
 The author order follows the maintainer's correction, with Renhe Jiang last;
 the public arXiv v1 snapshot may retain the earlier order. Machine-readable
 metadata is available in [CITATION.cff](CITATION.cff).
+The [arXiv version](https://arxiv.org/abs/2605.10038) remains available as a
+preprint. Proceedings volume, pages and DOI are omitted until verified.
 
 <div align="center">
 
-**[Read the paper](https://arxiv.org/abs/2605.10038) · [Explore the code](timeclaw) · [Get started](#quick-start)**
+**[NeurIPS 2026 paper](https://neurips.cc/virtual/2026/poster/153295) · [Explore the code](timeclaw) · [Get started](#quick-start)**
 
 MIT-licensed project code · [License](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.txt)
 

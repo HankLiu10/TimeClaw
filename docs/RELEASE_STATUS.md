@@ -1,5 +1,10 @@
 # Current source protocol — version 0.1.2
 
+**Paper status:** accepted at **NeurIPS 2026**. The
+[official conference page](https://neurips.cc/virtual/2026/poster/153295) identifies
+the paper; arXiv:2605.10038 remains its preprint. This publication-status update
+does not alter the historical evaluation/provenance findings below.
+
 **Publication update — 2026-11-17:** the repaired 0.1.2 source is now public in
 [HankLiu10/TimeClaw](https://github.com/HankLiu10/TimeClaw). All 297 files in the
 initial source publication were independently fetched and matched against the

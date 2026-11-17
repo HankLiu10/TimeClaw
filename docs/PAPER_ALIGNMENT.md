@@ -23,12 +23,15 @@ and do not require distributing or relabeling those old products.
 
 ## Public paper and release scope
 
-The canonical paper is [TimeClaw: A Time-Series AI Agent with Exploratory
-Execution Learning](https://arxiv.org/abs/2605.10038), by Hangchen Liu, Dongyuan Li,
+The paper is accepted at **NeurIPS 2026**; see the
+[official conference page](https://neurips.cc/virtual/2026/poster/153295).
+The [arXiv preprint](https://arxiv.org/abs/2605.10038), *TimeClaw: A Time-Series
+AI Agent with Exploratory Execution Learning*, is by Hangchen Liu, Dongyuan Li,
 Jiewen Deng, Weiwei Ye, Yoshihide Sekimoto and Renhe Jiang. The release citation
 uses the maintainer's latest author-order correction (Renhe Jiang last); the
 public v1 snapshot may retain its earlier author order. The arXiv v1 record
-was submitted on 2026-05-11 and is labelled "Under review". Its Section 5.1 and
+was submitted on 2026-05-11 and retains the historical comment "Under review";
+that comment does not describe the current conference status. Its Section 5.1 and
 Appendix B.3 explicitly define 17 tasks / 30 metric views.
 
 | Scope | Public arXiv v1 | This repaired release |
