@@ -1,139 +1,111 @@
+<div align="center">
+
 # TimeClaw
 
-**A Time-Series AI Agent with Exploratory Execution Learning**
+### A Time-Series AI Agent with Exploratory Execution Learning
 
-[Paper (arXiv)](https://arxiv.org/abs/2605.10038) ·
-[Code](https://github.com/HankLiu10/TimeClaw)
+**Explore alternative tool paths. Learn from execution. Reuse experience.**
 
-TimeClaw combines time-series tools and language-model reasoning with reusable
-experience. A native ReAct controller chooses tools, executes them and reads the
-observations. During learning it compares executed candidate branches, records
-Notes and distills hierarchical memory. Inference reuses frozen memory.
-This learning updates experience files, not model weights.
+[![Paper](https://img.shields.io/badge/arXiv-2605.10038-b31b1b)](https://arxiv.org/abs/2605.10038)
+[![Tests](https://github.com/HankLiu10/TimeClaw/actions/workflows/tests.yml/badge.svg)](https://github.com/HankLiu10/TimeClaw/actions/workflows/tests.yml)
+[![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](#quick-start)
+[![License](https://img.shields.io/badge/License-MIT-0D9488)](LICENSE)
 
-The default benchmark is **`paper30_original`: 17 tasks / 30 metric cells**,
-matching the main tables of arXiv v1. A metric cell means one reported score for
-one task; for example, weather indicators report six scores, not six tasks.
+[**Paper**](https://arxiv.org/abs/2605.10038) · [**Quick start**](#quick-start) · [**Tasks**](#tasks-and-evaluation) · [**Documentation**](#documentation)
 
-| Domain | Task settings | Count |
-|---|---|---:|
-| Finance | Forecast, MACD, trend, news–price correlation, MCQA; each short/long | 10 |
-| Weather | Forecast and MCQA short/long; indicator, future trend and past trend short | 7 |
+</div>
 
-The earlier `timeclaw18` software inventory remains an explicit extension
-(18 tasks / 26 cells): it omits weather indicators and adds long future/past
-weather trends. Set `benchmark.task_set` in the config for learning and baselines;
-inference also accepts `--task-set`. Every stage must use the same selection.
-Changing task set requires a fresh workspace/output; existing receipts are not relabeled.
-Task/metric alignment does not establish reproduction of historical scores;
-see [paper alignment](docs/PAPER_ALIGNMENT.md).
+TimeClaw combines **time-series tools, language-model reasoning and reusable
+experience**. Rather than relying on a single prediction call, its ReAct
+controller repeatedly chooses a tool, executes it and reads the observation.
+During learning, it explores alternative paths, compares their outcomes and
+distills experience into hierarchical memory. At inference time, that frozen
+memory guides subsequent decisions. **Learning updates experience files, not
+model weights.**
 
-[Task definitions](docs/PAPER_TASKS.md) · [Architecture](docs/ARCHITECTURE.md) ·
-[Scoring](docs/SCORING.md) · [Validation](docs/RELEASE_STATUS.md)
+<p align="center">
+  <img src="docs/assets/overview.svg" alt="TimeClaw workflow: independent training examples feed exploratory tool execution, measured comparison and memory distillation; evaluation inputs then use frozen memory in a ReAct tool loop, with scoring after the answer." width="100%">
+</p>
 
-## Installation
+| What makes TimeClaw useful? | How it works |
+|---|---|
+| **Execution-grounded learning** | Task-aware tool dropout varies tool availability to encourage alternative paths; learning retains their real execution outcomes. |
+| **Reusable hierarchical memory** | Turn per-example Notes into scoped rules and tool/skill guidance, then reuse them without changing model weights. |
+| **Multimodal time-series reasoning** | Combine numerical observations with task-provided text and supported image inputs through a shared tool-using agent. |
+| **A shared evaluation protocol** | Use explicit task definitions, common scorers and separate learning/evaluation inputs across finance and weather. |
 
-The verified core environment is **Linux / Python 3.10**. From the source root:
+For example, a financial task can combine a price series with news, use a
+forecasting tool and return a trend decision. A weather task can ask for future
+temperatures, extrema or a multiple-choice answer. The controller chooses the
+execution path; these examples are not fixed pipelines.
+
+## Quick start
+
+The verified core environment is **Linux with Python 3.10**. Statistical tools
+are included; neural forecasting tools require their own dependencies and
+weights. See [model setup](docs/MODELS.md).
+
+### 1 · Install
 
 ```bash
+git clone https://github.com/HankLiu10/TimeClaw.git
+cd TimeClaw
 python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-py310.lock
 python -m pip install -e '.[dev]'
 python -m pip check
 python scripts/setup_mtbench.py
-```
 
-The setup helper installs the pinned external MTBench prompt/metric code at
-revision `394a9d274403e93a08b24c2a0b7af461615ce302`; it does not download datasets.
-For a custom installation, use `--destination PATH` and set
-`TIMECLAW_MTBENCH_ROOT=PATH`. See [third-party notices](THIRD_PARTY_NOTICES.txt).
-Benchmark setup and run commands are distributed in the source checkout;
-the wheel contains the agent library.
-
-The core environment includes statistical tools. Neural forecasting models need
-separate dependencies and downloaded weights: see [model setup](docs/MODELS.md).
-Listing a tool does not certify that its optional model environment is installed.
-
-The following checks require no model credentials or weights:
-
-```bash
+# Check the tool catalog without model credentials or weights.
 timeclaw tools --list
-python -m ruff check timeclaw scripts tests --select E9,F821,F822,F823
-LITELLM_LOCAL_MODEL_COST_MAP=True HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-  python -m pytest -q --timeout=20
 ```
 
-## Data and configuration
+The setup helper installs a pinned revision of the external MTBench prompt and
+metric code. **It does not download datasets or model weights.**
 
-**Verified source metadata:** the supplied profile explicitly loads
-`configs/mtbench_observation_times.json`. It restores the actual observation-time
-correspondence for 117 finance-long records, using unique exact matches to the
-pinned raw series, and supplies NOAA-verified weather station identities.
-The original data files, price/temperature values, news and labels remain
-unchanged. All 7,573 evaluation records pass the source-time checks under this
-profile. See [the evidence protocol](docs/OBSERVATION_TIME_EVIDENCE.md) and
-[data readiness](docs/DATA_READINESS.md).
-
-Download the official evaluation inputs before learning:
-
-```bash
-python scripts/download_mtbench.py --list
-python scripts/download_mtbench.py
-```
-
-Eight dataset repositories and immutable revisions are listed in
-`configs/datasets.lock.json`. Download receipts record hashes for verified reuse.
-A smaller download can use `--dataset weather_aligned_short`.
-
-Learning requires **separately sourced independent training data** under
-`data_preparation/independent/splits/<dataset>/`. Independent training data and
-collection scripts are not included in this source distribution; prepare records
-according to [the data schema](docs/DATA.md). A portable 160-record
-independent review bundle has been prepared separately with this source delivery;
-it covers four dataset pools, not every task. There is no verified public hosted
-URL for the complete independent corpus, so full historical paper learning cannot
-yet be reproduced from public downloads alone. The loader never substitutes the
-official evaluation pool for missing training data. Source paths, observed
-windows, complete source-time support and declared article sources are checked
-before learning. See [train/evaluation boundaries](docs/DATA_BOUNDARIES.md).
-
-Create a local config and provide your credential through the process environment:
+### 2 · Configure and prepare data
 
 ```bash
 cp configs/default.yaml configs/local.yaml
 export TIMECLAW_CONFIG="$PWD/configs/local.yaml"
 export OPENAI_API_KEY='YOUR_OWN_KEY'
+
+# Inspect, then download the pinned official evaluation inputs.
+python scripts/download_mtbench.py --list
+python scripts/download_mtbench.py
 ```
 
-Configure your provider/model and optional services in `configs/local.yaml`.
-`benchmark.observation_time_evidence` is an explicit source-metadata attachment,
-resolved under `benchmark.repo_root` unless absolute. Keep it available when using
-a custom data root. Setting it to null selects unmodified upstream metadata; that
-raw view retains the upstream source-time defects and fails full-source learning
-admission. There is no automatic repair or dataset exclusion on failure.
-The supplied profile uses `gpt-6.1-sol`/low, no automatic model substitution,
-no output-token cap, a 3600-second attempt timeout and transient-error retries
-every 30 seconds. Quota failures and content refusals remain errors. Model
-requests may incur provider charges. `.env.example` is a documentation template;
-`.env` files are not loaded automatically.
+Set your provider, model and any optional model services in
+`configs/local.yaml`. The supplied profile uses `gpt-6.1-sol` with low reasoning
+effort; it is a software default, not a claim about the paper's historical model
+configuration. Provider calls may incur charges. `.env` files are not loaded
+automatically.
 
-`benchmark.repo_root` contains the inputs; `benchmark.training_root` is resolved
-under it. By default all eight evaluation pools are declared. A deliberately
-smaller experiment must explicitly set `benchmark.evaluation_datasets`; missing
-or empty declared pools are errors. Keep those evaluation inputs fixed when
-using the learned memory. Workspace priority is explicit `--workspace-dir`,
-then `TIMECLAW_WORKSPACE_DIR`, then `workspace_dir` in the config.
+> [!IMPORTANT]
+> **Learning needs independent training data.** Place separately collected records
+> under `data_preparation/independent/splits/<dataset>/`, following the
+> [data schema](docs/DATA.md). A complete public training-corpus download is not
+> currently supplied. Official evaluation data is never substituted for missing
+> training data. Inference from an empty workspace runs untrained native ReAct;
+> it does not represent the learned agent.
 
-## Learn and infer
+The default config declares all eight evaluation pools and explicitly loads the
+audited observation-time metadata attachment. For a smaller download and
+experiment, set `benchmark.evaluation_datasets` explicitly; see the
+[data and configuration guide](docs/RUN_GUIDE.md#data-and-configuration).
 
-For a small run on independently collected weather data:
+### 3 · Learn experience, then run frozen inference
+
+After preparing independent weather training records and the evaluation inputs:
 
 ```bash
+# Explore independent training examples and finalize their memory.
 python -m timeclaw.benchmark.run_learning --train \
   --dataset weather_aligned_short --task trend_past --max-samples 2 \
   --concurrency 1 --per-task-concurrency 1
 
+# Evaluate with the same workspace's frozen memory.
 python scripts/run_timeclaw_mtbench_inference.py \
   --config configs/local.yaml --task-set paper30_original \
   --task weather_trend_past_short --samples-per-task 2 \
@@ -141,90 +113,95 @@ python scripts/run_timeclaw_mtbench_inference.py \
   --output-root results/main --run-id weather_past_short
 ```
 
-A **Note** stores one training experience. **MEMORY** stores distilled rules;
-TOOLS/SKILLS guidance is derived from that store. Exploration seeks at least
-two valid, executed and scored branches. If the exploration budget ends after
-attempting multiple branches and only one valid path survives, its actual score
-can support a **single-execution Note** (`single_execution`), without a winner or
-comparative signal. An unscored/zero-candidate run cannot create such a Note.
-For example, one failed branch plus one forecast with measured MAE can record
-that forecast and MAE, but cannot establish that its tool beats the failed one.
-These Notes are excluded from winner counts and relative tool-rule support.
-Ten new scoped Notes
-trigger batch distillation; training finalization drains the remainder. Thirty
-controls history snapshots. Training already includes finalization; `--all` is
-its alias and cannot be combined with `--train` or `--distill`. Standalone
-`--distill` explicitly refreshes an existing admitted learning workspace.
+These two examples are a small workflow check, not a full benchmark. The task
+preset is **`paper30_original`** by default. Keep the same configuration and
+workspace across learning and inference. Inference checks the frozen learning
+lineage and does not learn from test answers.
 
-An explicit `--sample-index-file` must map every requested dataset to a nonempty
-list of unique, nonnegative integer indices into the loaded source list. Missing
-dataset keys, booleans, strings, duplicates and out-of-range indices are errors;
-they never mean "run everything" or "drop the invalid entries". For example,
-`{"weather_aligned_short": [2, 0]}` selects original indices 2 then 0. Training
-validates this selection before creating services or changing learning lineage.
+See the [full run guide](docs/RUN_GUIDE.md) for sample selection, workspaces,
+retries, resume behavior and the direct-LLM baseline.
 
-When `--max-samples` is used, the existing training policy additionally excludes
-articles longer than 70,000 characters and considers at most the first
-`max_samples + 300` candidates to fill the limit. This is a text-length policy,
-not a score-based choice; it can leave fewer rows and is reported in the log.
-Use the realized sample manifest to identify the actual learning cohort.
+<details>
+<summary><strong>What is stored in memory?</strong></summary>
 
-For the full task set, remove training dataset/task filters, then remove the
-inference task filter and use `--samples-per-task 0`. Only do so after preparing
-all intended independent corpora and evaluation pools.
+A **Note** records one training experience: its actual execution path and measured
+outcome. **MEMORY** stores rules distilled from Notes; TOOLS/SKILLS guidance is
+derived from those rules. Ten new Notes in a scope trigger batch distillation;
+training finalization processes any remainder. The separate thirty-Note counter
+controls history snapshots.
 
-`training_lineage.json` binds learning inputs, evaluation inputs, task definitions
-and hashes of learned files. Keep it with copied memory. Inference checks that
-seal before execution and after cleanup, and cannot learn from test answers.
-An empty workspace runs untrained native ReAct; learned-agent results require
-the intended finalized learning workspace.
+Exploration seeks at least two valid, executed and scored branches. If multiple
+branches were attempted but the budget ends with only one valid scored path,
+TimeClaw can retain a **single-execution Note**. It records what happened, without
+claiming a comparative winner. For example, a measured forecast MAE can be stored,
+but cannot establish that its tool outperformed a branch that failed. Zero-candidate
+or unscored attempts cannot create such a Note. These Notes cannot support relative
+tool-selection rules or winner-frequency statistics.
 
-One learning/distillation job owns write access to a workspace. Frozen-inference
-jobs may read it concurrently; learning cannot modify it while they run. A busy
-workspace is reported before model startup. Use separate processes for separate
-workspaces: artifact roots are bound per process.
+</details>
 
-Each output run has one writer. `--resume` requires matching code, config, full
-evaluation content/targets, task selection and frozen memory. Existing recorded
-failures remain outcomes; duplicate or foreign rows are rejected. A fresh launch
-refuses an existing run. `--clear-output` explicitly removes only that run's
-outputs and cannot be combined with `--resume`; preserve old evidence first.
-Failed or empty batches exit nonzero after retaining their records.
+## Tasks and evaluation
 
-## Baseline and evaluation
+The default **`paper30_original`** preset matches the paper's main-table inventory:
+**17 tasks across finance and weather, reported through 30 metric cells**.
+A metric cell is one score for one task; a task can have several metrics.
 
-The direct-LLM baseline receives the same task's visible prompt and uses the
-same scorer as TimeClaw, with one direct model call per sample/task:
+| Domain | Task families | Settings | Tasks |
+|---|---|---|---:|
+| Finance | Forecasting, MACD prediction, trend classification, news–price correlation, multiple-choice QA | Short and long | 10 |
+| Weather | Forecasting and multiple-choice QA | Short and long | 4 |
+| Weather | Indicator prediction, future trend and past trend | Short | 3 |
+| **Total** | | | **17** |
 
-```bash
-python -m timeclaw.benchmark.baseline_eval \
-  --config configs/local.yaml --dataset weather_aligned_short --task trend_past \
-  --max-samples 2 --concurrency 1 --output-dir results/direct_baseline
-```
+For instance, the weather indicator task predicts the maximum temperature,
+minimum temperature and their difference, each scored by MSE and MAE: **one task,
+six metric cells**. The [complete task table](docs/PAPER_TASKS.md) lists every key,
+dataset and metric.
 
-One direct-baseline job owns its output directory through admission, requests,
-and shutdown. A competing launch on the same directory fails before another
-backend is created; use distinct output directories for separate concurrent runs.
+The direct-LLM baseline receives the same visible task prompt and uses the same
+scorer. Both methods retain raw predictions, failures and exclusion counts, with
+upstream-filtered and all-valid summaries. Compare the same frozen sample cohort;
+read the [scoring protocol](docs/SCORING.md) before interpreting results.
 
-Use the same frozen samples for both methods. Both preserve raw predictions and
-report upstream threshold-filtered and all-valid summaries, plus failure and
-exclusion counts. No score-based choice between different runs is implemented.
-Read [the scoring protocol](docs/SCORING.md), including the documented
-weather-long prompt/evaluator discrepancy, before comparing results.
+<details>
+<summary><strong>Release scope and reproducibility</strong></summary>
 
-This distribution contains main-experiment code and regression tests. Raw data,
-old checkpoints, learned memory, experimental outputs and weights are not
-included. Software validation is separate from exact numerical reproduction of
-historical tables. The implementation/evidence limits are recorded in
-[paper alignment](docs/PAPER_ALIGNMENT.md) and [release validation](docs/RELEASE_STATUS.md).
+- This repository contains repaired **main-experiment source**, setup helpers and
+  regression tests. Raw datasets, old training products, learned memory, model
+  weights, ablations and case-study runners are not included.
+- Source-package validation passed **1,223 tests**, with four optional-package
+  skips. These software checks do not establish reproduction of historical paper
+  scores or certify every optional neural-model environment. Current CI is linked
+  at the top of this page.
+- The supplied source-time profile preserves the original series, news and labels
+  while supplying audited observation-time and weather-station metadata. See the
+  [evidence protocol](docs/OBSERVATION_TIME_EVIDENCE.md).
+- `timeclaw18` is an explicit **18-task / 26-cell extension**, distinct from the
+  paper preset. It omits weather indicators and adds long future/past weather
+  trends. Changing presets requires a fresh workspace and output; existing runs
+  are not relabeled.
+- Independent-corpus availability and historical-result provenance are documented
+  in [data readiness](docs/DATA_READINESS.md) and
+  [paper alignment](docs/PAPER_ALIGNMENT.md).
 
-## Citation, contribution and license
+</details>
 
-This is the TimeClaw repository at
-[HankLiu10/TimeClaw](https://github.com/HankLiu10/TimeClaw).
-[CITATION.cff](CITATION.cff) identifies the paper and follows the maintainer's
-latest author-order correction, with Renhe Jiang last. The cited arXiv v1 record
-may retain its earlier author order and labels the manuscript "Under review".
+## Documentation
+
+| I want to… | Start here |
+|---|---|
+| Install, configure and run an experiment | [Full run guide](docs/RUN_GUIDE.md) |
+| Understand exploration, memory and inference | [Architecture](docs/ARCHITECTURE.md) |
+| Find task keys, datasets and metrics | [Paper task inventory](docs/PAPER_TASKS.md) |
+| Prepare independent training records | [Data schema](docs/DATA.md) · [Data boundaries](docs/DATA_BOUNDARIES.md) |
+| Set up forecasting models and weights | [Model setup](docs/MODELS.md) |
+| Understand evaluation and known scoring differences | [Scoring protocol](docs/SCORING.md) |
+| Check validation evidence and reproduction limits | [Release validation](docs/RELEASE_STATUS.md) · [Paper alignment](docs/PAPER_ALIGNMENT.md) |
+| Report a bug or contribute | [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/HankLiu10/TimeClaw/issues) |
+
+## Citation
+
+If TimeClaw is useful for your research, please cite the paper:
 
 ```bibtex
 @article{liu2026timeclaw,
@@ -236,8 +213,14 @@ may retain its earlier author order and labels the manuscript "Under review".
 }
 ```
 
-Contributions and bug reports are welcome through [the contribution guide](CONTRIBUTING.md) and
-[GitHub Issues](https://github.com/HankLiu10/TimeClaw/issues).
+The author order follows the maintainer's correction, with Renhe Jiang last;
+the public arXiv v1 snapshot may retain the earlier order. Machine-readable
+metadata is available in [CITATION.cff](CITATION.cff).
 
-Project code uses the [MIT license](LICENSE). External datasets, model weights
-and dependencies retain their own terms; see [third-party notices](THIRD_PARTY_NOTICES.txt).
+<div align="center">
+
+**[Read the paper](https://arxiv.org/abs/2605.10038) · [Explore the code](timeclaw) · [Get started](#quick-start)**
+
+MIT-licensed project code · [License](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.txt)
+
+</div>

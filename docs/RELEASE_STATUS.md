@@ -1,5 +1,14 @@
 # Current source protocol — version 0.1.2
 
+**Publication update — 2026-11-17:** the repaired 0.1.2 source is now public in
+[HankLiu10/TimeClaw](https://github.com/HankLiu10/TimeClaw). All 297 files in the
+initial source publication were independently fetched and matched against the
+reviewed source hashes; its
+[GitHub Actions run](https://github.com/HankLiu10/TimeClaw/actions/runs/44044567643)
+passed. Earlier statements below about pending publication describe historical
+audit stages, not the current repository. The later README refresh changes
+documentation and its file manifest only; the validated runtime is unchanged.
+
 The default task inventory now matches the public paper: `paper30_original`,
 17 tasks / 30 primary metric cells. Weather max/min/diff prediction and all six
 MSE/MAE summaries are included. `timeclaw18` remains an explicitly named extension;
@@ -20,7 +29,7 @@ also pass.
 See VALIDATION.json for the final distribution receipt. Tests use scripted model
 responses and blocked external networking; this update made zero paid requests,
 used no GPU, and does not certify numerical paper reproduction or every optional
-neural model environment. No repaired source has been uploaded.
+neural model environment.
 
 The following sections retain earlier 0.1.1 audit details. Their statements that
 the task registry or native core was unchanged describe those earlier revisions;

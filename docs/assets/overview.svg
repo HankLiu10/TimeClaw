@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="604" viewBox="0 0 1160 604" role="img" aria-labelledby="title desc">
+  <title id="title">TimeClaw: explore, learn and reuse execution experience</title>
+  <desc id="desc">Learning uses independent training inputs to explore tool paths, compare measured outcomes, record Notes and distill memory. Inference uses separate evaluation inputs, frozen memory and a ReAct tool loop to produce an answer. Evaluation answers are scored outside the agent.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 8 4 0 8" fill="none" stroke="#8491a8" stroke-width="1.5"/></marker>
+    <marker id="blueArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 8 4 0 8" fill="none" stroke="#4361b5" stroke-width="1.5"/></marker>
+  </defs>
+  <rect x="1" y="1" width="1158" height="602" rx="22" fill="#f8fafc" stroke="#dce3ee"/>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="34" y="47" font-size="26" font-weight="700" fill="#17243c">Learn from doing. Reason with experience.</text>
+    <text x="34" y="77" font-size="18" fill="#57667e">A shared tool-using agent, with experience stored outside model weights.</text>
+
+    <rect x="24" y="105" width="1112" height="188" rx="16" fill="#edf6f3"/>
+    <circle cx="49" cy="133" r="11" fill="#087e70"/>
+    <text x="70" y="140" font-size="19" font-weight="700" fill="#17675d">LEARNING</text>
+    <text x="251" y="140" font-size="17" fill="#4a736a">Independent training data · training targets used by the evaluator</text>
+
+    <rect x="40" y="161" width="222" height="108" rx="12" fill="#fff" stroke="#cfdfd9"/>
+    <text x="57" y="192" font-size="20" font-weight="700" fill="#17243c">Observe</text>
+    <text x="57" y="219" font-size="17" fill="#57667e"><tspan x="57">Series + task context</tspan><tspan x="57" dy="25">Text / images, if supplied</tspan></text>
+
+    <path d="M269 215 H294" stroke="#8491a8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+    <rect x="305" y="161" width="261" height="108" rx="12" fill="#fff" stroke="#cfdfd9"/>
+    <text x="322" y="192" font-size="20" font-weight="700" fill="#17243c">Explore &amp; compare</text>
+    <text x="322" y="219" font-size="17" fill="#57667e">Execute alternative tool paths</text>
+    <text x="322" y="244" font-size="17" fill="#57667e">Compare measured outcomes</text>
+
+    <path d="M574 215 H599" stroke="#8491a8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+    <rect x="610" y="161" width="222" height="108" rx="12" fill="#fff" stroke="#cfdfd9"/>
+    <text x="627" y="192" font-size="20" font-weight="700" fill="#17243c">Record Notes</text>
+    <text x="627" y="219" font-size="17" fill="#57667e">Actual execution evidence</text>
+    <text x="627" y="244" font-size="17" fill="#57667e">Paths + tools + scores</text>
+
+    <path d="M840 215 H865" stroke="#8491a8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+    <rect x="876" y="161" width="244" height="108" rx="12" fill="#087e70"/>
+    <text x="894" y="192" font-size="20" font-weight="700" fill="#fff">Distill memory</text>
+    <text x="894" y="219" font-size="17" fill="#e0f4ef">Scoped reusable rules</text>
+    <text x="894" y="244" font-size="17" fill="#e0f4ef">Tool &amp; skill guidance</text>
+
+
+    <rect x="24" y="350" width="1112" height="202" rx="16" fill="#edf1fa"/>
+    <path d="M998 277 V324 H435 V399" stroke="#4361b5" stroke-width="2" stroke-dasharray="5 5" fill="none" marker-end="url(#blueArrow)"/>
+    <rect x="579" y="307" width="274" height="34" rx="17" fill="#f8fafc"/>
+    <text x="716" y="330" text-anchor="middle" font-size="18" font-weight="700" fill="#4361b5">Reuse frozen memory</text>
+    <circle cx="49" cy="378" r="11" fill="#4361b5"/>
+    <text x="70" y="385" font-size="19" font-weight="700" fill="#344e98">INFERENCE</text>
+    <text x="610" y="385" font-size="17" fill="#5c6e94">Separate evaluation inputs · no test-time learning</text>
+
+    <rect x="40" y="406" width="222" height="120" rx="12" fill="#fff" stroke="#d3dced"/>
+    <text x="57" y="438" font-size="20" font-weight="700" fill="#17243c">New task</text>
+    <text x="57" y="466" font-size="17" fill="#57667e">Visible observations</text>
+    <text x="57" y="491" font-size="17" fill="#57667e">+ task requirements</text>
+
+    <path d="M269 466 H294" stroke="#8491a8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+    <rect x="305" y="406" width="261" height="120" rx="12" fill="#4361b5"/>
+    <text x="322" y="438" font-size="20" font-weight="700" fill="#fff">ReAct controller</text>
+    <text x="322" y="466" font-size="17" fill="#ecf1ff">Reason with learned guidance</text>
+    <text x="322" y="491" font-size="17" fill="#ecf1ff">Choose tools; read results</text>
+
+    <path d="M574 451 H599" stroke="#8491a8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+    <path d="M603 483 H578" stroke="#8491a8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+    <rect x="610" y="406" width="222" height="120" rx="12" fill="#fff" stroke="#d3dced"/>
+    <text x="627" y="438" font-size="20" font-weight="700" fill="#17243c">Execute tools</text>
+    <text x="627" y="466" font-size="17" fill="#57667e">Analyze · predict · reason</text>
+    <text x="627" y="491" font-size="17" fill="#57667e">Return observations</text>
+
+    <path d="M840 466 H865" stroke="#8491a8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+    <rect x="876" y="406" width="244" height="120" rx="12" fill="#fff" stroke="#d3dced"/>
+    <text x="894" y="438" font-size="20" font-weight="700" fill="#17243c">Task answer</text>
+    <text x="894" y="466" font-size="17" fill="#57667e">Forecasts · indicators</text>
+    <text x="894" y="491" font-size="17" fill="#57667e">Trends · correlation · QA</text>
+
+    <text x="34" y="581" font-size="17" fill="#57667e">Predictions are finalized before external test scoring. Learning changes experience files, not model weights.</text>
+  </g>
+</svg>
