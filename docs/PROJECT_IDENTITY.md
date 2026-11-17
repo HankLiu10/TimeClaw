@@ -7,6 +7,7 @@ Agent with Exploratory Execution Learning**, accepted at **NeurIPS 2026**.
 |---|---|
 | Official code | [HankLiu10/TimeClaw](https://github.com/HankLiu10/TimeClaw) |
 | NeurIPS 2026 paper page | [Conference poster entry](https://neurips.cc/virtual/2026/poster/153295) |
+| Conference poster PDF | [Download the single-page poster](https://github.com/HankLiu10/TimeClaw/releases/download/v0.1.2/TimeClaw_Poster.pdf) |
 | OpenReview | [Paper discussion](https://openreview.net/forum?id=MK0e2fxdTl) |
 | Preprint | [arXiv:2605.10038](https://arxiv.org/abs/2605.10038) |
 | First public preprint | [May 11, 2026 — arXiv v1](https://arxiv.org/abs/2605.10038v1) |

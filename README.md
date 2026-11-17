@@ -15,7 +15,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)](#quick-start)
 [![License](https://img.shields.io/badge/License-MIT-0D9488)](LICENSE)
 
-[**NeurIPS paper**](https://neurips.cc/virtual/2026/poster/153295) · [**OpenReview**](https://openreview.net/forum?id=MK0e2fxdTl) · [**Quick start**](#quick-start) · [**Tasks**](#tasks-and-evaluation) · [**Documentation**](#documentation)
+[**NeurIPS paper**](https://neurips.cc/virtual/2026/poster/153295) · [**OpenReview**](https://openreview.net/forum?id=MK0e2fxdTl) · [**Poster (PDF)**](https://github.com/HankLiu10/TimeClaw/releases/download/v0.1.2/TimeClaw_Poster.pdf) · [**Quick start**](#quick-start) · [**Tasks**](#tasks-and-evaluation) · [**Documentation**](#documentation)
 
 Hangchen Liu · Dongyuan Li · Jiewen Deng · Weiwei Ye · Yoshihide Sekimoto · Renhe Jiang
 
@@ -222,6 +222,7 @@ links and citation details.
 | Understand evaluation and known scoring differences | [Scoring protocol](docs/SCORING.md) |
 | Check validation evidence and reproduction limits | [Release validation](docs/RELEASE_STATUS.md) · [Paper alignment](docs/PAPER_ALIGNMENT.md) |
 | Identify the official paper and implementation | [Project identity](docs/PROJECT_IDENTITY.md) · [NeurIPS 2026](https://neurips.cc/virtual/2026/poster/153295) |
+| Download the conference poster | [Poster (PDF, 140 × 90 cm)](https://github.com/HankLiu10/TimeClaw/releases/download/v0.1.2/TimeClaw_Poster.pdf) |
 | Report a bug or contribute | [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/HankLiu10/TimeClaw/issues) |
 
 ## Citation
