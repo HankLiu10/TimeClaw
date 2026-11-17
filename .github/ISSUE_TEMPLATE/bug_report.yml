@@ -1,0 +1,23 @@
+name: Bug report
+description: Report a reproducible TimeClaw bug
+title: "[Bug] "
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit/version, operating system, Python, and optional model environment.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction and expected behavior
+      description: Include the exact command and minimal inputs or schema; do not attach private data.
+    validations:
+      required: true
+  - type: textarea
+    id: trace
+    attributes:
+      label: Sanitized error trace
+      description: Remove credentials and private prompt/data content.

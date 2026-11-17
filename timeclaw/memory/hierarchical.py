@@ -1,0 +1,5926 @@
+"""Agent Memory System — OpenClaw-inspired file-first architecture.
+
+Five components (aligned with OpenClaw naming):
+
+SOUL.md (fixed, human-written):
+    Agent identity and behavioral guidelines.  Corresponds to OpenClaw SOUL.md.
+    Not learned — maintained by developers.
+
+Notes (auto-recorded):
+    Natural-language summaries of each pipeline run + outcome.
+    Append-only, stored as scope-sharded raw experience records.
+
+MEMORY (auto-distilled from notes):
+    LLM-distilled causal attributions explaining WHY certain patterns of
+    success/failure occur.  Scoped to ``scope_key``.  Additionally holds
+    task-bucket ``cross_domain`` scopes for universal operating strategies
+    distilled across corresponding scopes.
+    Corresponds to OpenClaw MEMORY.md, but auto-distilled rather than
+    manually curated.
+
+TOOLS.md (auto-distilled from notes):
+    Per-scope per-tool usage notes learned from experience — when each
+    tool works well or poorly for that scope, helping the agent distinguish
+    between functionally similar tools under the current task boundary.
+
+SKILLS/ (auto-distilled from MEMORY):
+    Scene-specific SOPs (Standard Operating Procedures) per (domain, task).
+    Step-by-step operational guides.  Corresponds to OpenClaw SKILLS.md.
+
+SKILLS_DECISION/ (auto-distilled from MEMORY):
+    Explanation-oriented decision guides per scope. These are not injected
+    into the agent's execution prompt. They are reserved for user-facing
+    rendering that explains why certain evidence patterns usually support a
+    judgment, while remaining subordinate to the real execution trace.
+
+Distillation chain:
+    Notes  ──→  MEMORY (per-scope + task-bucket cross_domain)
+                 └──→  TOOLS.md (per-scope cards)
+                 └──→  SKILLS/
+                 └──→  SKILLS_DECISION/
+
+New definition:
+    ``scope_key`` is the canonical storage and retrieval key for one
+    benchmark scope. It should match the benchmark's dataset-level scope
+    name directly, for example ``weather_aligned_short_forecast``.
+
+New definition:
+    ``Notes`` are now a distillation-source layer only. They remain
+    append-only raw records used to distill MEMORY / TOOLS / SKILLS /
+    SKILLS_DECISION, but
+    they are no longer injected directly into the agent prompt and no
+    longer rely on a vector-store retrieval path.
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+from contextlib import AsyncExitStack, contextmanager
+from contextvars import copy_context
+from difflib import SequenceMatcher
+import fcntl
+import hashlib
+import json
+import re
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, unquote
+
+from loguru import logger
+
+from timeclaw.core import trace_logger as trace
+from timeclaw.data_integrity import assert_not_quarantined
+from timeclaw.core.candidate_labels import canonical_candidate_label
+from timeclaw.core.learning_text import (
+    sanitize_learning_evidence_text,
+    sanitize_learning_text,
+)
+
+MEMORY_ROOT = Path(".timeclaw/hierarchical_memory")
+NOTES_DIR = MEMORY_ROOT / "notes"
+MEMORY_DIR = MEMORY_ROOT / "memory"
+TOOLS_FILE = MEMORY_ROOT / "TOOLS.md"
+SKILLS_DIR = MEMORY_ROOT / "skills"
+SKILLS_DECISION_DIR = MEMORY_ROOT / "skills_decision"
+STATE_DIR = MEMORY_ROOT / "state"
+DISTILL_STATE_FILE = STATE_DIR / "distill_state.json"
+DISTILL_STATE_LOCK_FILE = STATE_DIR / ".distill_state.lock"
+HISTORY_DIR = MEMORY_ROOT / "history"
+LOCKS_DIR = MEMORY_ROOT / "locks"
+SOUL_FILE = Path("timeclaw/memory/SOUL.md")
+
+CROSS_DOMAIN_SCOPE = "cross_domain"
+CROSS_DOMAIN_SCOPE_PREFIX = "cross_domain__"
+_FRAMEWORK_TOOLS = {
+    "evaluate_against_gt",
+    "evaluate_batch_against_gt",
+    "batch_evaluate_against_gt",
+    "spawn_subagent",
+    "none",
+}
+_NOTE_VALIDATION_TOOLS = {
+    "consistency_check",
+    "bound_check",
+    "evaluate_against_gt",
+    "evaluate_batch_against_gt",
+    "batch_evaluate_against_gt",
+}
+_TOOL_NAME_ALIASES = {
+    "multimodal_classifier": "llm_reasoning_classification",
+    "reasoning_based_multimodal_classification": "llm_reasoning_classification",
+    "direct_indicator_reasoning": "llm_reasoning_indicator",
+    "reasoning_based_indicator_analysis": "llm_reasoning_indicator",
+    "context_aware_forecast": "llm_reasoning_forecast",
+    "multimodal_qa": "llm_reasoning_qa",
+}
+
+# New definition:
+# - `scoped note count`: number of note blocks written for one exact scope_key
+# - `global note count`: total number of note blocks across all scopes
+#
+# Distillation cadence:
+# - Notes -> MEMORY: rebuild every 10 newly accumulated scoped notes
+# - Scope history snapshot: persist one audit snapshot every 30 newly covered
+#   scoped notes, while still flushing any shorter tail during explicit
+#   distill_pending / shutdown finalization
+# - MEMORY -> SKILLS / TOOLS / cross_domain: rebuild from the latest full MEMORY
+#   view when their source fingerprint changes
+_DISTILL_L1_TO_L2 = 10
+_MEMORY_HISTORY_SNAPSHOT_INTERVAL = 30
+_NOTES_TO_MEMORY_EMPTY_RETRY_ATTEMPTS = 5
+_DISTILL_STAGE_RETRY_ATTEMPTS = 5
+_DISTILL_STAGE_RETRY_BASE_DELAY_S = 2.0
+_DISTILL_STAGE_RETRY_MAX_DELAY_S = 30.0
+_MEMORY_RULE_CAP = 30
+_L1_RETRIEVAL_K = 5
+
+
+def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+    tmp_path.write_text(content, encoding=encoding)
+    tmp_path.replace(path)
+
+
+@contextmanager
+def _exclusive_file_lock(lock_path: Path):
+    """Process-wide advisory lock for one shared artifact path."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _scope_lock_path(scope: str) -> Path:
+    return _ScopeStorageCodec.path(LOCKS_DIR / "scopes", scope, ".lock")
+
+
+def _bucket_lock_path(bucket: str) -> Path:
+    safe = quote(str(bucket).strip(), safe="")
+    return LOCKS_DIR / "buckets" / f"{safe}.lock"
+
+
+TOOLS_LOCK_FILE = LOCKS_DIR / ".tools.lock"
+
+
+class _ScopeStorageCodec:
+    """Reversible on-disk encoding for arbitrary scope names.
+
+    New definition:
+        `storage scope name` is the filename-safe, reversible encoding of one
+        logical `scope_key`. We use percent-encoding so scope-bound artifacts
+        keep exact identity even when a custom scope contains spaces, slashes,
+        brackets, or other path-sensitive characters.
+    """
+
+    _SAFE = "._-"
+
+    @classmethod
+    def encode(cls, scope: str) -> str:
+        scope_name = str(scope).strip() or "__default__"
+        return quote(scope_name, safe=cls._SAFE)
+
+    @classmethod
+    def decode(cls, storage_name: str) -> str:
+        name = str(storage_name).strip()
+        if not name:
+            return ""
+        return unquote(name)
+
+    @classmethod
+    def path(cls, root: Path, scope: str, suffix: str) -> Path:
+        return root / f"{cls.encode(scope)}{suffix}"
+
+    @classmethod
+    def dir(cls, root: Path, scope: str) -> Path:
+        return root / cls.encode(scope)
+
+    @classmethod
+    def resolve_existing_path(cls, root: Path, scope: str, suffix: str) -> Path:
+        encoded_path = cls.path(root, scope, suffix)
+        if encoded_path.exists():
+            return encoded_path
+        legacy_name = (str(scope).strip() or "__default__")
+        legacy_path = root / f"{legacy_name}{suffix}"
+        if legacy_path.exists():
+            return legacy_path
+        return encoded_path
+
+    @classmethod
+    def iter_scope_paths(cls, root: Path, suffix: str) -> list[tuple[str, Path]]:
+        seen: set[str] = set()
+        items: list[tuple[str, Path]] = []
+        for path in sorted(root.glob(f"*{suffix}")):
+            storage_name = path.name[: -len(suffix)] if suffix else path.name
+            scope = cls.decode(storage_name)
+            if scope in seen:
+                continue
+            seen.add(scope)
+            items.append((scope, path))
+        return items
+
+
+def _task_bucket_from_scope(scope: str) -> str:
+    scope_name = str(scope).strip()
+    if not scope_name:
+        return ""
+    if scope_name.startswith(CROSS_DOMAIN_SCOPE_PREFIX):
+        return scope_name[len(CROSS_DOMAIN_SCOPE_PREFIX):].strip()
+    parts = scope_name.split("_", 1)
+    if len(parts) == 2 and parts[0] in {"weather", "finance"}:
+        return parts[1].strip()
+    return scope_name
+
+
+def _cross_domain_scope_for_bucket(bucket: str) -> str:
+    bucket_name = str(bucket).strip()
+    return f"{CROSS_DOMAIN_SCOPE_PREFIX}{bucket_name}" if bucket_name else CROSS_DOMAIN_SCOPE
+
+
+def _cross_domain_scope_for_scope(scope: str) -> str:
+    return _cross_domain_scope_for_bucket(_task_bucket_from_scope(scope))
+
+
+def _is_cross_domain_scope(scope: str) -> bool:
+    scope_name = str(scope).strip()
+    return scope_name == CROSS_DOMAIN_SCOPE or scope_name.startswith(CROSS_DOMAIN_SCOPE_PREFIX)
+
+
+def _available_tool_names() -> set[str]:
+    try:
+        from timeclaw.clawhub.tool_registry import discover_and_register, list_tool_instances
+
+        tools = list_tool_instances()
+        if not tools:
+            discover_and_register()
+            tools = list_tool_instances()
+        return {t.name for t in tools}
+    except Exception:
+        return set()
+
+
+def _canonicalize_tool_list(tool_names: list[str]) -> list[str]:
+    available = _available_tool_names()
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_name in tool_names:
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        key = re.sub(r"\s+", "_", name.lower())
+        canonical = _TOOL_NAME_ALIASES.get(key, name)
+        if canonical not in available:
+            continue
+        if canonical in _FRAMEWORK_TOOLS or canonical in seen:
+            continue
+        seen.add(canonical)
+        out.append(canonical)
+    return out
+
+
+def _canonicalize_tool_chain_list(tool_chains: Any) -> list[list[str]]:
+    available = _available_tool_names()
+    normalized: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    if not isinstance(tool_chains, list):
+        return []
+    for raw_chain in tool_chains:
+        if not isinstance(raw_chain, list):
+            continue
+        chain: list[str] = []
+        chain_seen: set[str] = set()
+        for raw_name in raw_chain:
+            name = str(raw_name).strip()
+            if not name:
+                continue
+            key = re.sub(r"\s+", "_", name.lower())
+            canonical = _TOOL_NAME_ALIASES.get(key, name)
+            if canonical not in available:
+                continue
+            if canonical in _FRAMEWORK_TOOLS or canonical in chain_seen:
+                continue
+            chain_seen.add(canonical)
+            chain.append(canonical)
+        if not chain:
+            continue
+        chain_key = tuple(chain)
+        if chain_key in seen:
+            continue
+        seen.add(chain_key)
+        normalized.append(chain)
+    return normalized
+
+
+def _tool_chain_text(tool_chain: list[str]) -> str:
+    return " -> ".join(str(tool).strip() for tool in tool_chain if str(tool).strip())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Notes (append-only experience log, distillation source only)
+# ═══════════════════════════════════════════════════════════════════════
+
+class Notes:
+    """Append-only natural-language note store used as distillation source.
+
+    New definition:
+    - `Notes` is the raw note collection/layer name
+    - one individual record is still called a `note`
+    - storage is scope-sharded on disk under `notes/<scope>.md`
+    """
+
+    def __init__(self, reasoner_llm=None):
+        NOTES_DIR.mkdir(parents=True, exist_ok=True)
+        self._total_count = self._count_notes_on_disk()
+        self._scope_counts = self._count_scope_notes_on_disk()
+        self._pending: list[dict[str, Any]] = []
+        self._scope_locks: dict[str, asyncio.Lock] = {}
+        self._lock_registry_lock = asyncio.Lock()
+        self._counts_lock = asyncio.Lock()
+        self._note_llm = reasoner_llm
+
+    @property
+    def total(self) -> int:
+        return self._total_count
+
+    def scoped_total(self, scope: str) -> int:
+        return int(self._scope_counts.get(scope, 0) or 0)
+
+    async def _get_llm(self):
+        if self._note_llm is None:
+            from timeclaw.core.config import TimeClawConfig
+            from timeclaw.llm.router import ModelRouter
+            cfg = TimeClawConfig.load()
+            router = ModelRouter(cfg.llm)
+            self._note_llm = router.get_backend("reasoner")
+        return self._note_llm
+
+    async def add(self, run_context: dict[str, Any]) -> int:
+        note_text = self._build_note(run_context)
+        scope = str(run_context.get("scope_key", "")).strip()
+        scope_lock = await self._scope_lock(scope)
+
+        async with scope_lock:
+            self._append_to_scope_log(note_text, run_context)
+            async with self._counts_lock:
+                self._total_count += 1
+                if scope:
+                    self._scope_counts[scope] = self._scope_counts.get(scope, 0) + 1
+                return self._total_count
+
+    async def _scope_lock(self, scope: str) -> asyncio.Lock:
+        scope_name = scope or "__default__"
+        async with self._lock_registry_lock:
+            lock = self._scope_locks.get(scope_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._scope_locks[scope_name] = lock
+            return lock
+
+    @staticmethod
+    def _scope_storage_name(scope: str) -> str:
+        return _ScopeStorageCodec.encode(scope)
+
+    @classmethod
+    def _scope_log_path(cls, scope: str) -> Path:
+        return _ScopeStorageCodec.resolve_existing_path(NOTES_DIR, scope, ".md")
+
+    @staticmethod
+    def _count_notes_on_disk() -> int:
+        total = 0
+        for path in NOTES_DIR.glob("*.md"):
+            text = path.read_text(encoding="utf-8")
+            total += sum(1 for block in text.split("\n### ") if block.strip())
+        return total
+
+    @classmethod
+    def _count_scope_notes_on_disk(cls) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for path in NOTES_DIR.glob("*.md"):
+            for item in cls._note_items_from_text(path.name, path.read_text(encoding="utf-8")):
+                scope = cls._extract_scope_from_note_block(item["text"])
+                if scope:
+                    counts[scope] = counts.get(scope, 0) + 1
+        return counts
+
+    @staticmethod
+    def _stable_note_id(file_name: str, note: str) -> str:
+        payload = f"{file_name}\n{note}".encode("utf-8", errors="ignore")
+        return hashlib.sha1(payload).hexdigest()[:16]
+
+    @classmethod
+    def _note_items_from_text(cls, file_name: str, text: str) -> list[dict[str, str]]:
+        items: list[dict[str, str]] = []
+        sanitized_text = sanitize_learning_text(text)
+        for raw in reversed(sanitized_text.split("\n### ")):
+            note = sanitize_learning_text(raw).strip()
+            if not note:
+                continue
+            items.append({
+                "id": cls._stable_note_id(file_name, note),
+                "text": note,
+            })
+        return items
+
+    @staticmethod
+    def _extract_scope_from_note_block(note: str) -> str:
+        lines = note.splitlines()
+        for idx, line in enumerate(lines):
+            if line.strip() == "Scope:" and idx + 1 < len(lines):
+                scope = lines[idx + 1].strip()
+                if scope:
+                    return scope
+        first_content = ""
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                first_content = stripped
+                break
+        match = re.match(r"(?:###\s*)?(?:\[[^\]]+\]\s+)?([^\n]+?)\s+[—-]\s+(OK|FAIL|SCORED|LOGGED)\s*$", first_content)
+        if match:
+            return match.group(1).strip()
+        inline = re.match(r"\[([^\]]+)\]\s+(?:OK|FAIL|SCORED|LOGGED)\b", first_content)
+        if inline:
+            return inline.group(1).strip()
+        return ""
+
+    def _build_note(self, ctx: dict[str, Any]) -> str:
+        scope = ctx.get("scope_key", "")
+        domain = ctx.get("domain", "unknown")
+        task = ctx.get("task", "unknown")
+        metrics = ctx.get("metrics") or {}
+        outcome = self._outcome_label(ctx.get("correct"), metrics)
+        predicted = str(ctx.get("predicted", ""))
+        _GT_KEYS = {"ground_truth_label", "ground_truth", "correct"}
+        metric_items = [
+            (k, v) for k, v in metrics.items()
+            if isinstance(v, (int, float)) and k not in _GT_KEYS
+        ] if metrics else []
+        fingerprint = ctx.get("data_fingerprint", "")[:500]
+        description = ctx.get("description", "")
+        pipeline_summary = ctx.get("pipeline_summary", "")
+        analysis_structured = ctx.get("analysis_structured") or {}
+
+        candidate_traces = ctx.get("candidate_traces") or []
+        tools = self._winner_tools_for_note(ctx.get("tool_chain", []), candidate_traces)
+        winner_generators, winner_validators = self._split_tool_roles(tools)
+        approaches = self._format_approaches(candidate_traces)
+        candidates = self._format_candidates(
+            candidate_traces,
+            analysis_structured=analysis_structured,
+        )
+        task_prompt, numeric_block, _text_block = self._task_prompt_blocks(description)
+        source_lines = self._source_lines(ctx)
+
+        scope_label = scope or f"{domain}/{task}"
+        lines = [f"[{scope_label}] {outcome}", "", "Scope:", scope_label]
+        if source_lines:
+            lines.extend(["", "Source:"])
+            lines.extend(source_lines)
+        if task_prompt:
+            lines.extend([
+                "",
+                "Task Prompt:",
+                "[TASK_PROMPT_BEGIN]",
+                task_prompt,
+                "[TASK_PROMPT_END]",
+            ])
+        if numeric_block:
+            lines.extend([
+                "",
+                "Numeric Time Series:",
+                "[NUMERIC_TIME_SERIES_BEGIN]",
+                numeric_block,
+                "[NUMERIC_TIME_SERIES_END]",
+            ])
+        text_signals = self._select_text_signals(
+            description=description,
+            task=task,
+            analysis_structured=analysis_structured,
+        )
+        if text_signals:
+            lines.extend(["", "Text Signals:"])
+            lines.extend(f"- {item}" for item in text_signals)
+        single = ctx.get("evidence_kind") == "single_execution"
+        if single:
+            lines.extend(["", "Evidence Kind:", "single_execution", "No comparative signal; observed execution and score only."])
+        lines.extend(["", "Observed Tools:" if single else "Winner Tools:"])
+        winner_tools = winner_generators + winner_validators
+        if winner_tools:
+            lines.extend(f"- {tool}" for tool in winner_tools[:20])
+        else:
+            lines.append("- none")
+        lines.extend(["", "Prediction:", predicted])
+        if metric_items:
+            lines.extend(["", "Metrics:"])
+            lines.extend(
+                f"- {key}: {value:.3f}" for key, value in metric_items
+            )
+        if fingerprint:
+            lines.extend(["", "Fingerprint:", fingerprint])
+        if approaches:
+            lines.extend(["", "Approaches:"])
+            lines.extend(f"- {item}" for item in approaches[:5])
+        if candidates:
+            lines.extend(["", "Candidates:", "[CANDIDATES_BEGIN]"])
+            lines.extend(candidates[:3])
+            lines.append("[CANDIDATES_END]")
+        rendered_summary = self._analysis_without_text_signals(pipeline_summary, bool(text_signals))
+        if rendered_summary:
+            lines.extend(["", "Analysis:", "[ANALYSIS_BEGIN]", rendered_summary, "[ANALYSIS_END]"])
+        return sanitize_learning_text("\n".join(lines))
+
+    @staticmethod
+    def _source_lines(ctx: dict[str, Any]) -> list[str]:
+        source = ctx.get("source_metadata") or {}
+        if not isinstance(source, dict):
+            source = {}
+        dataset_name = str(source.get("dataset_name", "")).strip()
+        sample_ref = str(source.get("sample_ref", "")).strip()
+        source_file = str(source.get("source_file", "")).strip()
+        sample_idx = source.get("sample_idx")
+        task_name = str(source.get("task_name", "")).strip()
+        train_run_id = str(source.get("train_run_id", "")).strip()
+        trace_id = str(ctx.get("trace_id") or source.get("trace_id") or "").strip()
+
+        lines: list[str] = []
+        admission = source.get("training_source_admission")
+        if isinstance(admission, dict) and admission.get("observed_input_sha256"):
+            lines.append(f"- Input SHA256: {admission['observed_input_sha256']}")
+            lines.append("- Checked Evaluation Pools: " + ", ".join(admission["evaluation_datasets_checked"]))
+        if dataset_name:
+            lines.append(f"- Dataset: {dataset_name}")
+        if sample_ref:
+            lines.append(f"- Sample Ref: {sample_ref}")
+        if source_file:
+            lines.append(f"- Source File: {source_file}")
+        if isinstance(sample_idx, int):
+            lines.append(f"- Sample Index: {sample_idx}")
+        if task_name:
+            lines.append(f"- Task: {task_name}")
+        if train_run_id:
+            lines.append(f"- Train Run ID: {train_run_id}")
+        if trace_id:
+            lines.append(f"- Trace ID: {trace_id}")
+            lines.append(f"- Trace Path: {trace.get_trace_path(trace_id)}")
+        return lines
+
+    @classmethod
+    def _split_tool_roles(cls, tools: list[str]) -> tuple[list[str], list[str]]:
+        generators: list[str] = []
+        validators: list[str] = []
+        for raw_tool in tools:
+            tool = str(raw_tool).strip()
+            if not tool:
+                continue
+            if tool in _NOTE_VALIDATION_TOOLS:
+                validators.append(tool)
+            else:
+                generators.append(tool)
+        return generators, validators
+
+    @classmethod
+    def _task_prompt_blocks(cls, description: str) -> tuple[str, str, str]:
+        compact = cls._task_without_long_text(description).strip()
+        if not compact:
+            return "", "", ""
+
+        numeric_match = cls._extract_numeric_series_block(description)
+        text_match = cls._extract_text_context_block(description)
+
+        if numeric_match:
+            placeholder = f"{numeric_match['label']}\n[see Numeric Time Series block below]\n"
+            compact = compact.replace(str(numeric_match["full_text"]), placeholder, 1)
+        if text_match:
+            placeholder = f"{text_match['label']}\n[see Text Context block below]\n"
+            compact = compact.replace(str(text_match["full_text"]), placeholder, 1)
+
+        compact = re.sub(r"\n{3,}", "\n\n", compact).strip()
+        numeric_block = cls._render_extracted_block(numeric_match)
+        task_prompt = cls._compact_task_prompt(compact)
+        return task_prompt, numeric_block, ""
+
+    @staticmethod
+    def _compact_task_prompt(compact_prompt: str, max_lines: int = 6) -> str:
+        if not isinstance(compact_prompt, str) or not compact_prompt.strip():
+            return ""
+
+        text = compact_prompt.replace("\r", "\n")
+        if "\n\nUser prompt:\n" in text:
+            _system, user_text = text.split("\n\nUser prompt:\n", 1)
+        else:
+            user_text = text
+        user_text = re.sub(r"\[see Text Context block below\]", "[see Text Signals below]", user_text)
+        user_text = re.sub(r"\s+", " ", user_text).strip()
+        if not user_text:
+            return ""
+
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", user_text)
+            if sentence.strip()
+        ]
+        if not sentences:
+            sentences = [user_text]
+
+        selected: list[str] = []
+        seen: set[str] = set()
+        priority_patterns = [
+            r"\byour task is\b",
+            r"\binput time series\b|\bstock price\b|\btemperature readings\b|\btime series spans\b|\bestimation period\b",
+            r"\bevery 24\b|\bcompare\b|\bcalculate\b|\bclassify\b|\bthreshold\b|\bnext[- ]day\b",
+            r"\breturn\b|\boutput\b|\bensure the output\b|\bnumber of\b|\bjson\b",
+        ]
+        for pattern in priority_patterns:
+            for sentence in sentences:
+                lower = sentence.lower()
+                if re.search(pattern, lower) and sentence not in seen:
+                    selected.append(sentence)
+                    seen.add(sentence)
+                    if len(selected) >= max_lines:
+                        break
+            if len(selected) >= max_lines:
+                break
+
+        for sentence in sentences:
+            if len(selected) >= max_lines:
+                break
+            if sentence not in seen:
+                selected.append(sentence)
+                seen.add(sentence)
+
+        return "\n".join(f"- {item}" for item in selected[:max_lines])
+
+    @staticmethod
+    def _render_extracted_block(block: dict[str, str] | None) -> str:
+        if not isinstance(block, dict):
+            return ""
+        label = str(block.get("label", "")).strip()
+        body = str(block.get("body", "")).strip()
+        if label and body:
+            return f"{label}\n{body}"
+        return body or label
+
+    @classmethod
+    def _extract_numeric_series_block(cls, description: str) -> dict[str, str] | None:
+        if not isinstance(description, str) or not description.strip():
+            return None
+
+        explicit_patterns = [
+            r"(?P<label>The input prices are:)\s*(?P<body>\[(?:[^\[\]]|\n)+?\])",
+            r"(?P<label>The input temperature readings are:)\s*(?P<body>\[(?:[^\[\]]|\n)+?\])",
+            r"(?P<label>(?:\d+-day )?temperature time series[^\n:]*:)\s*(?P<body>\[(?:[^\[\]]|\n)+?\])",
+            r"(?P<label>stock price of .*?:)\s*(?P<body>\[(?:[^\[\]]|\n)+?\])",
+        ]
+        for pattern in explicit_patterns:
+            match = re.search(pattern, description, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return {
+                    "label": str(match.group("label")).strip(),
+                    "body": str(match.group("body")).strip(),
+                    "full_text": str(match.group(0)),
+                }
+
+        match = re.search(
+            r"\[(?:\s*-?\d+(?:\.\d+)?\s*,){4,}\s*-?\d+(?:\.\d+)?\s*\]",
+            description,
+            flags=re.DOTALL,
+        )
+        if not match:
+            return None
+        return {
+            "label": "Numeric time series:",
+            "body": str(match.group(0)).strip(),
+            "full_text": str(match.group(0)),
+        }
+
+    @staticmethod
+    def _extract_text_context_block(description: str) -> dict[str, str] | None:
+        if not isinstance(description, str) or not description.strip():
+            return None
+
+        patterns = [
+            (
+                r"(?P<label>The news article states:)\s*(?P<body>.*?)(?=(?:\n\nPlease return|\n\nBased on|\n\nReturn|\n\nNow, you need|Please return|Return your|Question:| Answer:|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>Weather report:)\s*(?P<body>.*?)(?=(?:\n\nYour task is|\n\nReturn ONLY|\n\nQuestion:|Return ONLY|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>News:)\s*(?P<body>.*?)(?=(?:\n\nYour task is|\n\nReturn ONLY|\n\nQuestion:|Return ONLY|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>Text:)\s*(?P<body>.*?)(?=(?:\n\nYour task is|\n\nReturn ONLY|\n\nQuestion:|Return ONLY|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>Context:)\s*(?P<body>.*?)(?=(?:\n\nQuestion:| Question:| Answer:|Return your answer|$))",
+                re.DOTALL,
+            ),
+            (
+                r"(?P<label>weather event report:)\s*(?P<body>.*?)(?=(?:Question:| Answer:|$))",
+                re.IGNORECASE | re.DOTALL,
+            ),
+            (
+                r"(?P<label>News published at [^\n]*?Z:)\s*(?P<body>.*?)(?=(?:Question:| Give your answer| Answer:|$))",
+                re.DOTALL,
+            ),
+        ]
+        for pattern, flags in patterns:
+            match = re.search(pattern, description, flags=flags)
+            if match:
+                body = str(match.group("body")).strip()
+                if not body:
+                    continue
+                return {
+                    "label": str(match.group("label")).strip(),
+                    "body": body,
+                    "full_text": str(match.group(0)),
+                }
+        return None
+
+    @classmethod
+    def _select_text_signals(
+        cls,
+        description: str,
+        task: str,
+        analysis_structured: dict[str, Any],
+    ) -> list[str]:
+        llm_signals = analysis_structured.get("text_signals")
+        if isinstance(llm_signals, list):
+            cleaned = [str(item).strip() for item in llm_signals if str(item).strip()]
+            if cleaned:
+                return cleaned[:6]
+        return cls._extract_text_signals(description, task=task, task_description=description)
+
+    @staticmethod
+    def _analysis_without_text_signals(pipeline_summary: str, has_top_level_text_signals: bool) -> str:
+        if not has_top_level_text_signals or not isinstance(pipeline_summary, str):
+            return pipeline_summary
+        marker = "Text Signals:\n"
+        if not pipeline_summary.startswith(marker):
+            return pipeline_summary
+        split_marker = "\n\nSample Conditions:\n"
+        idx = pipeline_summary.find(split_marker)
+        if idx < 0:
+            return pipeline_summary
+        return "Sample Conditions:\n" + pipeline_summary[idx + len(split_marker):].lstrip()
+
+    @staticmethod
+    def _round_display_numbers(value: Any) -> Any:
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, float):
+            return round(value, 3)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, list):
+            return [Notes._round_display_numbers(item) for item in value]
+        if isinstance(value, tuple):
+            return [Notes._round_display_numbers(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                str(key): Notes._round_display_numbers(item)
+                for key, item in value.items()
+            }
+        return value
+
+    @staticmethod
+    def _extract_text_signals(
+        description: str,
+        task: str = "",
+        task_description: str = "",
+        max_sentences: int = 5,
+        max_chars: int = 1200,
+    ) -> list[str]:
+        if not isinstance(description, str) or not description.strip():
+            return []
+        text = description
+        if "\n\nUser prompt:\n" in text:
+            text = text.split("\n\nUser prompt:\n", 1)[1]
+        signal_blocks: list[str] = []
+        for label in (
+            "Weather report:",
+            "News:",
+            "Text:",
+            "Context:",
+            "The news article states:",
+        ):
+            idx = text.find(label)
+            if idx < 0:
+                continue
+            snippet = text[idx + len(label):].strip()
+            for stop in (
+                "\n\nYour task is",
+                "\nYour task is",
+                "\n\nReturn ONLY",
+                "\nReturn ONLY",
+                "\n\nQuestion:",
+                "\nQuestion:",
+                "\n\nPlease return",
+                "\nPlease return",
+                "Please return",
+                "Return your",
+                "\n\nBased on",
+                "\nBased on",
+                "\n\nNow, you need",
+                "\nNow, you need",
+            ):
+                stop_idx = snippet.find(stop)
+                if stop_idx >= 0:
+                    snippet = snippet[:stop_idx].strip()
+                    break
+            snippet = " ".join(snippet.replace("||", " ").split())
+            if snippet:
+                signal_blocks.append(snippet)
+            break
+        if not signal_blocks:
+            match = re.search(
+                r"News published at [^\n]*?Z:\s*(?P<body>.*?)(?=(?:Question:| Give your answer| Answer:|$))",
+                text,
+                flags=re.DOTALL,
+            )
+            if match:
+                snippet = " ".join(str(match.group("body")).strip().replace("||", " ").split())
+                if snippet:
+                    signal_blocks.append(snippet)
+        if not signal_blocks:
+            return []
+        cleaned = signal_blocks[0]
+        sentences = Notes._candidate_text_sentences(cleaned)
+        ranked_sentences = Notes._rank_text_signals_for_task(
+            sentences,
+            task=task,
+            task_description=task_description or description,
+        )
+        selected: list[str] = []
+        used = 0
+        for sentence in ranked_sentences:
+            if len(selected) >= max_sentences:
+                break
+            if used + len(sentence) > max_chars and selected:
+                break
+            selected.append(sentence)
+            used += len(sentence)
+        return selected
+
+    @staticmethod
+    def _candidate_text_sentences(text_block: str) -> list[str]:
+        if not isinstance(text_block, str) or not text_block.strip():
+            return []
+
+        candidates: list[str] = []
+        content_match = re.search(r"Content:\s*(\[[\s\S]*\])", text_block, flags=re.DOTALL)
+        if content_match:
+            candidates.extend(Notes._parse_list_like_text_items(content_match.group(1)))
+        if not candidates:
+            content_line = re.search(r"Content:\s*(.+)", text_block, flags=re.DOTALL)
+            if content_line:
+                candidates.extend(Notes._split_text_signal_sentences(content_line.group(1)))
+
+        title_match = re.search(r"Title:\s*(.+?)(?=\s+Content:|$)", text_block, flags=re.DOTALL)
+        if title_match:
+            title = " ".join(title_match.group(1).split()).strip()
+            if title:
+                candidates.append(title if re.search(r"[.!?]$", title) else f"{title}.")
+
+        if not candidates:
+            candidates.extend(Notes._split_text_signal_sentences(text_block))
+
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for item in candidates:
+            normalized = " ".join(str(item).split()).strip().strip("[]")
+            if not normalized:
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                deduped.append(normalized)
+        return deduped
+
+    @staticmethod
+    def _parse_list_like_text_items(serialized: str) -> list[str]:
+        raw = str(serialized or "").strip()
+        if not raw:
+            return []
+
+        items: list[str] = []
+        try:
+            parsed = ast.literal_eval(raw)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, str) and item.strip():
+                    items.extend(Notes._split_text_signal_sentences(item))
+            if items:
+                return items
+
+        for quoted in re.findall(r"'([^']+)'|\"([^\"]+)\"", raw):
+            value = next((part for part in quoted if part), "").strip()
+            if value:
+                items.extend(Notes._split_text_signal_sentences(value))
+        return items
+
+    @staticmethod
+    def _split_text_signal_sentences(text: str) -> list[str]:
+        cleaned = " ".join(str(text or "").replace("||", " ").split()).strip()
+        if not cleaned:
+            return []
+        return [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", cleaned)
+            if sentence.strip()
+        ]
+
+    @staticmethod
+    def _rank_text_signals_for_task(
+        sentences: list[str],
+        task: str,
+        task_description: str = "",
+    ) -> list[str]:
+        """Rank text sentences by task relevance before truncation.
+
+        New definition:
+            `task focus` means the small set of content words extracted from
+            the full task description by a lightweight local prompt template.
+            It is only used to re-rank original text sentences; it does not
+            rewrite, summarize, or introduce task-specific hardcoded rules.
+        """
+        if not sentences:
+            return []
+
+        task_focus = Notes._task_focus_terms(task_description, task=task)
+
+        scored: list[tuple[int, int, str]] = []
+        for idx, sentence in enumerate(sentences):
+            lower = sentence.lower()
+            score = 0
+            for term in task_focus:
+                if term in lower:
+                    score += 1
+            if any(ch.isdigit() for ch in sentence):
+                score += 1
+            if any(token in lower for token in ("between", "near", "caused", "resulted", "damage", "injur", "fatal")):
+                score += 1
+            scored.append((-score, idx, sentence))
+
+        scored.sort()
+        return [sentence for _, _, sentence in scored]
+
+    @staticmethod
+    def _task_focus_terms(task_description: str, task: str = "", limit: int = 12) -> list[str]:
+        if not isinstance(task_description, str) or not task_description.strip():
+            return []
+
+        focus_text = task_description
+        lower = focus_text.lower()
+        for marker in (
+            "your task is to",
+            "your task is",
+            "task:",
+            "question:",
+            "return only",
+        ):
+            idx = lower.find(marker)
+            if idx >= 0:
+                focus_text = focus_text[idx + len(marker):]
+                break
+
+        prompt_prefix = (
+            f"Task type: {task}. Focus on the concrete entities, targets, variables, "
+            f"and requested outputs that matter for solving this task.\n"
+        )
+        focus_text = prompt_prefix + focus_text
+        focus_text = focus_text.replace("\n", " ")
+        focus_text = re.sub(r"[^a-zA-Z0-9_\- ]+", " ", focus_text)
+        tokens = [tok.lower() for tok in focus_text.split() if tok.strip()]
+
+        stop = {
+            "the", "a", "an", "and", "or", "to", "of", "for", "with", "in", "on", "at",
+            "from", "this", "that", "these", "those", "is", "are", "be", "as", "by",
+            "only", "return", "nothing", "else", "using", "based", "given", "predict",
+            "identify", "answer", "choose", "best", "next", "past", "values", "value",
+            "json", "array", "number", "numbers",
+        }
+        selected: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            if token in stop or len(token) < 3 or token.isdigit():
+                continue
+            if token not in seen:
+                seen.add(token)
+                selected.append(token)
+            if len(selected) >= limit:
+                break
+        return selected
+
+    @staticmethod
+    def _task_without_long_text(description: str) -> str:
+        if not isinstance(description, str) or not description.strip():
+            return ""
+        text = description
+        if "\n\nUser prompt:\n" not in text:
+            return text
+        system_part, user_part = text.split("\n\nUser prompt:\n", 1)
+        for label in (
+            "Weather report:",
+            "News:",
+            "Text:",
+            "Context:",
+            "The news article states:",
+        ):
+            idx = user_part.find(label)
+            if idx < 0:
+                continue
+            prefix = user_part[:idx].rstrip()
+            suffix = user_part[idx + len(label):]
+            for stop in (
+                "\n\nYour task is",
+                "\nYour task is",
+                "\n\nReturn ONLY",
+                "\nReturn ONLY",
+                "\n\nQuestion:",
+                "\nQuestion:",
+                "\n\nPlease return",
+                "\nPlease return",
+                "Please return",
+                "Return your",
+                "\n\nBased on",
+                "\nBased on",
+                "\n\nNow, you need",
+                "\nNow, you need",
+            ):
+                stop_idx = suffix.find(stop)
+                if stop_idx >= 0:
+                    suffix = suffix[stop_idx:].lstrip()
+                    break
+            user_part = f"{prefix}\n\n{label}\n[see Text Signals below]\n\n{suffix}".strip()
+            break
+        if "News published at " in user_part:
+            match = re.search(r"(News published at [^\n]*?Z:)", user_part)
+            if match:
+                label = match.group(1)
+                idx = user_part.find(label)
+                prefix = user_part[:idx].rstrip()
+                suffix = user_part[idx + len(label):]
+                for stop in (
+                    "\n\nYour task is",
+                    "\nYour task is",
+                    "\n\nReturn ONLY",
+                    "\nReturn ONLY",
+                    "\n\nQuestion:",
+                    "\nQuestion:",
+                    "\n\nPlease return",
+                    "\nPlease return",
+                    "Please return",
+                    "Return your",
+                    "\n\nBased on",
+                    "\nBased on",
+                    "\n\nNow, you need",
+                    "\nNow, you need",
+                    " Give your answer",
+                    " Answer:",
+                ):
+                    stop_idx = suffix.find(stop)
+                    if stop_idx >= 0:
+                        suffix = suffix[stop_idx:].lstrip()
+                        break
+                user_part = f"{prefix}\n\n{label}\n[see Text Signals below]\n\n{suffix}".strip()
+        return f"{system_part}\n\nUser prompt:\n{user_part}".strip()
+
+    @staticmethod
+    def _visible_tool_chain(tool_chain: list[str]) -> list[str]:
+        """Filter out orchestration / supervision tools from learned tool traces."""
+        return [t for t in tool_chain if t and t not in _FRAMEWORK_TOOLS]
+
+    @classmethod
+    def _winner_tools_for_note(
+        cls,
+        tool_chain: list[str],
+        candidate_traces: list[dict[str, Any]],
+    ) -> list[str]:
+        visible = cls._visible_tool_chain(tool_chain)
+        if visible:
+            return visible
+        explicit_correctness: list[bool] = []
+        total_candidates = 0
+        for trace in candidate_traces:
+            if not isinstance(trace, dict):
+                continue
+            if trace.get("prediction") is None:
+                continue
+            total_candidates += 1
+            metrics = trace.get("metrics")
+            if not isinstance(metrics, dict) or not metrics:
+                continue
+            if isinstance(metrics.get("correct"), bool):
+                explicit_correctness.append(bool(metrics.get("correct")))
+                continue
+            if isinstance(metrics.get("accuracy"), (int, float)):
+                explicit_correctness.append(float(metrics["accuracy"]) >= 1.0)
+        if explicit_correctness and total_candidates == len(explicit_correctness) and not any(explicit_correctness):
+            return []
+        winner = cls._select_best_candidate_trace(candidate_traces)
+        if not winner:
+            return []
+        return cls._visible_tool_chain(winner.get("tool_chain", []))
+
+    @staticmethod
+    def _candidate_score(metrics: dict[str, Any]) -> tuple[int, float]:
+        if isinstance(metrics.get("accuracy"), (int, float)):
+            return (0, -float(metrics["accuracy"]))
+        if isinstance(metrics.get("correct"), bool):
+            return (0, 0.0 if metrics["correct"] else 1.0)
+        for key in ("mae", "avg_mae", "rmse", "mse", "max_mae"):
+            if isinstance(metrics.get(key), (int, float)):
+                return (1, float(metrics[key]))
+        return (9, 0.0)
+
+    @classmethod
+    def _select_best_candidate_trace(
+        cls,
+        candidate_traces: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        valid = [
+            trace for trace in candidate_traces
+            if isinstance(trace, dict)
+            and isinstance(trace.get("metrics"), dict)
+            and trace.get("metrics")
+        ]
+        if not valid:
+            return None
+        return min(valid, key=lambda trace: cls._candidate_score(trace["metrics"]))
+
+    @staticmethod
+    def _outcome_label(correct: bool | None, metrics: dict[str, Any]) -> str:
+        """Map MTBench-style training outcomes to note labels.
+
+        New definition:
+            - ``OK`` / ``FAIL`` only for tasks with explicit binary correctness
+              (classification / QA / correlation style metrics).
+            - ``SCORED`` for continuous-score tasks that only provide graded
+              errors such as MAE / RMSE / component MAE.
+            - Explicit parse/type/tool errors still map to ``FAIL``.
+        """
+        if correct is True:
+            return "OK"
+        if correct is False:
+            return "FAIL"
+        if not metrics:
+            return "LOGGED"
+        if bool(metrics.get("parse_error")) or bool(metrics.get("type_error")):
+            return "FAIL"
+        if any(
+            bool(v) for k, v in metrics.items()
+            if k.endswith("_error") and k not in {"parse_error", "type_error"}
+        ):
+            return "FAIL"
+        return "SCORED"
+
+    @staticmethod
+    def _format_approaches(candidate_traces: list[dict[str, Any]]) -> list[str]:
+        """Build ranked candidate summaries directly from candidate traces."""
+        if not candidate_traces:
+            return []
+        ranked = Notes._ranked_candidate_summaries(candidate_traces)
+        return ranked[:5]
+
+    @staticmethod
+    def _candidate_evidence_by_path(
+        analysis_structured: dict[str, Any],
+    ) -> dict[str, list[str]]:
+        raw_items = analysis_structured.get("candidate_evidence")
+        if not isinstance(raw_items, list):
+            return {}
+        evidence_by_path: dict[str, list[str]] = {}
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            evidence = item.get("evidence")
+            if not path or not isinstance(evidence, list):
+                continue
+            # Temporary probe mode:
+            # preserve raw analysis evidence in notes so we can inspect the
+            # analysis LLM output without the later note-sanitization layer.
+            cleaned = [
+                str(entry).strip()
+                for entry in evidence
+                if str(entry).strip()
+            ]
+            if cleaned:
+                evidence_by_path[path] = cleaned[:2]
+        return evidence_by_path
+
+    @classmethod
+    def _format_candidates(
+        cls,
+        candidate_traces: list[dict[str, Any]],
+        *,
+        analysis_structured: dict[str, Any] | None = None,
+    ) -> list[str]:
+        if not candidate_traces:
+            return []
+        evidence_by_path = cls._candidate_evidence_by_path(analysis_structured or {})
+        formatted: list[str] = []
+        for idx, trace in enumerate(candidate_traces[:3]):
+            name = cls._display_candidate_name(trace, idx)
+            metrics = trace.get("metrics") or {}
+            _, score_label, _ = cls._candidate_score(metrics)
+            header = f"- Candidate: {name}"
+            if score_label:
+                header += f" ({score_label})"
+            block = [header]
+            if metrics:
+                metric_text = cls._stringify_metrics(metrics)
+                if metric_text:
+                    block.append(f"  Metrics: {metric_text}")
+            tool_chain = [t for t in trace.get("tool_chain", []) if t and t not in _FRAMEWORK_TOOLS]
+            generator_tools, validation_tools = cls._split_tool_roles(tool_chain)
+            tool_parts: list[str] = []
+            if generator_tools:
+                tool_parts.append(" -> ".join(generator_tools))
+            if validation_tools:
+                tool_parts.append(f"Validation: {' -> '.join(validation_tools)}")
+            if tool_parts:
+                block.append(f"  Tools: {' | '.join(tool_parts)}")
+            prediction = cls._short_prediction_value(trace.get("prediction"))
+            if prediction:
+                block.append(f"  Prediction: {prediction}")
+            evidence_items = evidence_by_path.get(name, [])
+            reasoning = " ".join(
+                item if item.endswith(".") else f"{item}."
+                for item in evidence_items[:2]
+            ).strip()
+            if reasoning:
+                block.append(f"  Reasoning: {reasoning}")
+            weakness = cls._compact_candidate_weakness(trace)
+            if weakness:
+                block.append(f"  Weakness: {weakness}")
+            formatted.append("\n".join(block))
+        return formatted
+
+    @staticmethod
+    def _short_prediction_value(prediction: Any) -> str:
+        if prediction is None or isinstance(prediction, (list, tuple, dict)):
+            return ""
+        rendered = Notes._stringify_value(prediction).strip()
+        if not rendered or len(rendered) > 80 or "\n" in rendered:
+            return ""
+        return rendered
+
+    @staticmethod
+    def _sanitize_candidate_reasoning(text: str) -> str:
+        cleaned = str(text).strip()
+        if not cleaned:
+            return ""
+        cleaned = re.sub(r"^\s*\d+[\.\)\-:]\s*", "", cleaned)
+        cleaned = re.sub(r"(?i)\breason:\s*", "", cleaned)
+        cleaned = re.sub(r"(?i)\baction:\s*.*$", "", cleaned)
+        cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+        cleaned = sanitize_learning_evidence_text(cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,:;|-")
+        lower = cleaned.lower()
+        banned_markers = (
+            "spawn_subagent",
+            "evaluate_against_gt",
+            "evaluate_batch_against_gt",
+            "batch_evaluate_against_gt",
+            "task-valid",
+            "tool call",
+            "call a tool",
+            "calling a tool",
+        )
+        if any(marker in lower for marker in banned_markers):
+            return ""
+        if lower.startswith("tool "):
+            return ""
+        # Keep short but meaningful tool intentions such as "run ets" instead
+        # of dropping them purely due to length.
+        if len(cleaned) < 4:
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _compact_candidate_reasoning(trace: dict[str, Any]) -> str:
+        """Render note-facing reasoning from execution-only public snippets.
+
+        New definition:
+            Notes may reuse only explicit execution-side public reasoning. They
+            must not reconstruct reasoning from raw step thoughts, because those
+            thoughts can still contain search/control-flow language.
+        """
+        if "public_reasoning_snippets" in trace:
+            public_snippets = trace.get("public_reasoning_snippets")
+            if not isinstance(public_snippets, list):
+                return ""
+            cleaned_public = [
+                str(item).strip()
+                for item in public_snippets
+                if str(item).strip()
+            ]
+            if cleaned_public:
+                rendered: list[str] = []
+                for snippet in cleaned_public[:2]:
+                    snippet = snippet[0].upper() + snippet[1:] if snippet else snippet
+                    if not snippet.endswith("."):
+                        snippet += "."
+                    rendered.append(snippet)
+                return " ".join(rendered)
+            return ""
+        return ""
+
+    @staticmethod
+    def _compact_candidate_weakness(trace: dict[str, Any]) -> str:
+        tool_chain = [t for t in trace.get("tool_chain", []) if t and t not in _FRAMEWORK_TOOLS]
+        if tool_chain == ["basic_stats"]:
+            return "Relied on global summary statistics without an explicit future-path estimate."
+
+        metrics = trace.get("metrics") or {}
+        if bool(metrics.get("correct")):
+            return ""
+        if isinstance(metrics.get("accuracy"), (int, float)) and float(metrics["accuracy"]) >= 0.999:
+            return ""
+
+        steps = trace.get("steps")
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                tool = str(step.get("tool") or "").strip()
+                obs = step.get("observation")
+                if tool == "arima_forecast" and isinstance(obs, dict):
+                    forecast = obs.get("forecast")
+                    if isinstance(forecast, list):
+                        numeric = [float(v) for v in forecast if isinstance(v, (int, float))]
+                        if len(numeric) >= 3 and max(numeric) - min(numeric) < 0.5:
+                            return "Forecast path was nearly flat, which can miss structured seasonality."
+        _, score_label, _ = Notes._candidate_score(metrics)
+        if score_label:
+            return f"This path recorded {score_label} on the sample."
+        return ""
+
+    @staticmethod
+    def _ranked_candidate_summaries(candidate_traces: list[dict[str, Any]]) -> list[str]:
+        ranked: list[tuple[tuple[int, float], str]] = []
+        fallback: list[str] = []
+        seen: set[str] = set()
+        for idx, trace in enumerate(candidate_traces):
+            if not isinstance(trace, dict):
+                continue
+            name = Notes._display_candidate_name(trace, idx)
+            if name in seen:
+                continue
+            seen.add(name)
+            metrics = trace.get("metrics") or {}
+            score_value, score_label, sort_key = Notes._candidate_score(metrics)
+            if score_label:
+                ranked.append((sort_key, f"{name}({score_label})"))
+            else:
+                fallback.append(name)
+        ranked.sort(key=lambda item: item[0])
+        return [text for _, text in ranked] + fallback
+
+    @staticmethod
+    def _format_candidate_steps(steps: Any, role: str = "all") -> list[str]:
+        if not isinstance(steps, list):
+            return []
+        rendered: list[str] = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            tool = str(step.get("tool") or "").strip()
+            if not tool:
+                continue
+            is_validation = tool in _NOTE_VALIDATION_TOOLS
+            if role == "generator" and is_validation:
+                continue
+            if role == "validation" and not is_validation:
+                continue
+            rendered.append(f"  - Tool: {tool}")
+            reason = str(step.get("thought") or "").strip()
+            if reason:
+                rendered.append(f"    Reason/Action: {reason}")
+            observation = step.get("observation")
+            if observation is not None:
+                rendered.append(f"    Observation: {Notes._stringify_observation(observation)}")
+        return rendered
+
+    @staticmethod
+    def _display_candidate_name(trace: dict[str, Any], index: int) -> str:
+        display = canonical_candidate_label(
+            candidate_key=trace.get("candidate_key"),
+            name=trace.get("name"),
+            tool_chain=[t for t in trace.get("tool_chain", []) if t and t not in _FRAMEWORK_TOOLS],
+            fallback=f"candidate_{index}",
+        )
+        return display[:80]
+
+    @staticmethod
+    def _candidate_score(metrics: dict[str, Any]) -> tuple[float | None, str, tuple[int, float]]:
+        if not isinstance(metrics, dict) or not metrics:
+            return None, "", (9, 0.0)
+        for key in ("mae", "avg_mae", "rmse", "mse", "max_mae"):
+            if isinstance(metrics.get(key), (int, float)):
+                value = float(metrics[key])
+                label_parts = [f"{key}={value:.3f}"]
+                if key != "rmse" and isinstance(metrics.get("rmse"), (int, float)):
+                    label_parts.append(f"rmse={float(metrics['rmse']):.3f}")
+                return value, ", ".join(label_parts), (1, value)
+        if isinstance(metrics.get("accuracy"), (int, float)):
+            value = float(metrics["accuracy"])
+            return value, f"acc={value:.3f}", (0, -value)
+        return None, "", (9, 0.0)
+
+    @staticmethod
+    def _stringify_value(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(
+                Notes._round_display_numbers(value),
+                ensure_ascii=False,
+                default=str,
+            )
+        except TypeError:
+            return str(value)
+
+    @staticmethod
+    def _stringify_metrics(metrics: dict[str, Any]) -> str:
+        parts: list[str] = []
+        for key in ("mae", "avg_mae", "rmse", "mse", "mape", "max_mae", "accuracy"):
+            value = metrics.get(key)
+            if isinstance(value, (int, float)):
+                parts.append(f"{key}={float(value):.3f}")
+        if not parts:
+            return ""
+        return ", ".join(parts)
+
+    @staticmethod
+    def _stringify_observation(observation: Any) -> str:
+        payload = observation
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                return payload
+        if isinstance(payload, dict):
+            filtered = dict(payload)
+            if "quantiles" in filtered:
+                filtered.pop("quantiles", None)
+            if "fitted_values" in filtered:
+                filtered.pop("fitted_values", None)
+            if "order" in filtered:
+                filtered.pop("order", None)
+            try:
+                return json.dumps(
+                    Notes._round_display_numbers(filtered),
+                    ensure_ascii=False,
+                    default=str,
+                )
+            except TypeError:
+                return str(filtered)
+        return Notes._stringify_value(payload)
+
+    @staticmethod
+    def _observation_contains_prediction(steps: Any, prediction: Any) -> bool:
+        if not isinstance(steps, list):
+            return False
+        prediction_text = Notes._stringify_value(prediction)
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            observation = step.get("observation")
+            if observation is None:
+                continue
+            if isinstance(observation, str):
+                try:
+                    observation = json.loads(observation)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if isinstance(observation, dict):
+                for key in ("point_forecast", "forecast", "prediction", "values", "answer"):
+                    if key in observation:
+                        return True
+            observation_text = (
+                observation if isinstance(observation, str)
+                else Notes._stringify_value(observation)
+            )
+            if prediction_text and prediction_text in observation_text:
+                return True
+        return False
+
+    def _append_to_scope_log(self, note: str, ctx: dict[str, Any]) -> None:
+        scope = ctx.get("scope_key", "")
+        domain = ctx.get("domain", "")
+        task = ctx.get("task", "")
+        correct = self._outcome_label(ctx.get("correct"), ctx.get("metrics") or {})
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        path = self._scope_log_path(str(scope).strip())
+
+        label = sanitize_learning_text(scope or f"{domain}/{task}")
+        clean_note = sanitize_learning_text(note).strip()
+        entry = sanitize_learning_text(f"\n### [{timestamp}] {label} — {correct}\n{clean_note}\n")
+        with path.open("a", encoding="utf-8") as f:
+            f.write(entry)
+
+    def search(self, query: str, k: int = _L1_RETRIEVAL_K,
+               domain: str | None = None, task: str | None = None,
+               scope: str | None = None,
+               return_ids: bool = False) -> list[str] | list[dict[str, Any]]:
+        tokens = [token.lower() for token in re.findall(r"\w+", query or "") if token.strip()]
+        matches: list[dict[str, Any]] = []
+        files = sorted(NOTES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            for item in self._note_items_from_text(path.name, text):
+                note = item["text"]
+                parsed = DistillationAgent._parse_note_sections(note)
+                note_scope = str(parsed["sections"].get("Scope") or parsed.get("header") or "").strip()
+                if scope and note_scope != scope:
+                    continue
+                if domain and parsed.get("domain") != domain:
+                    continue
+                if task and parsed.get("task") != task:
+                    continue
+                lower = note.lower()
+                score = sum(lower.count(token) for token in tokens) if tokens else 0
+                if tokens and score == 0 and scope is None and domain is None and task is None:
+                    continue
+                matches.append({
+                    "id": item["id"],
+                    "text": note,
+                    "score": score,
+                })
+        matches.sort(key=lambda item: (-int(item["score"]), item["id"]), reverse=False)
+        trimmed = matches[:k]
+        if return_ids:
+            return [{"id": item["id"], "text": item["text"]} for item in trimmed]
+        return [item["text"] for item in trimmed]
+
+    def delete_notes(self, note_ids: list[str]) -> int:
+        logger.info("[Notes] delete_notes is disabled; notes are kept as raw distillation sources")
+        return 0
+
+    def get_recent_notes(self, n: int = 10) -> list[str]:
+        return [item["text"] for item in self.get_recent_note_items(n)]
+
+    def get_recent_note_items(self, n: int = 10) -> list[dict[str, str]]:
+        files = sorted(NOTES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        notes: list[dict[str, str]] = []
+        for f in files:
+            if len(notes) >= n:
+                break
+            for item in self._note_items_from_text(f.name, f.read_text(encoding="utf-8")):
+                notes.append(item)
+                if len(notes) >= n:
+                    break
+        return notes[:n]
+
+    def get_scope_note_items(self, scope: str) -> list[dict[str, Any]]:
+        """Return one scope's notes in append order with a stable 1-based sequence."""
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return []
+        path = self._scope_log_path(scope_name)
+        if not path.exists():
+            return []
+        items = self._note_items_from_text(path.name, path.read_text(encoding="utf-8"))
+        items.reverse()
+        for idx, item in enumerate(items, start=1):
+            item["seq"] = idx
+        return items
+
+    async def resolve_conflicts(self, query: str,
+                                domain: str | None = None,
+                                task: str | None = None,
+                                scope: str | None = None) -> list[str]:
+        notes = self.search(
+            query, k=_L1_RETRIEVAL_K * 3,
+            domain=domain, task=task, scope=scope,
+        )
+        return notes if isinstance(notes, list) else [item["text"] for item in notes]
+
+    def get_prompt_section(self, query: str,
+                           domain: str | None = None,
+                           task: str | None = None,
+                           scope: str | None = None) -> str:
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MEMORY.md — Causal insights distilled from notes
+# ═══════════════════════════════════════════════════════════════════════
+
+class MemoryEntry:
+    """Structured MEMORY rule stored per scope.
+
+    New definition:
+        A MEMORY entry is now a scope-local rule object rather than a single
+        free-form insight string. `conditions` are descriptive only; they are
+        not used as retrieval keys because scope is already the hard boundary.
+        `preferred_tool_chains` / `avoid_tool_chains` are ordered workflow
+        hints and should only be used when path order materially changes the
+        operational guidance.
+
+    New definition:
+        `conflict_rule_ids` stores the persisted ids of rules that this rule
+        conflicts with. It is cumulative relationship metadata, not prompt
+        content, and is used to recompute `injectable` from cumulative support.
+    """
+
+    def __init__(
+        self,
+        scope: str,
+        rule_id: str,
+        kind: str,
+        summary: str,
+        conditions: list[str] | None = None,
+        preferred_tools: list[str] | None = None,
+        avoid_tools: list[str] | None = None,
+        preferred_tool_chains: list[list[str]] | None = None,
+        avoid_tool_chains: list[list[str]] | None = None,
+        rationale: str = "",
+        evidence: dict[str, Any] | None = None,
+        source_rule_ids: list[str] | None = None,
+        conflict_rule_ids: list[str] | None = None,
+        confidence: float = 0.5,
+        injectable: bool = True,
+        status: str = "active",
+        timestamp: float = 0.0,
+    ):
+        self.scope = scope
+        self.rule_id = rule_id
+        self.kind = kind
+        self.summary = summary
+        self.conditions = conditions or []
+        self.preferred_tools = preferred_tools or []
+        self.avoid_tools = avoid_tools or []
+        self.preferred_tool_chains = preferred_tool_chains or []
+        self.avoid_tool_chains = avoid_tool_chains or []
+        self.rationale = rationale
+        self.evidence = evidence or {}
+        self.source_rule_ids = source_rule_ids or []
+        self.conflict_rule_ids = conflict_rule_ids or []
+        self.confidence = confidence
+        self.injectable = injectable
+        self.status = status
+        self.timestamp = timestamp or time.time()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scope": self.scope,
+            "rule_id": self.rule_id,
+            "kind": self.kind,
+            "summary": self.summary,
+            "conditions": list(self.conditions),
+            "preferred_tools": list(self.preferred_tools),
+            "avoid_tools": list(self.avoid_tools),
+            "preferred_tool_chains": [list(chain) for chain in self.preferred_tool_chains],
+            "avoid_tool_chains": [list(chain) for chain in self.avoid_tool_chains],
+            "rationale": self.rationale,
+            "evidence": dict(self.evidence),
+            "source_rule_ids": list(self.source_rule_ids),
+            "conflict_rule_ids": list(self.conflict_rule_ids),
+            "confidence": float(self.confidence),
+            "injectable": bool(self.injectable),
+            "status": self.status,
+            "timestamp": self.timestamp,
+        }
+
+
+class MemoryStore:
+    """MEMORY.md — causal insights partitioned by scope (domain_task)."""
+
+    def __init__(self):
+        MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        self._entries: dict[str, list[dict]] = {}
+        self._load_existing()
+
+    def _load_existing(self) -> None:
+        for scope, f in _ScopeStorageCodec.iter_scope_paths(MEMORY_DIR, ".json"):
+            try:
+                raw = json.loads(f.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    normalized = [
+                        self._normalize_entry(scope, entry, idx)
+                        for idx, entry in enumerate(raw)
+                    ]
+                    normalized = self._dedupe_rule_ids(normalized)
+                    self._entries[scope] = normalized
+                    if normalized != raw:
+                        _atomic_write_text(
+                            f,
+                            json.dumps(normalized, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+            except Exception:
+                pass
+
+    def get_entries(self, scope: str) -> list[dict]:
+        return self._entries.get(scope, [])
+
+    def get_all_entries(self) -> list[dict]:
+        all_entries = []
+        for entries in self._entries.values():
+            all_entries.extend(entries)
+        return all_entries
+
+    def total(self) -> int:
+        return sum(len(v) for v in self._entries.values())
+
+    def add_entries(self, scope: str, new_entries: list[dict],
+                    removed_rule_ids: list[str] | None = None) -> None:
+        if removed_rule_ids:
+            removed_set = {str(item).strip() for item in removed_rule_ids if str(item).strip()}
+            existing = [
+                e for e in self._entries.get(scope, [])
+                if str(e.get("rule_id", "")).strip() not in removed_set
+            ]
+            n_removed = len(self._entries.get(scope, [])) - len(existing)
+            if n_removed:
+                logger.info(f"[MEMORY] {scope}: removed {n_removed} contradicted rules")
+            self._entries[scope] = existing
+
+        existing = self._entries.get(scope, [])
+        existing_ids = {str(e.get("rule_id", "")) for e in existing}
+        existing_summaries = {str(e.get("summary", "")) for e in existing}
+        for idx, entry in enumerate(new_entries):
+            normalized = self._normalize_entry(scope, entry, len(existing) + idx)
+            rule_id = str(normalized.get("rule_id", "")).strip()
+            summary = str(normalized.get("summary", "")).strip()
+            if rule_id and rule_id not in existing_ids and summary not in existing_summaries:
+                existing.append(normalized)
+                existing_ids.add(rule_id)
+                existing_summaries.add(summary)
+        self._entries[scope] = existing
+        path = _ScopeStorageCodec.path(MEMORY_DIR, scope, ".json")
+        _atomic_write_text(path, json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def replace_entries(self, scope: str, entries: list[dict]) -> None:
+        normalized = [self._normalize_entry(scope, entry, idx) for idx, entry in enumerate(entries)]
+        normalized = self._dedupe_rule_ids(normalized)
+        self._entries[scope] = normalized
+        path = _ScopeStorageCodec.path(MEMORY_DIR, scope, ".json")
+        _atomic_write_text(path, json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def get_cross_domain_entries(self, bucket: str = "") -> list[dict]:
+        if bucket:
+            return self.get_entries(_cross_domain_scope_for_bucket(bucket))
+        entries: list[dict] = []
+        for scope, scoped_entries in self._entries.items():
+            if _is_cross_domain_scope(scope):
+                entries.extend(scoped_entries)
+        return entries
+
+    @staticmethod
+    def _normalize_note_refs(refs: Any) -> list[str]:
+        if not isinstance(refs, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in refs:
+            ref = str(item).strip()
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            out.append(ref)
+        return out[:200]
+
+    @classmethod
+    def _entry_note_refs(cls, entry: dict[str, Any]) -> list[str]:
+        evidence = entry.get("evidence") if isinstance(entry.get("evidence"), dict) else {}
+        return cls._normalize_note_refs(evidence.get("sample_refs", []))
+
+    @classmethod
+    def _entry_support_count(cls, entry: dict[str, Any]) -> int:
+        refs = cls._entry_note_refs(entry)
+        return len(refs)
+
+    @staticmethod
+    def _normalize_conflict_rule_ids(rule_ids: Any) -> list[str]:
+        if not isinstance(rule_ids, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in rule_ids:
+            rule_id = str(item).strip()
+            if not rule_id or rule_id in seen:
+                continue
+            seen.add(rule_id)
+            out.append(rule_id)
+        return out
+
+    @staticmethod
+    def _normalize_rule_payload(scope: str, payload: dict[str, Any], index: int) -> dict[str, Any]:
+        kind = str(payload.get("kind", "")).strip() or "domain_heuristic"
+        summary = str(payload.get("summary", "")).strip()
+        conditions = [str(item).strip() for item in payload.get("conditions", []) if str(item).strip()]
+        preferred_tools = _canonicalize_tool_list(
+            [str(item).strip() for item in payload.get("preferred_tools", []) if str(item).strip()]
+        )
+        avoid_tools = _canonicalize_tool_list(
+            [str(item).strip() for item in payload.get("avoid_tools", []) if str(item).strip()]
+        )
+        preferred_tool_chains = _canonicalize_tool_chain_list(payload.get("preferred_tool_chains", []))
+        avoid_tool_chains = _canonicalize_tool_chain_list(payload.get("avoid_tool_chains", []))
+        rationale = str(payload.get("rationale", "")).strip()
+        source_rule_ids = [
+            str(item).strip()
+            for item in payload.get("source_rule_ids", [])
+            if str(item).strip()
+        ]
+        return MemoryEntry(
+            scope=scope,
+            rule_id=str(payload.get("rule_id", "")).strip() or f"{scope}::{index + 1:03d}",
+            kind=kind,
+            summary=summary,
+            conditions=conditions,
+            preferred_tools=preferred_tools,
+            avoid_tools=avoid_tools,
+            preferred_tool_chains=preferred_tool_chains,
+            avoid_tool_chains=avoid_tool_chains,
+            rationale=rationale,
+            evidence={"support_count": 0, "sample_refs": []},
+            source_rule_ids=source_rule_ids,
+            conflict_rule_ids=[],
+            status="active",
+        ).to_dict()
+
+    def get_prompt_section(self, domain: str = "", task: str = "", scope: str = "") -> str:
+        """Render all injectable MEMORY rules for the requested retrieval scope.
+
+        New definition:
+        - prompt injection for MEMORY is no longer top-k capped
+        - ranking still controls display order, but not inclusion
+        """
+        scope = scope or f"{domain}_{task}"
+        entries = [entry for entry in self.get_entries(scope) if bool(entry.get("injectable", True))]
+        domain_entries = [
+            entry for entry in self.get_entries(domain)
+            if bool(entry.get("injectable", True))
+        ] if domain else []
+        all_entries = sorted(
+            entries + domain_entries,
+            key=lambda entry: (
+                not bool(entry.get("injectable", True)),
+                -float(entry.get("confidence", 0.0) or 0.0),
+                -MemoryStore._entry_support_count(entry),
+                -float(entry.get("timestamp", 0.0) or 0.0),
+            ),
+        )
+        if not all_entries:
+            return ""
+        lines = ["## MEMORY — Learned Insights\n"]
+        if all_entries:
+            lines.append(f"### {scope} Specific")
+            for e in all_entries:
+                rendered = self._render_entry(e)
+                if rendered:
+                    lines.append(f"- {rendered}")
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _render_entry(entry: dict[str, Any]) -> str:
+        summary = str(entry.get("summary", "")).strip()
+        conditions = [str(item).strip() for item in entry.get("conditions", []) if str(item).strip()]
+        preferred = [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()]
+        avoid = [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()]
+        preferred_paths = _canonicalize_tool_chain_list(entry.get("preferred_tool_chains", []))
+        avoid_paths = _canonicalize_tool_chain_list(entry.get("avoid_tool_chains", []))
+        rationale = str(entry.get("rationale", "")).strip()
+        support = MemoryStore._entry_support_count(entry)
+
+        parts: list[str] = []
+        if summary:
+            parts.append(f"Rule: {summary}")
+        if conditions:
+            parts.append(f"When: {', '.join(conditions[:3])}")
+        if preferred_paths:
+            parts.append(
+                f"Prefer Path: {' || '.join(_tool_chain_text(chain) for chain in preferred_paths[:2])}"
+            )
+        if preferred:
+            parts.append(f"Prefer: {', '.join(preferred[:3])}")
+        if avoid_paths:
+            parts.append(
+                f"Avoid Path: {' || '.join(_tool_chain_text(chain) for chain in avoid_paths[:2])}"
+            )
+        if avoid:
+            parts.append(f"Avoid: {', '.join(avoid[:3])}")
+        if rationale:
+            parts.append(f"Why: {rationale}")
+        if support > 0:
+            parts.append(f"Evidence: {support} note(s)")
+        return " | ".join(parts)
+
+    @staticmethod
+    def _normalize_entry(scope: str, entry: dict[str, Any], index: int) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            entry = {}
+
+        # Migrate legacy single-string insight objects into the new rule schema.
+        if "summary" not in entry and "insight" in entry:
+            insight = str(entry.get("insight", "")).strip()
+            evidence_count = int(entry.get("evidence_count", 0) or 0)
+            entry = MemoryEntry(
+                scope=scope,
+                rule_id=f"{scope}::{index + 1:03d}",
+                kind="domain_heuristic",
+                summary=insight,
+                conditions=[],
+                preferred_tools=[],
+                avoid_tools=[],
+                preferred_tool_chains=[],
+                avoid_tool_chains=[],
+                rationale="",
+                evidence={"support_count": evidence_count, "sample_refs": []},
+                source_rule_ids=[
+                    str(item).strip()
+                    for item in entry.get("source_rule_ids", [])
+                    if str(item).strip()
+                ],
+                conflict_rule_ids=[],
+                status="active",
+                timestamp=float(entry.get("timestamp", 0.0) or time.time()),
+            ).to_dict()
+            return entry
+
+        summary = str(entry.get("summary", "")).strip()
+        rule_id = str(entry.get("rule_id", "")).strip() or f"{scope}::{index + 1:03d}"
+        kind = str(entry.get("kind", "")).strip() or "domain_heuristic"
+        conditions = [str(item).strip() for item in entry.get("conditions", []) if str(item).strip()]
+        preferred_tools = _canonicalize_tool_list(
+            [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()]
+        )
+        avoid_tools = _canonicalize_tool_list(
+            [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()]
+        )
+        preferred_tool_chains = _canonicalize_tool_chain_list(entry.get("preferred_tool_chains", []))
+        avoid_tool_chains = _canonicalize_tool_chain_list(entry.get("avoid_tool_chains", []))
+        rationale = str(entry.get("rationale", "")).strip()
+        evidence = entry.get("evidence") if isinstance(entry.get("evidence"), dict) else {}
+        evidence = {
+            **evidence,
+            "sample_refs": MemoryStore._normalize_note_refs(evidence.get("sample_refs", [])),
+        }
+        evidence["support_count"] = len(evidence["sample_refs"])
+        confidence = float(entry.get("confidence", 0.5) or 0.5)
+        injectable = bool(entry.get("injectable", True))
+        status = str(entry.get("status", "active")).strip() or "active"
+        timestamp = float(entry.get("timestamp", 0.0) or time.time())
+        source_rule_ids = [
+            str(item).strip()
+            for item in entry.get("source_rule_ids", [])
+            if str(item).strip()
+        ]
+        conflict_rule_ids = MemoryStore._normalize_conflict_rule_ids(entry.get("conflict_rule_ids", []))
+
+        return MemoryEntry(
+            scope=scope,
+            rule_id=rule_id,
+            kind=kind,
+            summary=summary,
+            conditions=conditions,
+            preferred_tools=preferred_tools,
+            avoid_tools=avoid_tools,
+            preferred_tool_chains=preferred_tool_chains,
+            avoid_tool_chains=avoid_tool_chains,
+            rationale=rationale,
+            evidence=evidence,
+            source_rule_ids=source_rule_ids,
+            conflict_rule_ids=conflict_rule_ids,
+            confidence=confidence,
+            injectable=injectable,
+            status=status,
+            timestamp=timestamp,
+        ).to_dict()
+
+    @staticmethod
+    def _dedupe_rule_ids(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep only the strongest entry for each non-empty rule_id."""
+        deduped: dict[str, dict[str, Any]] = {}
+        ordered_fallback: list[dict[str, Any]] = []
+
+        def _rank(entry: dict[str, Any]) -> tuple[float, int, float]:
+            return (
+                float(entry.get("confidence", 0.0) or 0.0),
+                MemoryStore._entry_support_count(entry),
+                float(entry.get("timestamp", 0.0) or 0.0),
+            )
+
+        for entry in entries:
+            rule_id = str(entry.get("rule_id", "")).strip()
+            if not rule_id:
+                ordered_fallback.append(entry)
+                continue
+            existing = deduped.get(rule_id)
+            if existing is None or _rank(entry) > _rank(existing):
+                deduped[rule_id] = entry
+
+        unique_entries = list(deduped.values()) + ordered_fallback
+        unique_entries.sort(
+            key=lambda entry: (
+                not bool(entry.get("injectable", True)),
+                -float(entry.get("confidence", 0.0) or 0.0),
+                -MemoryStore._entry_support_count(entry),
+            )
+        )
+        return unique_entries[:_MEMORY_RULE_CAP]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SOUL.md — Fixed agent identity (human-written, not learned)
+# ═══════════════════════════════════════════════════════════════════════
+
+def load_soul() -> str:
+    """Load the fixed SOUL.md content."""
+    if SOUL_FILE.exists():
+        return SOUL_FILE.read_text(encoding="utf-8").strip()
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TOOLS.md — Per-tool usage notes learned from experience
+# ═══════════════════════════════════════════════════════════════════════
+
+class ToolsStore:
+    """TOOLS.md — per-scope per-tool experience notes, distilled from MEMORY.
+
+    New definition:
+    - tool cards are keyed by exact ``scope_key``
+    - usage counters are also keyed by exact ``scope_key``
+    - prompt injection is filtered by the requested tool set, not by an extra fixed top-k cap
+    """
+
+    _MIN_RUNS = 5
+
+    def __init__(self):
+        MEMORY_ROOT.mkdir(parents=True, exist_ok=True)
+        self._notes_by_scope: dict[str, dict[str, dict[str, Any]]] = {}
+        self._scope_counts: dict[str, dict[str, int]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if TOOLS_FILE.exists():
+            try:
+                raw = json.loads(TOOLS_FILE.read_text())
+                if isinstance(raw, dict) and "notes_by_scope" in raw:
+                    self._notes_by_scope = {
+                        str(scope): {
+                            str(tool_name): self._normalize_note_payload(payload)
+                            for tool_name, payload in (tool_map or {}).items()
+                        }
+                        for scope, tool_map in (raw.get("notes_by_scope", {}) or {}).items()
+                    }
+                    self._scope_counts = raw.get("_scope_counts", {})
+                elif isinstance(raw, dict) and "_scope_counts" in raw:
+                    self._notes_by_scope = {}
+                    self._scope_counts = raw.get("_scope_counts", {})
+                else:
+                    self._notes_by_scope = {}
+            except Exception:
+                self._notes_by_scope = {}
+
+    def _reload_from_disk(self) -> None:
+        self._notes_by_scope = {}
+        self._scope_counts = {}
+        self._load()
+
+    def _save(self) -> None:
+        payload = {"notes_by_scope": self._notes_by_scope, "_scope_counts": self._scope_counts}
+        _atomic_write_text(TOOLS_FILE, json.dumps(payload, indent=2, ensure_ascii=False))
+
+    def get_notes(self, scope: str = "") -> dict[str, dict[str, Any]]:
+        if scope:
+            return dict(self._notes_by_scope.get(scope, {}))
+        merged: dict[str, dict[str, Any]] = {}
+        for tool_map in self._notes_by_scope.values():
+            for tool_name, payload in tool_map.items():
+                merged.setdefault(tool_name, payload)
+        return merged
+
+    def update(self, scope: str, notes: dict[str, Any]) -> None:
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return
+        with _exclusive_file_lock(TOOLS_LOCK_FILE):
+            self._reload_from_disk()
+            scoped = self._notes_by_scope.setdefault(scope_name, {})
+            scoped.update({
+                str(tool_name): self._normalize_note_payload(payload)
+                for tool_name, payload in notes.items()
+            })
+            self._save()
+        logger.info(f"[TOOLS] Updated usage notes for {len(notes)} tools in {scope_name}")
+
+    def replace(self, scope: str, notes: dict[str, Any]) -> None:
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return
+        with _exclusive_file_lock(TOOLS_LOCK_FILE):
+            self._reload_from_disk()
+            self._notes_by_scope[scope_name] = {
+                str(tool_name): self._normalize_note_payload(payload)
+                for tool_name, payload in notes.items()
+            }
+            self._save()
+        logger.info(f"[TOOLS] Rebuilt usage notes for {len(notes)} tools in {scope_name}")
+
+    def record_scope_usage(self, scope: str, tool_counts: dict[str, int]) -> None:
+        """Replace per-tool usage counts for a scope from the latest scan."""
+        with _exclusive_file_lock(TOOLS_LOCK_FILE):
+            self._reload_from_disk()
+            self._scope_counts[scope] = dict(tool_counts)
+            self._save()
+
+    def increment_scope_usage(self, scope: str, tool_names: list[str]) -> None:
+        """Increment per-tool usage counts for one scope from a finished run."""
+        if not scope or not tool_names:
+            return
+        with _exclusive_file_lock(TOOLS_LOCK_FILE):
+            self._reload_from_disk()
+            bucket = self._scope_counts.setdefault(scope, {})
+            for raw_name in tool_names:
+                name = str(raw_name).strip()
+                if not name:
+                    continue
+                bucket[name] = int(bucket.get(name, 0) or 0) + 1
+            self._save()
+
+    def get_scope_usage(self, scope: str) -> dict[str, int]:
+        """Return a copy of per-tool usage counts for one scope."""
+        return dict(self._scope_counts.get(scope, {}))
+
+    def total(self) -> int:
+        return sum(len(tool_map) for tool_map in self._notes_by_scope.values())
+
+    def get_tool_note(self, tool_name: str, scope: str) -> str:
+        payload = self._notes_by_scope.get(scope, {}).get(tool_name)
+        return self._render_note_payload(payload) if payload else ""
+
+    def get_prompt_for_tools(
+        self, tool_names: list[str], scope: str = "",
+    ) -> dict[str, str]:
+        """Return notes for the requested tools, ordered by scope-local usage."""
+        scope_data = self._scope_counts.get(scope, {}) if scope else {}
+        scoped_notes = self._notes_by_scope.get(scope, {}) if scope else {}
+        ranked: list[tuple[int, str, str]] = []
+        for name in tool_names:
+            payload = scoped_notes.get(name)
+            note = self._render_note_payload(payload) if payload else ""
+            if note:
+                ranked.append((scope_data.get(name, 0), name, note))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        result: dict[str, str] = {}
+        for _, name, note in ranked:
+            result[name] = note
+        return result
+
+    @staticmethod
+    def _normalize_note_payload(payload: Any) -> dict[str, Any]:
+        if isinstance(payload, str):
+            return {
+                "when_it_helps": [payload.strip()] if payload.strip() else [],
+                "when_to_avoid": [],
+                "output_risks": [],
+            }
+        if not isinstance(payload, dict):
+            return {"when_it_helps": [], "when_to_avoid": [], "output_risks": []}
+
+        def _listify(value: Any) -> list[str]:
+            if value is None:
+                return []
+            if isinstance(value, list):
+                return [str(item).strip() for item in value if str(item).strip()]
+            text = str(value).strip()
+            return [text] if text else []
+
+        return {
+            "when_it_helps": _listify(payload.get("when_it_helps")),
+            "when_to_avoid": _listify(payload.get("when_to_avoid")),
+            "output_risks": _listify(payload.get("output_risks")),
+        }
+
+    @staticmethod
+    def _render_note_payload(payload: dict[str, Any] | None) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        parts: list[str] = []
+        helps = [str(item).strip() for item in payload.get("when_it_helps", []) if str(item).strip()]
+        avoid = [str(item).strip() for item in payload.get("when_to_avoid", []) if str(item).strip()]
+        risks = [str(item).strip() for item in payload.get("output_risks", []) if str(item).strip()]
+        if helps:
+            parts.append("When it helps: " + "; ".join(helps[:2]))
+        if avoid:
+            parts.append("When to avoid: " + "; ".join(avoid[:2]))
+        if risks:
+            parts.append("Output risks: " + "; ".join(risks[:2]))
+        return " | ".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SKILLS/ — Scene-specific SOPs distilled from MEMORY insights
+# ═══════════════════════════════════════════════════════════════════════
+
+_SKILL_SECTION_ORDER = ("Trigger", "Core Idea", "Workflow", "Avoid", "Evidence")
+
+
+def _parse_skill_source_rule_ids(lines: list[str]) -> list[str]:
+    rule_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_line in lines:
+        text = str(raw_line or "").strip()
+        if not text:
+            continue
+        if text.startswith("- "):
+            text = text[2:].strip()
+        parsed_items: list[str] = []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                payload = json.loads(text)
+            except Exception:
+                payload = None
+            if isinstance(payload, list):
+                parsed_items.extend(str(item).strip() for item in payload if str(item).strip())
+        if not parsed_items:
+            parsed_items.extend(
+                str(item).strip()
+                for item in text.split(",")
+                if str(item).strip()
+            )
+        for rule_id in parsed_items:
+            if rule_id in seen:
+                continue
+            seen.add(rule_id)
+            rule_ids.append(rule_id)
+    return rule_ids
+
+
+def _parse_skill_markdown_blocks(skill_markdown: str) -> list[dict[str, Any]]:
+    text = str(skill_markdown or "").strip()
+    if not text:
+        return []
+    lines = text.splitlines()
+    blocks: list[dict[str, Any]] = []
+    current_title = ""
+    current_sections: dict[str, list[str]] = {}
+    current_section = ""
+
+    def _flush() -> None:
+        nonlocal current_title, current_sections, current_section
+        if not current_title:
+            current_sections = {}
+            current_section = ""
+            return
+        blocks.append(
+            {
+                "title": current_title.strip(),
+                "source_rule_ids": _parse_skill_source_rule_ids(
+                    current_sections.get("Source Rule IDs", [])
+                ),
+                "sections": {
+                    section_name: list(current_sections.get(section_name, []))
+                    for section_name in _SKILL_SECTION_ORDER
+                },
+            }
+        )
+        current_title = ""
+        current_sections = {}
+        current_section = ""
+
+    section_headers = {
+        "source rule ids:": "Source Rule IDs",
+        "trigger:": "Trigger",
+        "core idea:": "Core Idea",
+        "workflow:": "Workflow",
+        "avoid:": "Avoid",
+        "evidence:": "Evidence",
+    }
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("## SKILL"):
+            continue
+        if stripped.startswith("### Skill "):
+            _flush()
+            current_title = stripped
+            current_sections = {}
+            current_section = ""
+            continue
+        lowered = stripped.lower()
+        if lowered.startswith("source rule ids:"):
+            current_section = "Source Rule IDs"
+            current_sections.setdefault(current_section, [])
+            remainder = line.split(":", 1)[1].strip()
+            if remainder:
+                current_sections[current_section].append(remainder)
+            continue
+        header = section_headers.get(lowered)
+        if header:
+            current_section = header
+            current_sections.setdefault(header, [])
+            continue
+        if not current_title or not current_section:
+            continue
+        current_sections.setdefault(current_section, []).append(line)
+    _flush()
+    return blocks
+
+
+def _render_skill_markdown_blocks(
+    blocks: list[dict[str, Any]],
+    *,
+    include_source_rule_ids: bool,
+) -> str:
+    rendered_blocks: list[str] = []
+    for block in blocks:
+        title = str(block.get("title") or "").strip()
+        if not title:
+            continue
+        lines = [title]
+        if include_source_rule_ids:
+            source_rule_ids = [
+                str(rule_id).strip()
+                for rule_id in block.get("source_rule_ids") or []
+                if str(rule_id).strip()
+            ]
+            if source_rule_ids:
+                lines.append(f"Source Rule IDs: {', '.join(source_rule_ids)}")
+                lines.append("")
+        sections = block.get("sections") if isinstance(block.get("sections"), dict) else {}
+        for section_name in _SKILL_SECTION_ORDER:
+            values = [
+                str(item).rstrip()
+                for item in sections.get(section_name, [])
+                if str(item).strip()
+            ]
+            if not values:
+                continue
+            lines.append(f"{section_name}:")
+            lines.extend(values)
+            lines.append("")
+        rendered_blocks.append("\n".join(lines).strip())
+    return "\n\n".join(block for block in rendered_blocks if block).strip()
+
+
+class SkillsStore:
+    """SKILLS/ — per (domain, task) operational guides.
+
+    Each skill is a natural-language SOP describing how to approach
+    a specific task type: steps, tool combinations, and pitfalls.
+    Corresponds to OpenClaw SKILLS.md.
+    """
+
+    def __init__(self):
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        self._skills: dict[str, str] = {}
+        self._load()
+
+    def _load(self) -> None:
+        for scope, f in _ScopeStorageCodec.iter_scope_paths(SKILLS_DIR, ".md"):
+            try:
+                self._skills[scope] = f.read_text(encoding="utf-8")
+            except Exception:
+                pass
+    def get_skill(self, scope: str) -> str:
+        return self._skills.get(scope, "")
+
+    def get_skill_metadata(self, scope: str) -> dict[str, Any]:
+        skill_markdown = self._skills.get(scope, "")
+        if not skill_markdown:
+            return {}
+        return {
+            "scope": str(scope).strip(),
+            "skills": [
+                {
+                    "title": str(block.get("title") or "").strip(),
+                    "source_rule_ids": [
+                        str(rule_id).strip()
+                        for rule_id in block.get("source_rule_ids") or []
+                        if str(rule_id).strip()
+                    ],
+                }
+                for block in _parse_skill_markdown_blocks(skill_markdown)
+                if str(block.get("title") or "").strip()
+            ],
+        }
+
+    def total(self) -> int:
+        return len(self._skills)
+
+    def update_skill(self, scope: str, content: str) -> None:
+        self._skills[scope] = content
+        path = _ScopeStorageCodec.path(SKILLS_DIR, scope, ".md")
+        _atomic_write_text(path, content, encoding="utf-8")
+        logger.info(f"[SKILLS] Updated SOP for {scope}")
+
+    def delete_skill_metadata(self, scope: str) -> None:
+        path = _ScopeStorageCodec.resolve_existing_path(SKILLS_DIR, scope, ".meta.json")
+        if path.exists():
+            path.unlink()
+        logger.info(f"[SKILLS] Removed metadata for {scope}")
+
+    def delete_skill(self, scope: str) -> None:
+        if scope in self._skills:
+            del self._skills[scope]
+        path = _ScopeStorageCodec.resolve_existing_path(SKILLS_DIR, scope, ".md")
+        if path.exists():
+            path.unlink()
+        self.delete_skill_metadata(scope)
+        logger.info(f"[SKILLS] Removed SOP for {scope}")
+
+    def get_prompt_section(self, domain: str = "", task: str = "", scope: str = "") -> str:
+        scope = scope or f"{domain}_{task}"
+        skill = self._skills.get(scope, "")
+        if not skill:
+            return ""
+        prompt_skill = _render_skill_markdown_blocks(
+            _parse_skill_markdown_blocks(skill),
+            include_source_rule_ids=False,
+        ) or skill
+        lines = [f"## SKILL — Operational Guide for {scope}\n"]
+        lines.append(prompt_skill)
+        lines.append("")
+        return "\n".join(lines)
+
+
+class SkillsDecisionStore:
+    """SKILLS_DECISION/ — explanation-oriented guides for user-facing rendering.
+
+    These guides are not used to steer execution. They summarize why certain
+    evidence patterns usually support a decision, and are meant to be used only
+    as a rendering aid after real execution evidence has already been gathered.
+    """
+
+    def __init__(self):
+        SKILLS_DECISION_DIR.mkdir(parents=True, exist_ok=True)
+        self._skills_decision: dict[str, str] = {}
+        self._load()
+
+    def _load(self) -> None:
+        for scope, f in _ScopeStorageCodec.iter_scope_paths(SKILLS_DECISION_DIR, ".md"):
+            try:
+                self._skills_decision[scope] = f.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+    def get_skill_decision(self, scope: str) -> str:
+        return self._skills_decision.get(scope, "")
+
+    def total(self) -> int:
+        return len(self._skills_decision)
+
+    def update_skill_decision(self, scope: str, content: str) -> None:
+        self._skills_decision[scope] = content
+        path = _ScopeStorageCodec.path(SKILLS_DECISION_DIR, scope, ".md")
+        _atomic_write_text(path, content, encoding="utf-8")
+        logger.info(f"[SKILLS_DECISION] Updated decision guide for {scope}")
+
+    def delete_skill_decision(self, scope: str) -> None:
+        if scope in self._skills_decision:
+            del self._skills_decision[scope]
+        path = _ScopeStorageCodec.resolve_existing_path(SKILLS_DECISION_DIR, scope, ".md")
+        if path.exists():
+            path.unlink()
+        logger.info(f"[SKILLS_DECISION] Removed decision guide for {scope}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Distillation Prompts
+# ═══════════════════════════════════════════════════════════════════════
+
+NOTES_TO_MEMORY_PROMPT = """\
+You are updating scope-local MEMORY for a multimodal time-series agent.
+Your job is to convert raw experience notes into reusable task-solving rules.
+
+## Context
+Scope: {scope}
+Total runs analyzed: {total}
+
+## Statistics
+{statistics}
+
+## Sample Experience Notes (recent, each with stable note_id)
+{notes}
+
+## Existing Rules (review and update these)
+{existing_memory}
+
+## What You Must Decide In This One Response
+1. Which existing rules gained additional support from these notes, and by how much
+2. Which existing rules are duplicates and should be merged
+3. Which existing rules are genuine alternatives and should remain as conflicts
+4. Which truly new rules must be added
+
+## Rule Scope And Content
+Every rule must be:
+- specific to this scope
+- about solving the task itself
+- grounded in repeated evidence from the notes/statistics
+- usable at test time without access to ground truth
+
+Allowed `kind` values only:
+- tool_selection
+- tool_failure
+- domain_heuristic
+- result_constraint
+
+Use these meanings:
+- `tool_selection`: when one tool family is preferable under certain input conditions
+- `tool_failure`: when a tool often breaks, misformats, or underperforms under certain conditions
+- `domain_heuristic`: stable task/domain pattern that affects how to solve the problem
+- `result_constraint`: output-shape or validity constraint that good results should satisfy
+
+## Evidence Strength
+Notes marked single_execution contain an observed execution and score, not a comparison.
+Never use their IDs to support tool_selection or tool_failure rules, or a relative tool advantage.
+They may support non-comparative domain_heuristic or result_constraint hypotheses only.
+Do not convert unscored alternative failures into performance comparisons.
+
+## Hard Prohibitions
+Do NOT create rules about:
+- spawn_subagent
+- evaluate_against_gt
+- evaluate_batch_against_gt
+- batch_evaluate_against_gt
+- retry loops
+- training workflow
+- learning mode
+- exploration policy
+- orchestration behavior
+
+Do NOT use:
+- ground-truth values
+- ground-truth distributions
+- label frequencies
+- sample-specific answer content
+
+Rules must be based on:
+- input characteristics
+- task requirements
+- output validity patterns
+- observed relative tool behavior from the notes/statistics
+
+## How To Write A Good New Rule
+`summary`:
+- must be one short reusable sentence
+- plain text only
+- no brackets like [WHEN]
+- no arrow notation like -> or =>
+- no evidence clause inside summary
+- no semicolon-packed mega-sentence
+- do not recap a single sample
+
+`conditions`:
+- 0 to 3 short phrases
+- describe observable input/task conditions only
+- descriptive only, not retrieval keys
+
+`preferred_tools` and `avoid_tools`:
+- only real task-solving tools
+- do not include framework actions or evaluators
+- use them only when the guidance is truly about the single tool itself
+- leave empty if not applicable
+
+`preferred_tool_chains` and `avoid_tool_chains`:
+- ordered tool paths only, each as a JSON array of exact tool names
+- use them only when workflow order materially changes the guidance
+- do not restate a single-tool rule as a one-step chain unless order really matters
+- leave empty if not applicable
+- a single rule MUST NEVER place the same tool or tool chain in both preferred and avoid fields
+- if evidence supports opposite guidance under different conditions, express that as separate rules and connect them with `conflict_groups`
+
+## Critical Semantics For Tool Fields
+- `preferred_tools` / `avoid_tools` mean single-tool guidance or interchangeable alternatives
+- `preferred_tool_chains` / `avoid_tool_chains` mean ordered workflows where earlier tool outputs materially support later tool decisions
+- If the evidence says "tool A before tool B" or "tool A feeding tool B worked / failed", you MUST use a tool chain field rather than flattening both tools into `preferred_tools` or `avoid_tools`
+- If a rule would become misleading after removing tool order, it belongs in a tool-chain field
+- A multi-item `preferred_tools` list should read as "any of these single tools may be suitable", not as "run them in sequence"
+- A multi-item `avoid_tools` list should read as "each single tool is risky under these conditions", not as "this exact sequence failed"
+
+Examples:
+- Good single-tool rule:
+  `preferred_tools=["timesfm2_forecast"]`
+  Use when the rule is about TimesFM itself being the better forecaster.
+- Good tool-chain rule:
+  `preferred_tool_chains=[["slice", "llm_reasoning_correlation"]]`
+  Use when the success specifically depended on slicing first and then reasoning over that slice.
+- Bad flattening:
+  `preferred_tools=["slice", "llm_reasoning_correlation"]`
+  This is wrong when the real lesson is that reasoning should consume the slice output.
+
+`rationale`:
+- 1 to 2 short sentences
+- explain why this rule is supported by the notes/statistics
+- may mention relative metrics or repeated failures
+- do not mention hidden labels or ground truth values
+
+## How To Decide Between Existing Rules And New Rules
+- Prefer updating an existing rule when the new evidence clearly supports it
+- Merge rules only when they express the same operational guidance
+- Mark rules as conflicting only when both can be valid under different conditions or when evidence is genuinely split
+- Create a new rule only if the evidence is not already covered by an existing rule family
+- Keep the total active rule set at or below {memory_rule_cap} after the update
+- Before adding any new rule, you MUST compare it against every existing rule that could express the same operational guidance
+- Treat `domain_heuristic` and `result_constraint` as a shared duplicate-check pool; do not create a second rule just because the better label could be argued either way
+- If a candidate rule leads to the same test-time decision or same output-validity check as an existing rule, treat it as a duplicate even if the wording is different
+- Wording changes, abstraction changes, and scope-local paraphrases are NOT enough to justify a new rule
+- When in doubt, update the closest existing rule instead of creating a new one
+- For `tool_failure`, if the warning is about a specific multi-step workflow rather than one tool alone, use `avoid_tool_chains`; otherwise use `avoid_tools`
+- For `tool_selection`, if the evidence supports an ordered workflow, use `preferred_tool_chains`; if the evidence supports interchangeable single tools, use `preferred_tools`
+- For `tool_failure`, leave all `preferred_*` fields empty
+- For `tool_selection`, leave all `avoid_*` fields empty
+- Do not split one workflow into multiple rules only because the concrete tool names differ
+- Do not flatten an ordered workflow into `preferred_tools` or `avoid_tools` just because the same concrete tools appear in the path
+- If a winning branch used multiple substantive tools in sequence and the later step depended on the earlier output, bias toward a tool-chain rule
+- If a failure came from the interaction of two steps rather than one step alone, bias toward an `avoid_tool_chains` rule
+- If you observe mixed evidence that truly points in opposite operational directions, create separate rules with different `support_note_ids` and place those rule ids in `conflict_groups`
+
+## Strong Boundary Between `domain_heuristic` And `result_constraint`
+- Use `result_constraint` only when the rule is about validity, consistency, shape, format, or internal correctness of the output itself
+- Use `domain_heuristic` only when the rule is about input patterns, task structure, or domain regularities that influence strategy choice
+- If the rule says what a good output must satisfy, it is `result_constraint`, not `domain_heuristic`
+
+## Output Requirements
+Return JSON only with this exact top-level structure:
+{{
+ "support_updates": [
+    {{
+      "rule_id": "existing_rule_id_1",
+      "support_note_ids": ["note_id_1", "note_id_2"]
+    }}
+  ],
+  "merge_groups": [["existing_rule_id_1", "existing_rule_id_2"]],
+  "conflict_groups": [["existing_rule_id_3", "existing_rule_id_4"]],
+  "new_rules": [
+    {{
+      "kind": "tool_selection | tool_failure | domain_heuristic | result_constraint",
+      "summary": "short reusable sentence",
+      "conditions": ["condition 1", "condition 2"],
+      "preferred_tools": ["tool_a"],
+      "avoid_tools": ["tool_b"],
+      "preferred_tool_chains": [["tool_a", "tool_c"]],
+      "avoid_tool_chains": [["tool_b", "tool_d"]],
+      "rationale": "brief evidence-grounded rationale",
+      "support_note_ids": ["note_id_3", "note_id_4"],
+      "closest_existing_rule_id": "existing_rule_id_5",
+      "novelty_reason": "why this is not already covered by the closest existing rule"
+    }}
+  ]
+}}
+
+If no items belong in a section, return an empty list for that section.
+Every returned `support_note_ids` must use only note ids that appear in the
+provided experience notes.
+Every returned `new_rule` MUST include `closest_existing_rule_id` and `novelty_reason`.
+If a valid `novelty_reason` cannot be stated concretely, do not create the new rule.
+Every single returned rule must be internally consistent:
+- no tool or tool chain may appear in both preferred and avoid fields of the same rule
+- `tool_failure` rules must not contain any `preferred_*` fields
+- `tool_selection` rules must not contain any `avoid_*` fields
+Before returning, verify that every non-empty `preferred_tools` / `avoid_tools`
+field still remains valid if tool order is removed. If not, move that guidance
+into `preferred_tool_chains` / `avoid_tool_chains` instead.
+"""
+
+MEMORY_TO_CROSS_DOMAIN_PROMPT = """\
+You are synthesizing domain-specific decision rules into universal
+cross-domain insights for a multimodal time-series analysis agent.
+
+## Allowed Concrete Tool Names
+{allowed_tool_names}
+
+## All Domain-Task Rules
+{all_memory_entries}
+
+## Existing Cross-Domain Insights (review and update)
+{existing_cross_domain}
+
+## Your Task
+Produce an UPDATED set of cross-domain rules in the same JSON schema,
+but with summary/conditions/rationale phrased at a cross-domain level.
+
+RULES:
+- Max 6 rules total
+- Allowed kinds only:
+  - tool_selection
+  - tool_failure
+  - domain_heuristic
+  - result_constraint
+- Cross-domain rules must still avoid any training/orchestration behavior
+- If you mention tools, you MUST use exact names from the allowed tool list above
+- Use `preferred_tool_chains` / `avoid_tool_chains` only when cross-domain evidence clearly supports an ordered workflow
+- If no exact concrete tool name or ordered workflow is well-supported, leave these fields empty
+- Keep the same semantics as scope-local MEMORY:
+  `preferred_tools` / `avoid_tools` are single-tool or interchangeable-alternative guidance
+  `preferred_tool_chains` / `avoid_tool_chains` are ordered workflows only
+- Do not flatten an ordered workflow into `preferred_tools` merely because the same tools recur across domains
+- **CRITICAL**: Insights must NEVER reference ground truth values or label
+  distributions.  Base all guidance on input data characteristics and tool
+  performance metrics, not on output label frequencies.
+
+Return JSON: {{
+  "rules": [
+    {{
+      "kind": "tool_selection | tool_failure | domain_heuristic | result_constraint",
+      "summary": "short reusable rule",
+      "conditions": ["condition 1", "condition 2"],
+      "preferred_tools": ["tool_a"],
+      "avoid_tools": ["tool_b"],
+      "preferred_tool_chains": [["tool_a", "tool_c"]],
+      "avoid_tool_chains": [["tool_b", "tool_d"]],
+      "rationale": "why this rule is useful",
+      "source_rule_ids": ["scope_rule_id_1", "scope_rule_id_2"]
+    }}
+  ],
+  "removed_rule_ids": ["existing_rule_id_1", "existing_rule_id_2"]
+}}
+
+Every `source_rule_ids` item must reference a rule id that appears in
+`All Domain-Task Rules`.
+"""
+
+MEMORY_TO_TOOLS_PROMPT = """\
+You are distilling TOOLS.md for a time-series agent from already-distilled MEMORY rules.
+Produce concise single-tool cards for all tools supported by the evidence below.
+
+## Tool Evidence From MEMORY
+{tool_evidence}
+
+## Existing Tool Notes (review and update)
+{existing_tools}
+
+## Rules
+- Use ONLY the provided MEMORY evidence
+- Generate all tool cards in this one response
+- Keep cards short and operational
+- Each card must be about that tool as the subject
+- Avoid repeating the exact same boundary across many tools when the wording can be made tool-specific
+- Do not mechanically restate the same comparison sentence for multiple tools
+- Prefer tool-specific boundaries over shared comparison phrasing
+- If two tools share the same broad comparison evidence, phrase each card from that tool's own failure/suitability perspective
+- Prefer unique risks, failure modes, or usage limits for each tool when available
+- Do NOT restate scope definitions, task names, or generic facts like "this is a forecasting tool"
+- `when_it_helps`: only when the evidence clearly supports this tool
+- `when_to_avoid`: only when the evidence clearly warns against this tool
+- `output_risks`: only concrete output / failure risks tied to this tool
+- Omit weak or empty sections
+- Omit tools that have no meaningful boundary in the evidence
+- If a tool has only weak evidence compared with another tool, do not just write "prefer X instead"; explain the boundary from the current tool's perspective
+- Keep each bullet self-contained and specific
+
+Return JSON: {{
+  "tool_notes": {{
+    "tool_name": {{
+      "when_it_helps": ["short boundary"],
+      "when_to_avoid": ["short boundary"],
+      "output_risks": ["short risk"]
+    }}
+  }}
+}}
+"""
+
+MEMORY_TO_SKILLS_PROMPT = """\
+You are creating an operational guide (skill) for a time-series agent.
+Based on the structured MEMORY rules learned for this specific scope,
+produce a small set of executable workflow skills the agent can follow at test time.
+
+## Scope: {scope}
+
+## Structured MEMORY Rules
+{memory_entries}
+
+## Existing Skill (review and update)
+{existing_skill}
+
+## Your Task
+Write a concise operational guide in Markdown.
+
+Use the MEMORY rules as the source of truth.
+- Prefer rules with higher `support_count`
+- Prefer rules where `injectable=true`
+- Use `conditions` to decide when a workflow skill applies
+- Use `kind` to organize content:
+  - `tool_selection` + `domain_heuristic` -> skill condition / why / workflow
+  - `result_constraint` + `tool_failure` -> guardrails when strongly supported
+- Do not invent new knowledge that is not supported by the rules
+- Do not flatten all rules into generic advice; preserve meaningful conditionality when present
+- Do not restate the scope definition, task name, horizon, or other information that is already implied by the scope itself
+- Output at most 5 skills
+- Each skill must represent a distinct workflow, not a duplicate paraphrase
+- If the MEMORY rules only support 1 or 2 real workflows, output only 1 or 2
+- If evidence is weak, keep the workflow conservative and short
+- Do not output two skills whose conditions substantially overlap and whose workflows are materially the same
+- Merge nearby conditions into one broader skill when they lead to the same workflow choice and same guardrails
+- Prefer fewer, cleaner skills over many slightly reworded variants
+- Prefer abstract problem-solving language over overly specific sample wording
+- Mention concrete tool names only when MEMORY support is strong enough that the tool choice is genuinely actionable
+- If the real lesson is about problem decomposition rather than one exact tool, state the decomposition first and keep tool naming secondary
+- Keep each skill scannable; put the most decision-useful information first
+- Before writing any workflow, identify the task's real judgment target or comparison target when the MEMORY rules support one
+- If the rules indicate that the task is easy to misread, state what must be judged or compared before naming tools
+- Prefer `Core Idea` wording like "compare future-window X against reference-window Y" or "judge target-asset text signal against post-event price response" before listing concrete tools
+
+**CRITICAL**: The guide must NEVER reference ground truth values, ground
+truth distributions, or label base rates.  The agent will NOT have access
+to ground truth at test time.  All guidance must be based on input data
+characteristics and observed tool behavior, not on output label statistics.
+
+FORMAT: Plain Markdown (not JSON). Keep it under 350 words.
+
+Required structure:
+For each skill, use exactly this template:
+
+### Skill N
+Source Rule IDs: rule_id_1, rule_id_2
+
+Trigger:
+...
+
+Core Idea:
+...
+
+Workflow:
+1. ...
+2. ...
+
+Avoid:
+- ...
+
+Evidence:
+- Support: ...
+
+Rules:
+- `Source Rule IDs` is required and must appear immediately after `### Skill N`
+- Every `Source Rule IDs` item must be an exact MEMORY `rule_id` used to support that skill
+- Keep `Source Rule IDs` minimal but sufficient; usually 1-4 rule ids per skill
+- Every skill must have `Trigger`, `Core Idea`, and `Workflow`
+- `Workflow` should have 2-4 concrete steps
+- `Avoid` is optional; include it only when MEMORY rules clearly support failure warnings or invalid shortcuts
+- `Evidence` is required and must be short, e.g. `Support: strong (3 rules)` or `Support: medium (2 rules)`
+- `Support` must be rule-based only: count distinct supporting MEMORY rules, never notes, samples, or repeated evidence mentions
+- `Trigger` must describe the trigger for choosing this workflow, not the general task definition
+- `Core Idea` must explain the task-solving idea first; only mention tool names when they materially change the workflow
+- `Core Idea` should name the task's real judgment/comparison target when the MEMORY rules support that interpretation
+- `Workflow` must describe what to do, not just what tool is preferred
+- Put the task-solving abstraction before the concrete tool choice whenever possible
+- Do not create a catch-all skill that simply restates all rules
+- Before writing, deduplicate candidate skills by condition overlap + workflow overlap
+- Do not include an introduction or conclusion outside the skill list
+"""
+
+
+MEMORY_TO_SKILLS_DECISION_PROMPT = """\
+You are creating a decision-explanation guide for a time-series agent.
+Based on the structured MEMORY rules learned for this specific scope,
+produce a small set of explanation skills for user-facing rendering.
+
+## Scope: {scope}
+
+## Structured MEMORY Rules
+{memory_entries}
+
+## Existing Decision Skill Guide (review and update)
+{existing_skill_decision}
+
+## Your Task
+Write a concise Markdown guide describing why certain evidence patterns
+usually support a judgment for this scope.
+
+Use the MEMORY rules as the source of truth.
+- Prefer rules with higher `support_count`
+- Prefer rules where `injectable=true`
+- Focus on evidence logic and decision rationale, not execution prompting
+- Prefer abstract evidence patterns over tool-by-tool execution advice
+- Mention concrete tool names only when the tool materially affects what evidence is visible
+- Keep the guide faithful to MEMORY; do not invent unsupported rationale
+- Output at most 5 decision skills
+- Prefer fewer, cleaner decision skills over many overlapping paraphrases
+- State the task's real judgment target or comparison target before describing supporting evidence when the MEMORY rules support one
+- If the scope is easy to confuse, explain what is being judged first, then explain why a certain evidence pattern supports that judgment
+- Prefer evidence logic such as "target-window direction aligns with article signal" over path summaries such as "tool A then tool B usually works"
+
+Hard constraints:
+- This guide is NOT for execution-time planning
+- Do NOT present idealized workflow steps as if they were guaranteed to occur in every run
+- Do NOT include ground-truth values, label frequencies, or sample-specific answers
+- Do NOT leak raw rule ids into the final text
+
+FORMAT: Plain Markdown (not JSON). Keep it under 450 words.
+
+Required structure:
+For each decision skill, use exactly this template:
+
+### Decision Skill N
+When:
+...
+
+Why This Usually Supports The Judgment:
+...
+
+How To Explain It To A User:
+- ...
+- ...
+
+Do Not Overclaim:
+- ...
+
+Evidence Strength:
+- Support: ...
+
+Rules:
+- Every decision skill must have all five sections
+- `When` must describe when this explanation pattern applies
+- `Why This Usually Supports The Judgment` must explain the evidence logic, not execution mechanics
+- `Why This Usually Supports The Judgment` should name the actual judgment/comparison target when the MEMORY rules support that interpretation
+- `How To Explain It To A User` must be phrased as user-facing explanation points, not hidden chain-of-thought
+- `Do Not Overclaim` must warn against turning the guide into fake execution facts
+- `Evidence Strength` must be short, e.g. `Support: strong (4 rules)`
+- `Support` must be rule-based only: count distinct supporting MEMORY rules, never notes, samples, or repeated evidence mentions
+- Do not include an introduction or conclusion outside the decision skill list
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Distillation State
+# ═══════════════════════════════════════════════════════════════════════
+
+class DistillStateStore:
+    """Persist per-path distillation watermarks independently from artifacts.
+
+    New definition:
+    - `notes_to_memory_done_seq`: highest scope-local note sequence already
+      consumed by Notes -> MEMORY.
+    - `*_done_fingerprint`: hash of the exact full-memory view used to build
+      a downstream artifact.
+    - `memory_history_seq`: append-only snapshot counter for one scope's
+      MEMORY evolution across training.
+    """
+
+    def __init__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        DISTILL_STATE_LOCK_FILE.touch(exist_ok=True)
+        self._data: dict[str, dict[str, dict[str, Any]]] = {
+            "scopes": {},
+            "buckets": {},
+        }
+        self._load()
+
+    @staticmethod
+    def _normalized_state_payload(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
+        payload: dict[str, dict[str, dict[str, Any]]] = {
+            "scopes": {},
+            "buckets": {},
+        }
+        try:
+            if isinstance(raw, dict):
+                payload["scopes"] = {
+                    str(scope): dict(payload or {})
+                    for scope, payload in (raw.get("scopes", {}) or {}).items()
+                }
+                payload["buckets"] = {
+                    str(bucket): dict(payload or {})
+                    for bucket, payload in (raw.get("buckets", {}) or {}).items()
+                }
+        except Exception:
+            payload = {"scopes": {}, "buckets": {}}
+        return payload
+
+    def _read_disk_payload(self) -> dict[str, dict[str, dict[str, Any]]]:
+        if not DISTILL_STATE_FILE.exists():
+            return {"scopes": {}, "buckets": {}}
+        try:
+            raw = json.loads(DISTILL_STATE_FILE.read_text())
+        except Exception:
+            return {"scopes": {}, "buckets": {}}
+        return self._normalized_state_payload(raw)
+
+    def _load(self) -> None:
+        self._data = self._read_disk_payload()
+        self.reset_inflight_flags()
+        self.save()
+
+    def save(self) -> None:
+        _atomic_write_text(DISTILL_STATE_FILE, json.dumps(self._data, indent=2, ensure_ascii=False))
+
+    def reset_inflight_flags(self) -> None:
+        for payload in self._data["scopes"].values():
+            payload["notes_to_memory_inflight"] = False
+            payload["memory_to_skills_inflight"] = False
+            payload["memory_to_skills_decision_inflight"] = False
+            payload["memory_to_tools_inflight"] = False
+        for payload in self._data["buckets"].values():
+            payload["memory_to_cross_inflight"] = False
+
+    def get_scope(self, scope: str) -> dict[str, Any]:
+        with DISTILL_STATE_LOCK_FILE.open("r+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+            self._data = self._read_disk_payload()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        scope_name = str(scope).strip()
+        payload = dict(self._data["scopes"].get(scope_name, {}))
+        payload.setdefault("notes_total_seq", 0)
+        payload.setdefault("notes_to_memory_done_seq", 0)
+        payload.setdefault("notes_to_memory_inflight", False)
+        payload.setdefault("memory_fingerprint", "")
+        payload.setdefault("memory_history_seq", 0)
+        payload.setdefault("memory_to_skills_done_fingerprint", "")
+        payload.setdefault("memory_to_skills_inflight", False)
+        payload.setdefault("memory_to_skills_decision_done_fingerprint", "")
+        payload.setdefault("memory_to_skills_decision_inflight", False)
+        payload.setdefault("memory_to_tools_done_fingerprint", "")
+        payload.setdefault("memory_to_tools_inflight", False)
+        payload.setdefault("pending_snapshot_notes_from_seq", 0)
+        payload.setdefault("pending_snapshot_notes_to_seq", 0)
+        payload.setdefault("pending_snapshot_memory_fingerprint", "")
+        return payload
+
+    def update_scope(self, scope: str, **fields: Any) -> dict[str, Any]:
+        scope_name = str(scope).strip()
+        with DISTILL_STATE_LOCK_FILE.open("r+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self._data = self._read_disk_payload()
+            payload = dict(self._data["scopes"].get(scope_name, {}))
+            payload.setdefault("notes_total_seq", 0)
+            payload.setdefault("notes_to_memory_done_seq", 0)
+            payload.setdefault("notes_to_memory_inflight", False)
+            payload.setdefault("memory_fingerprint", "")
+            payload.setdefault("memory_history_seq", 0)
+            payload.setdefault("memory_to_skills_done_fingerprint", "")
+            payload.setdefault("memory_to_skills_inflight", False)
+            payload.setdefault("memory_to_skills_decision_done_fingerprint", "")
+            payload.setdefault("memory_to_skills_decision_inflight", False)
+            payload.setdefault("memory_to_tools_done_fingerprint", "")
+            payload.setdefault("memory_to_tools_inflight", False)
+            payload.setdefault("pending_snapshot_notes_from_seq", 0)
+            payload.setdefault("pending_snapshot_notes_to_seq", 0)
+            payload.setdefault("pending_snapshot_memory_fingerprint", "")
+            payload.update(fields)
+            self._data["scopes"][scope_name] = payload
+            self.save()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return dict(payload)
+
+    def get_bucket(self, bucket: str) -> dict[str, Any]:
+        with DISTILL_STATE_LOCK_FILE.open("r+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH)
+            self._data = self._read_disk_payload()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        bucket_name = str(bucket).strip()
+        payload = dict(self._data["buckets"].get(bucket_name, {}))
+        payload.setdefault("memory_fingerprint", "")
+        payload.setdefault("memory_to_cross_done_fingerprint", "")
+        payload.setdefault("memory_to_cross_inflight", False)
+        return payload
+
+    def update_bucket(self, bucket: str, **fields: Any) -> dict[str, Any]:
+        bucket_name = str(bucket).strip()
+        with DISTILL_STATE_LOCK_FILE.open("r+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self._data = self._read_disk_payload()
+            payload = dict(self._data["buckets"].get(bucket_name, {}))
+            payload.setdefault("memory_fingerprint", "")
+            payload.setdefault("memory_to_cross_done_fingerprint", "")
+            payload.setdefault("memory_to_cross_inflight", False)
+            payload.update(fields)
+            self._data["buckets"][bucket_name] = payload
+            self.save()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            return dict(payload)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Distillation Agent
+# ═══════════════════════════════════════════════════════════════════════
+
+class DistillationAgent:
+    """Orchestrates bottom-up knowledge distillation.
+
+    Distillation chain:
+        Notes  ──→  MEMORY (per-scope + cross_domain)
+                     └──→  TOOLS.md
+                     └──→  SKILLS/
+                     └──→  SKILLS_DECISION/
+
+    Note:
+        ``cross_domain`` is a distilled storage scope. It is not injected into
+        executor prompts.
+    """
+
+    def __init__(self, notes: Notes, memory: MemoryStore,
+                 tools: ToolsStore, skills: SkillsStore,
+                 skills_decision: SkillsDecisionStore,
+                 reasoner_llm=None):
+        self.notes = notes
+        self.memory = memory
+        self.tools = tools
+        self.skills = skills
+        self.skills_decision = skills_decision
+        self._state = DistillStateStore()
+        self._state_lock = asyncio.Lock()
+        self._scope_workers: dict[str, asyncio.Task] = {}
+        self._bucket_workers: dict[str, asyncio.Task] = {}
+        self._pending_scope_force: set[str] = set()
+        self._pending_bucket_force: set[str] = set()
+        self._llm = reasoner_llm
+
+    async def _get_llm(self):
+        if self._llm is None:
+            from timeclaw.core.config import TimeClawConfig
+            from timeclaw.llm.router import ModelRouter
+            cfg = TimeClawConfig.load()
+            router = ModelRouter(cfg.llm)
+            self._llm = router.get_backend("reasoner")
+        return self._llm
+
+    async def _complete_with_distill_retries(
+        self,
+        *,
+        stage_label: str,
+        messages: list[dict[str, Any]],
+        response_format: str | None = None,
+        min_text_len: int = 0,
+    ):
+        llm = await self._get_llm()
+        max_attempts = max(1, int(_DISTILL_STAGE_RETRY_ATTEMPTS))
+        base_delay = max(0.1, float(_DISTILL_STAGE_RETRY_BASE_DELAY_S))
+        max_delay = max(base_delay, float(_DISTILL_STAGE_RETRY_MAX_DELAY_S))
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await llm.complete(messages, response_format=response_format)
+                if response_format == "json":
+                    if resp is None or not isinstance(resp.parsed, dict):
+                        raise ValueError("missing or invalid parsed JSON response")
+                elif min_text_len > 0:
+                    text = str(getattr(resp, "text", "") or "").strip()
+                    if len(text) < min_text_len:
+                        raise ValueError(f"response text too short ({len(text)} chars)")
+                return resp
+            except Exception as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    break
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+                logger.warning(
+                    f"[{stage_label}] attempt {attempt}/{max_attempts} failed: {exc}. "
+                    f"Retrying in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+
+        if last_error is not None:
+            logger.warning(f"[{stage_label}] failed after {max_attempts} attempts: {last_error}")
+        return None
+
+    @staticmethod
+    def _threshold_reached(current: int, last: int, threshold: int) -> bool:
+        return max(0, int(current) - int(last)) >= int(threshold)
+
+    @staticmethod
+    def _snapshot_interval_reached(notes_from_seq: int, notes_to_seq: int) -> bool:
+        if int(notes_from_seq) <= 0 or int(notes_to_seq) < int(notes_from_seq):
+            return False
+        covered = int(notes_to_seq) - int(notes_from_seq) + 1
+        return covered >= int(_MEMORY_HISTORY_SNAPSHOT_INTERVAL)
+
+    def _consume_scope_force(self, scope: str) -> bool:
+        scope_name = str(scope).strip()
+        if not scope_name or scope_name not in self._pending_scope_force:
+            return False
+        self._pending_scope_force.discard(scope_name)
+        return True
+
+    def _consume_bucket_force(self, bucket: str) -> bool:
+        bucket_name = str(bucket).strip()
+        if not bucket_name or bucket_name not in self._pending_bucket_force:
+            return False
+        self._pending_bucket_force.discard(bucket_name)
+        return True
+
+    async def _get_scope_state(self, scope: str) -> dict[str, Any]:
+        async with self._state_lock:
+            return self._state.get_scope(scope)
+
+    async def _update_scope_state(self, scope: str, **fields: Any) -> dict[str, Any]:
+        async with self._state_lock:
+            return self._state.update_scope(scope, **fields)
+
+    async def _get_bucket_state(self, bucket: str) -> dict[str, Any]:
+        async with self._state_lock:
+            return self._state.get_bucket(bucket)
+
+    async def _update_bucket_state(self, bucket: str, **fields: Any) -> dict[str, Any]:
+        async with self._state_lock:
+            return self._state.update_bucket(bucket, **fields)
+
+    @staticmethod
+    def _hash_payload(payload: Any) -> str:
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    def _scope_memory_fingerprint(self, scope: str) -> str:
+        entries = self.memory.get_entries(scope)
+        if not entries:
+            return ""
+        normalized = [
+            {
+                "rule_id": str(entry.get("rule_id", "")).strip(),
+                "kind": str(entry.get("kind", "")).strip(),
+                "summary": str(entry.get("summary", "")).strip(),
+                "conditions": [str(item).strip() for item in entry.get("conditions", []) if str(item).strip()],
+                "preferred_tools": [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()],
+                "avoid_tools": [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()],
+                "preferred_tool_chains": _canonicalize_tool_chain_list(entry.get("preferred_tool_chains", [])),
+                "avoid_tool_chains": _canonicalize_tool_chain_list(entry.get("avoid_tool_chains", [])),
+                "rationale": str(entry.get("rationale", "")).strip(),
+                "evidence": {
+                    "sample_refs": self._entry_note_refs(entry),
+                    "support_count": self._entry_support_count(entry),
+                },
+                "conflict_rule_ids": MemoryStore._normalize_conflict_rule_ids(entry.get("conflict_rule_ids", [])),
+                "injectable": bool(entry.get("injectable", True)),
+                "status": str(entry.get("status", "active")).strip() or "active",
+            }
+            for entry in entries
+        ]
+        normalized.sort(key=lambda item: (item["rule_id"], item["summary"], item["kind"]))
+        return self._hash_payload(normalized)
+
+    def _bucket_memory_fingerprint(self, bucket: str) -> str:
+        entries = [
+            {
+                "scope": str(entry.get("scope", "")).strip(),
+                "rule_id": str(entry.get("rule_id", "")).strip(),
+                "kind": str(entry.get("kind", "")).strip(),
+                "summary": str(entry.get("summary", "")).strip(),
+                "conditions": [str(item).strip() for item in entry.get("conditions", []) if str(item).strip()],
+                "preferred_tools": [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()],
+                "avoid_tools": [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()],
+                "preferred_tool_chains": _canonicalize_tool_chain_list(entry.get("preferred_tool_chains", [])),
+                "avoid_tool_chains": _canonicalize_tool_chain_list(entry.get("avoid_tool_chains", [])),
+                "conflict_rule_ids": MemoryStore._normalize_conflict_rule_ids(entry.get("conflict_rule_ids", [])),
+                "injectable": bool(entry.get("injectable", True)),
+                "status": str(entry.get("status", "active")).strip() or "active",
+                "support_count": self._entry_support_count(entry),
+            }
+            for entry in self.memory.get_all_entries()
+            if _task_bucket_from_scope(str(entry.get("scope", "")).strip()) == bucket
+            and not _is_cross_domain_scope(str(entry.get("scope", "")).strip())
+        ]
+        if not entries:
+            return ""
+        entries.sort(key=lambda item: (item["scope"], item["rule_id"], item["summary"], item["kind"]))
+        return self._hash_payload(entries)
+
+    @staticmethod
+    def _scope_history_dir(scope: str) -> Path:
+        path = _ScopeStorageCodec.dir(HISTORY_DIR, scope)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    async def _append_memory_history_snapshot(
+        self,
+        *,
+        scope: str,
+        notes_from_seq: int,
+        notes_to_seq: int,
+        memory_fingerprint: str,
+    ) -> None:
+        """Persist one scope-local learning snapshot after a successful rebuild.
+
+        New definition:
+            A scope history snapshot should capture the reusable learning state
+            that would matter to future runs of that same scope at that moment,
+            not only the raw MEMORY rules. Therefore each snapshot includes:
+            - scope-local MEMORY entries
+            - scope-local tool notes
+            - scope-local skill text
+            - the current cross-domain rules for the same task bucket
+        """
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return
+
+        state = await self._get_scope_state(scope_name)
+        snapshot_seq = int(state.get("memory_history_seq", 0) or 0) + 1
+        created_at = time.time()
+        entries = self.memory.get_entries(scope_name)
+        tool_notes = self.tools.get_notes(scope_name)
+        skill_content = self.skills.get_skill(scope_name)
+        skill_decision_content = self.skills_decision.get_skill_decision(scope_name)
+        bucket = _task_bucket_from_scope(scope_name)
+        cross_domain_entries = self.memory.get_cross_domain_entries(bucket) if bucket else []
+        source_notes = [
+            {
+                "seq": int(item.get("seq", 0) or 0),
+                "id": str(item.get("id", "")).strip(),
+                "text": str(item.get("text", "")),
+            }
+            for item in self.notes.get_scope_note_items(scope_name)
+            if notes_from_seq <= int(item.get("seq", 0) or 0) <= notes_to_seq
+        ]
+        payload = {
+            "scope": scope_name,
+            "snapshot_seq": snapshot_seq,
+            "created_at": created_at,
+            "source_stage": "notes_to_memory",
+            "notes_from_seq": int(notes_from_seq),
+            "notes_to_seq": int(notes_to_seq),
+            "notes_covered_count": max(0, int(notes_to_seq) - int(notes_from_seq) + 1),
+            "source_note_count": len(source_notes),
+            "source_notes": source_notes,
+            "memory_fingerprint": str(memory_fingerprint or ""),
+            "rule_count": len(entries),
+            "entries": entries,
+            "tool_note_count": len(tool_notes),
+            "tool_notes": tool_notes,
+            "has_skill": bool(str(skill_content or "").strip()),
+            "skill_content": str(skill_content or ""),
+            "has_skill_decision": bool(str(skill_decision_content or "").strip()),
+            "skill_decision_content": str(skill_decision_content or ""),
+            "cross_domain_scope": _cross_domain_scope_for_bucket(bucket) if bucket else "",
+            "cross_domain_rule_count": len(cross_domain_entries),
+            "cross_domain_entries": cross_domain_entries,
+            "state_snapshot": {
+                "notes_total_seq": int(state.get("notes_total_seq", 0) or 0),
+                "notes_to_memory_done_seq": int(state.get("notes_to_memory_done_seq", 0) or 0),
+                "memory_to_skills_done_fingerprint": str(state.get("memory_to_skills_done_fingerprint", "") or ""),
+                "memory_to_skills_decision_done_fingerprint": str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""),
+                "memory_to_tools_done_fingerprint": str(state.get("memory_to_tools_done_fingerprint", "") or ""),
+            },
+        }
+
+        scope_dir = self._scope_history_dir(scope_name)
+        snapshot_path = scope_dir / f"{snapshot_seq:06d}.json"
+        _atomic_write_text(
+            snapshot_path,
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        manifest_path = scope_dir / "manifest.jsonl"
+        manifest_row = {
+            "scope": scope_name,
+            "snapshot_seq": snapshot_seq,
+            "created_at": created_at,
+            "source_stage": "notes_to_memory",
+            "notes_from_seq": int(notes_from_seq),
+            "notes_to_seq": int(notes_to_seq),
+            "memory_fingerprint": str(memory_fingerprint or ""),
+            "rule_count": len(entries),
+            "tool_note_count": len(tool_notes),
+            "has_skill": bool(str(skill_content or "").strip()),
+            "cross_domain_rule_count": len(cross_domain_entries),
+            "path": str(snapshot_path.relative_to(MEMORY_ROOT)),
+        }
+        with manifest_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(manifest_row, ensure_ascii=False) + "\n")
+
+        await self._update_scope_state(scope_name, memory_history_seq=snapshot_seq)
+
+    @staticmethod
+    def _create_background_task(coro: Any, label: str) -> asyncio.Task:
+        ctx = copy_context()
+
+        def _spawn() -> asyncio.Task:
+            trace.detach_context()
+            return asyncio.create_task(coro)
+
+        task = ctx.run(_spawn)
+
+        def _log_failure(done_task: asyncio.Task) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning(f"[Distill] Background task {label} failed: {exc}")
+
+        task.add_done_callback(_log_failure)
+        return task
+
+    def _ensure_scope_worker(self, scope: str, *, force: bool = False) -> None:
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return
+        worker = self._scope_workers.get(scope_name)
+        if worker and not worker.done():
+            if force:
+                self._pending_scope_force.add(scope_name)
+            return
+        self._scope_workers[scope_name] = self._create_background_task(
+            self._scope_worker(scope_name, force=force),
+            label=f"scope:{scope_name}",
+        )
+
+    def _ensure_bucket_worker(self, bucket: str, *, force: bool = False) -> None:
+        bucket_name = str(bucket).strip()
+        if not bucket_name:
+            return
+        worker = self._bucket_workers.get(bucket_name)
+        if worker and not worker.done():
+            if force:
+                self._pending_bucket_force.add(bucket_name)
+            return
+        self._bucket_workers[bucket_name] = self._create_background_task(
+            self._bucket_worker(bucket_name, force=force),
+            label=f"bucket:{bucket_name}",
+        )
+
+    async def on_sample_commit(self, scope_keys: list[str]) -> None:
+        await self.on_commit(scope_keys)
+
+    async def on_commit(self, scope_keys: list[str]) -> None:
+        """Record new note availability and trigger non-blocking distillation workers."""
+        seen: set[str] = set()
+        for raw_scope in scope_keys:
+            scope = str(raw_scope).strip()
+            if not scope or scope in seen or _is_cross_domain_scope(scope):
+                continue
+            seen.add(scope)
+            await self._update_scope_state(scope, notes_total_seq=self.notes.scoped_total(scope))
+            self._ensure_scope_worker(scope)
+
+    async def on_scope_commit(self, scope_keys: list[str]) -> None:
+        await self.on_commit(scope_keys)
+
+    async def on_global_commit(self, scope_keys: list[str]) -> None:
+        seen_buckets: set[str] = set()
+        for raw_scope in scope_keys:
+            bucket = _task_bucket_from_scope(raw_scope)
+            if not bucket or bucket in seen_buckets:
+                continue
+            seen_buckets.add(bucket)
+            self._ensure_bucket_worker(bucket)
+
+    async def _scope_worker(self, scope: str, *, force: bool = False) -> None:
+        with _exclusive_file_lock(_scope_lock_path(scope)):
+            try:
+                force_once = bool(force)
+                while True:
+                    effective_force = force_once or self._consume_scope_force(scope)
+                    force_once = False
+                    progressed = False
+                    notes_total = self.notes.scoped_total(scope)
+                    state = await self._update_scope_state(scope, notes_total_seq=notes_total)
+
+                    should_run_notes = (
+                        notes_total > int(state.get("notes_to_memory_done_seq", 0) or 0)
+                        and (
+                            effective_force
+                            or self._threshold_reached(
+                                notes_total,
+                                int(state.get("notes_to_memory_done_seq", 0) or 0),
+                                _DISTILL_L1_TO_L2,
+                            )
+                        )
+                    )
+                    if should_run_notes:
+                        target_seq = notes_total
+                        await self._update_scope_state(scope, notes_to_memory_inflight=True)
+                        success = await self.maybe_distill_notes_to_memory(
+                            scope,
+                            target_seq=target_seq,
+                            force=effective_force,
+                        )
+                        await self._update_scope_state(scope, notes_to_memory_inflight=False)
+                        if success:
+                            memory_fp = self._scope_memory_fingerprint(scope)
+                            previous_done_seq = int(state.get("notes_to_memory_done_seq", 0) or 0)
+                            pending_from_seq = int(state.get("pending_snapshot_notes_from_seq", 0) or 0)
+                            if pending_from_seq <= 0:
+                                pending_from_seq = previous_done_seq + 1
+                            await self._update_scope_state(
+                                scope,
+                                notes_to_memory_done_seq=target_seq,
+                                memory_fingerprint=memory_fp,
+                                pending_snapshot_notes_from_seq=pending_from_seq,
+                                pending_snapshot_notes_to_seq=target_seq,
+                                pending_snapshot_memory_fingerprint=memory_fp,
+                            )
+                            bucket = _task_bucket_from_scope(scope)
+                            if bucket:
+                                self._ensure_bucket_worker(bucket, force=effective_force)
+                            progressed = True
+                        else:
+                            break
+
+                    state = await self._get_scope_state(scope)
+                    memory_fp = self._scope_memory_fingerprint(scope)
+                    if memory_fp != str(state.get("memory_fingerprint", "") or ""):
+                        state = await self._update_scope_state(scope, memory_fingerprint=memory_fp)
+
+                    if memory_fp and memory_fp != str(state.get("memory_to_skills_done_fingerprint", "") or ""):
+                        await self._update_scope_state(scope, memory_to_skills_inflight=True)
+                        success = await self.maybe_distill_memory_to_skills(scope)
+                        await self._update_scope_state(scope, memory_to_skills_inflight=False)
+                        if success:
+                            await self._update_scope_state(scope, memory_to_skills_done_fingerprint=memory_fp)
+                            progressed = True
+                        else:
+                            break
+                    elif not memory_fp:
+                        cleared = False
+                        if self.skills.get_skill(scope):
+                            self.skills.delete_skill(scope)
+                            cleared = True
+                        if str(state.get("memory_to_skills_done_fingerprint", "") or ""):
+                            await self._update_scope_state(scope, memory_to_skills_done_fingerprint="")
+                            cleared = True
+                        if cleared:
+                            progressed = True
+
+                    state = await self._get_scope_state(scope)
+                    if memory_fp and memory_fp != str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""):
+                        await self._update_scope_state(scope, memory_to_skills_decision_inflight=True)
+                        success = await self.maybe_distill_memory_to_skills_decision(scope)
+                        await self._update_scope_state(scope, memory_to_skills_decision_inflight=False)
+                        if success:
+                            await self._update_scope_state(scope, memory_to_skills_decision_done_fingerprint=memory_fp)
+                            progressed = True
+                        else:
+                            break
+                    elif not memory_fp:
+                        cleared = False
+                        if self.skills_decision.get_skill_decision(scope):
+                            self.skills_decision.delete_skill_decision(scope)
+                            cleared = True
+                        if str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""):
+                            await self._update_scope_state(scope, memory_to_skills_decision_done_fingerprint="")
+                            cleared = True
+                        if cleared:
+                            progressed = True
+
+                    state = await self._get_scope_state(scope)
+                    if memory_fp and memory_fp != str(state.get("memory_to_tools_done_fingerprint", "") or ""):
+                        await self._update_scope_state(scope, memory_to_tools_inflight=True)
+                        success = await self.maybe_distill_memory_to_tools(scope)
+                        await self._update_scope_state(scope, memory_to_tools_inflight=False)
+                        if success:
+                            await self._update_scope_state(scope, memory_to_tools_done_fingerprint=memory_fp)
+                            progressed = True
+                        else:
+                            break
+                    elif not memory_fp:
+                        cleared = False
+                        if self.tools.get_notes(scope):
+                            self.tools.replace(scope, {})
+                            cleared = True
+                        if str(state.get("memory_to_tools_done_fingerprint", "") or ""):
+                            await self._update_scope_state(scope, memory_to_tools_done_fingerprint="")
+                            cleared = True
+                        if cleared:
+                            progressed = True
+
+                    state = await self._get_scope_state(scope)
+                    pending_from_seq = int(state.get("pending_snapshot_notes_from_seq", 0) or 0)
+                    pending_to_seq = int(state.get("pending_snapshot_notes_to_seq", 0) or 0)
+                    pending_snapshot_fp = str(state.get("pending_snapshot_memory_fingerprint", "") or "")
+                    if (
+                        pending_to_seq >= pending_from_seq > 0
+                        and pending_snapshot_fp == memory_fp
+                        and self._snapshot_interval_reached(pending_from_seq, pending_to_seq)
+                    ):
+                        bucket = _task_bucket_from_scope(scope)
+                        if bucket:
+                            self._ensure_bucket_worker(bucket, force=effective_force)
+                            bucket_task = self._bucket_workers.get(bucket)
+                            if bucket_task and not bucket_task.done():
+                                await bucket_task
+                        await self._append_memory_history_snapshot(
+                            scope=scope,
+                            notes_from_seq=pending_from_seq,
+                            notes_to_seq=pending_to_seq,
+                            memory_fingerprint=pending_snapshot_fp,
+                        )
+                        await self._update_scope_state(
+                            scope,
+                            pending_snapshot_notes_from_seq=0,
+                            pending_snapshot_notes_to_seq=0,
+                            pending_snapshot_memory_fingerprint="",
+                        )
+                        progressed = True
+
+                    if not progressed:
+                        break
+            finally:
+                current = asyncio.current_task()
+                if self._scope_workers.get(scope) is current:
+                    self._scope_workers.pop(scope, None)
+
+    async def _bucket_worker(self, bucket: str, *, force: bool = False) -> None:
+        with _exclusive_file_lock(_bucket_lock_path(bucket)):
+            try:
+                force_once = bool(force)
+                while True:
+                    effective_force = force_once or self._consume_bucket_force(bucket)
+                    force_once = False
+                    memory_fp = self._bucket_memory_fingerprint(bucket)
+                    state = await self._update_bucket_state(bucket, memory_fingerprint=memory_fp)
+                    if (
+                        memory_fp
+                        and (
+                            effective_force
+                            or memory_fp != str(state.get("memory_to_cross_done_fingerprint", "") or "")
+                        )
+                    ):
+                        await self._update_bucket_state(bucket, memory_to_cross_inflight=True)
+                        success = await self.maybe_distill_memory_to_cross_domain(bucket)
+                        await self._update_bucket_state(bucket, memory_to_cross_inflight=False)
+                        if success:
+                            await self._update_bucket_state(bucket, memory_to_cross_done_fingerprint=memory_fp)
+                            continue
+                        break
+                    if not memory_fp:
+                        cross_scope = _cross_domain_scope_for_bucket(bucket)
+                        cleared = False
+                        if self.memory.get_entries(cross_scope):
+                            self.memory.replace_entries(cross_scope, [])
+                            cleared = True
+                        if str(state.get("memory_to_cross_done_fingerprint", "") or ""):
+                            await self._update_bucket_state(bucket, memory_to_cross_done_fingerprint="")
+                            cleared = True
+                        if cleared:
+                            continue
+                        break
+                    break
+            finally:
+                current = asyncio.current_task()
+                if self._bucket_workers.get(bucket) is current:
+                    self._bucket_workers.pop(bucket, None)
+
+    @staticmethod
+    def _normalize_ref_list(refs: Any, allowed: set[str] | None = None) -> list[str]:
+        if not isinstance(refs, list):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in refs:
+            ref = str(item).strip()
+            if not ref or ref in seen:
+                continue
+            if allowed is not None and ref not in allowed:
+                continue
+            seen.add(ref)
+            out.append(ref)
+        return out
+
+    def _note_ref_count(self, refs: list[str]) -> int:
+        return len(self._normalize_ref_list(refs))
+
+    def _notes_for_scope(self, scope: str) -> list[dict[str, str]]:
+        """Return scope-local note items in append order without duplicates."""
+        scope_name = str(scope).strip()
+        if not scope_name:
+            return []
+
+        items: list[dict[str, Any]] = []
+        get_recent_items = getattr(self.notes, "get_recent_note_items", None)
+        total_notes = getattr(self.notes, "total", 0)
+        if callable(get_recent_items):
+            try:
+                items = list(get_recent_items(int(total_notes) or 10000))
+            except Exception:
+                items = []
+        if not items:
+            items = list(self.notes.get_scope_note_items(scope_name))
+        if not isinstance(items, list):
+            return []
+
+        scope_marker = f"\nScope:\n{scope_name}\n"
+        deduped: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            note_id = str(item.get("id", "")).strip()
+            text = str(item.get("text", ""))
+            if not note_id or note_id in seen_ids or not text or scope_marker not in text:
+                continue
+            seen_ids.add(note_id)
+            deduped.append({"id": note_id, "text": text})
+        return deduped
+
+    def _entry_note_refs(self, entry: dict[str, Any]) -> list[str]:
+        return self.memory._entry_note_refs(entry)
+
+    def _entry_support_count(self, entry: dict[str, Any]) -> int:
+        return self.memory._entry_support_count(entry)
+
+    def _source_rule_note_refs(self, source_rule_ids: list[str]) -> list[str]:
+        if not source_rule_ids:
+            return []
+        refs: list[str] = []
+        seen: set[str] = set()
+        by_id = {
+            str(entry.get("rule_id", "")).strip(): entry
+            for entry in self.memory.get_all_entries()
+            if isinstance(entry, dict)
+        }
+        for rule_id in source_rule_ids:
+            entry = by_id.get(str(rule_id).strip())
+            if not entry:
+                continue
+            for ref in self._entry_note_refs(entry):
+                if ref in seen:
+                    continue
+                seen.add(ref)
+                refs.append(ref)
+        return refs
+
+    @staticmethod
+    def _score_rule_confidence(
+        support_count: int,
+        last_seen_at: float,
+        max_conflict_support_count: int = 0,
+    ) -> float:
+        now = time.time()
+        age_days = max(0.0, (now - float(last_seen_at or now)) / 86400.0)
+        support_component = min(0.45, 0.12 * max(0, support_count))
+        freshness_component = max(0.05, 0.35 - min(0.30, age_days * 0.02))
+        conflict_penalty = min(0.35, 0.08 * max(0, max_conflict_support_count))
+        score = 0.15 + support_component + freshness_component - conflict_penalty
+        return max(0.05, min(0.95, score))
+
+    @staticmethod
+    def _max_conflict_support(entry: dict[str, Any], entries_by_id: dict[str, dict[str, Any]]) -> int:
+        max_support = 0
+        for other_id in MemoryStore._normalize_conflict_rule_ids(entry.get("conflict_rule_ids", [])):
+            other = entries_by_id.get(other_id)
+            if not other:
+                continue
+            support = MemoryStore._entry_support_count(other)
+            max_support = max(max_support, support)
+        return max_support
+
+    @staticmethod
+    def _set_conflict_rule_ids(entry: dict[str, Any], rule_ids: list[str]) -> None:
+        entry["conflict_rule_ids"] = MemoryStore._normalize_conflict_rule_ids(rule_ids)
+
+    @classmethod
+    def _redirect_conflict_rule_ids(
+        cls,
+        entries: list[dict[str, Any]],
+        merged_into: dict[str, str],
+    ) -> None:
+        if not merged_into:
+            return
+        for entry in entries:
+            rule_id = str(entry.get("rule_id", "")).strip()
+            redirected: list[str] = []
+            for other_id in MemoryStore._normalize_conflict_rule_ids(entry.get("conflict_rule_ids", [])):
+                target_id = str(merged_into.get(other_id, other_id)).strip()
+                if target_id and target_id != rule_id:
+                    redirected.append(target_id)
+            cls._set_conflict_rule_ids(entry, redirected)
+
+    @classmethod
+    def _apply_conflict_groups(
+        cls,
+        entries_by_id: dict[str, dict[str, Any]],
+        conflict_groups: list[list[str]],
+    ) -> None:
+        for group in conflict_groups:
+            group_ids = MemoryStore._normalize_conflict_rule_ids(group)
+            if len(group_ids) < 2:
+                continue
+            for rule_id in group_ids:
+                entry = entries_by_id.get(rule_id)
+                if not entry:
+                    continue
+                existing = MemoryStore._normalize_conflict_rule_ids(entry.get("conflict_rule_ids", []))
+                for other_id in group_ids:
+                    if other_id != rule_id:
+                        existing.append(other_id)
+                cls._set_conflict_rule_ids(entry, existing)
+
+    @classmethod
+    def _sync_conflict_rule_ids(cls, entries: list[dict[str, Any]]) -> None:
+        by_id = {
+            str(entry.get("rule_id", "")).strip(): entry
+            for entry in entries
+            if str(entry.get("rule_id", "")).strip()
+        }
+        adjacency: dict[str, set[str]] = {rule_id: set() for rule_id in by_id}
+        for rule_id, entry in by_id.items():
+            for other_id in MemoryStore._normalize_conflict_rule_ids(entry.get("conflict_rule_ids", [])):
+                if other_id not in by_id or other_id == rule_id:
+                    continue
+                adjacency[rule_id].add(other_id)
+                adjacency[other_id].add(rule_id)
+        for rule_id, entry in by_id.items():
+            cls._set_conflict_rule_ids(entry, sorted(adjacency.get(rule_id, set())))
+
+    @staticmethod
+    def _canonical_rule_text(text: str) -> str:
+        normalized = str(text or "").lower()
+        replacements = {
+            "self-consistency": "internal consistency",
+            "self consistency": "internal consistency",
+            "internally consistent": "internal consistency",
+            "internally coherent": "internal consistency",
+            "numerically consistent": "numeric consistency",
+            "numerical consistency": "numeric consistency",
+            "consistency-preserving": "consistency preserving",
+            "outputs": "output",
+            "results": "result",
+            "predictions": "prediction",
+            "answers": "answer",
+            "constraints": "constraint",
+            "heuristics": "heuristic",
+        }
+        for src, dst in replacements.items():
+            normalized = normalized.replace(src, dst)
+        normalized = re.sub(r"\bresults?\b", "output", normalized)
+        normalized = re.sub(r"\bpredictions?\b", "output", normalized)
+        normalized = re.sub(r"\banswers?\b", "output", normalized)
+        normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    @classmethod
+    def _rule_text_tokens(cls, text: str) -> set[str]:
+        stopwords = {
+            "a", "an", "and", "are", "as", "at", "be", "by", "do", "for",
+            "from", "good", "if", "in", "into", "is", "it", "of", "on",
+            "or", "must", "preserve", "remain", "same", "should", "stay",
+            "that", "the", "their", "them", "then", "this", "to", "under",
+            "use", "when", "with",
+        }
+        tokens: set[str] = set()
+        for token in cls._canonical_rule_text(text).split():
+            if len(token) <= 2 or token in stopwords:
+                continue
+            if token.endswith("ies") and len(token) > 4:
+                token = token[:-3] + "y"
+            elif token.endswith("s") and len(token) > 4:
+                token = token[:-1]
+            tokens.add(token)
+        return tokens
+
+    @classmethod
+    def _rule_similarity_signature(cls, entry: dict[str, Any]) -> dict[str, Any]:
+        summary = str(entry.get("summary", "")).strip()
+        conditions = [
+            str(item).strip()
+            for item in entry.get("conditions", [])
+            if str(item).strip()
+        ]
+        return {
+            "kind": str(entry.get("kind", "")).strip(),
+            "summary_text": cls._canonical_rule_text(summary),
+            "summary_tokens": cls._rule_text_tokens(summary),
+            "condition_tokens": cls._rule_text_tokens(" ".join(conditions)),
+            "preferred_tools": tuple(
+                str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()
+            ),
+            "avoid_tools": tuple(
+                str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()
+            ),
+            "preferred_tool_chains": tuple(
+                tuple(chain)
+                for chain in _canonicalize_tool_chain_list(entry.get("preferred_tool_chains", []))
+            ),
+            "avoid_tool_chains": tuple(
+                tuple(chain)
+                for chain in _canonicalize_tool_chain_list(entry.get("avoid_tool_chains", []))
+            ),
+        }
+
+    @staticmethod
+    def _token_overlap(left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        union = left | right
+        if not union:
+            return 0.0
+        return len(left & right) / len(union)
+
+    @classmethod
+    def _is_near_duplicate_rule(
+        cls,
+        existing_entry: dict[str, Any],
+        candidate_entry: dict[str, Any],
+    ) -> bool:
+        target_kinds = {"result_constraint", "domain_heuristic", "tool_failure"}
+        existing_sig = cls._rule_similarity_signature(existing_entry)
+        candidate_sig = cls._rule_similarity_signature(candidate_entry)
+
+        if existing_sig["kind"] not in target_kinds or candidate_sig["kind"] not in target_kinds:
+            return False
+        same_kind = existing_sig["kind"] == candidate_sig["kind"]
+        if not same_kind and {existing_sig["kind"], candidate_sig["kind"]} != {"result_constraint", "domain_heuristic"}:
+            return False
+        existing_preferred = set(existing_sig["preferred_tools"])
+        candidate_preferred = set(candidate_sig["preferred_tools"])
+        existing_avoid = set(existing_sig["avoid_tools"])
+        candidate_avoid = set(candidate_sig["avoid_tools"])
+        existing_preferred_paths = set(existing_sig["preferred_tool_chains"])
+        candidate_preferred_paths = set(candidate_sig["preferred_tool_chains"])
+        existing_avoid_paths = set(existing_sig["avoid_tool_chains"])
+        candidate_avoid_paths = set(candidate_sig["avoid_tool_chains"])
+
+        if same_kind and existing_sig["kind"] == "tool_failure":
+            same_tool_family = (
+                (
+                    not existing_avoid and not candidate_avoid
+                    and not existing_avoid_paths and not candidate_avoid_paths
+                )
+                or bool(existing_avoid & candidate_avoid)
+                or bool(existing_avoid_paths & candidate_avoid_paths)
+            )
+            if not same_tool_family:
+                return False
+            if existing_preferred != candidate_preferred:
+                return False
+            if existing_preferred_paths != candidate_preferred_paths:
+                return False
+        else:
+            if existing_preferred != candidate_preferred:
+                return False
+            if existing_avoid != candidate_avoid:
+                return False
+            if existing_preferred_paths != candidate_preferred_paths:
+                return False
+            if existing_avoid_paths != candidate_avoid_paths:
+                return False
+
+        summary_overlap = cls._token_overlap(
+            existing_sig["summary_tokens"], candidate_sig["summary_tokens"]
+        )
+        condition_overlap = cls._token_overlap(
+            existing_sig["condition_tokens"], candidate_sig["condition_tokens"]
+        )
+        summary_ratio = SequenceMatcher(
+            None,
+            existing_sig["summary_text"],
+            candidate_sig["summary_text"],
+        ).ratio()
+
+        condition_match = (
+            not existing_sig["condition_tokens"] and not candidate_sig["condition_tokens"]
+        ) or condition_overlap >= 0.6
+
+        if condition_match and summary_overlap >= 0.65:
+            return True
+        if condition_match and summary_ratio >= 0.82:
+            return True
+        if same_kind and existing_sig["kind"] == "tool_failure":
+            if condition_overlap >= 0.65 and (summary_ratio >= 0.62 or summary_overlap >= 0.33):
+                return True
+        if not same_kind:
+            cross_kind_condition_match = (
+                not existing_sig["condition_tokens"] and not candidate_sig["condition_tokens"]
+            ) or condition_overlap >= 0.55
+            if cross_kind_condition_match and (summary_ratio >= 0.60 or summary_overlap >= 0.30):
+                return True
+        return False
+
+    @classmethod
+    def _find_near_duplicate_rule_id(
+        cls,
+        entries: list[dict[str, Any]],
+        candidate_entry: dict[str, Any],
+        hinted_rule_id: str = "",
+    ) -> str:
+        by_id = {
+            str(entry.get("rule_id", "")).strip(): entry
+            for entry in entries
+            if str(entry.get("rule_id", "")).strip()
+        }
+        hint = str(hinted_rule_id).strip()
+        if hint and hint in by_id and cls._is_near_duplicate_rule(by_id[hint], candidate_entry):
+            return hint
+
+        best_rule_id = ""
+        best_score = 0.0
+        candidate_sig = cls._rule_similarity_signature(candidate_entry)
+        for entry in entries:
+            rule_id = str(entry.get("rule_id", "")).strip()
+            if not rule_id:
+                continue
+            if not cls._is_near_duplicate_rule(entry, candidate_entry):
+                continue
+            existing_sig = cls._rule_similarity_signature(entry)
+            overlap = cls._token_overlap(
+                existing_sig["summary_tokens"] | existing_sig["condition_tokens"],
+                candidate_sig["summary_tokens"] | candidate_sig["condition_tokens"],
+            )
+            ratio = SequenceMatcher(
+                None,
+                existing_sig["summary_text"],
+                candidate_sig["summary_text"],
+            ).ratio()
+            score = max(overlap, ratio)
+            if score > best_score:
+                best_score = score
+                best_rule_id = rule_id
+        return best_rule_id
+
+    def _apply_memory_update_decision(
+        self,
+        scope: str,
+        existing_entries: list[dict[str, Any]],
+        decision: dict[str, Any],
+        available_note_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        entries = self.memory._dedupe_rule_ids([dict(entry) for entry in existing_entries])
+        by_id = {str(entry.get("rule_id", "")).strip(): entry for entry in entries if str(entry.get("rule_id", "")).strip()}
+        now = time.time()
+
+        available_note_ids = available_note_ids or set()
+        support_updates: dict[str, list[str]] = {}
+        for item in decision.get("support_updates", []):
+            if not isinstance(item, dict):
+                continue
+            rule_id = str(item.get("rule_id", "")).strip()
+            if not rule_id or rule_id not in by_id:
+                continue
+            note_ids = self._normalize_ref_list(item.get("support_note_ids", []), allowed=available_note_ids)
+            if note_ids:
+                support_updates.setdefault(rule_id, [])
+                for note_id in note_ids:
+                    if note_id not in support_updates[rule_id]:
+                        support_updates[rule_id].append(note_id)
+
+        # Backward compatibility for older LLM outputs.
+        for rule_id in decision.get("support_rule_ids", []):
+            rid = str(rule_id).strip()
+            if rid and rid in by_id:
+                support_updates.setdefault(rid, [])
+        merge_groups = [
+            [str(rule_id).strip() for rule_id in group if str(rule_id).strip() in by_id]
+            for group in decision.get("merge_groups", [])
+            if isinstance(group, list)
+        ]
+        merge_groups = [group for group in merge_groups if len(group) >= 2]
+        conflict_groups = [
+            [str(rule_id).strip() for rule_id in group if str(rule_id).strip() in by_id]
+            for group in decision.get("conflict_groups", [])
+            if isinstance(group, list)
+        ]
+        conflict_groups = [group for group in conflict_groups if len(group) >= 2]
+
+        # Apply support increments before confidence recomputation.
+        for rule_id, added_note_ids in support_updates.items():
+            entry = by_id[rule_id]
+            evidence = dict(entry.get("evidence") or {})
+            existing_refs = self._normalize_ref_list(evidence.get("sample_refs", []))
+            merged_refs = existing_refs[:]
+            for note_id in added_note_ids:
+                if note_id not in merged_refs:
+                    merged_refs.append(note_id)
+            evidence["sample_refs"] = merged_refs[:200]
+            evidence["support_count"] = len(evidence["sample_refs"])
+            entry["evidence"] = evidence
+            entry["timestamp"] = now
+
+        # Merge duplicate/overlapping rules by keeping the strongest first id.
+        merged_away: set[str] = set()
+        merged_into: dict[str, str] = {}
+        for group in merge_groups:
+            survivors = [by_id[rule_id] for rule_id in group if rule_id in by_id and rule_id not in merged_away]
+            if len(survivors) < 2:
+                continue
+            survivors.sort(key=lambda e: (self._entry_support_count(e), float(e.get("timestamp", 0.0) or 0.0)), reverse=True)
+            keeper = survivors[0]
+            keeper_rule_id = str(keeper.get("rule_id", "")).strip()
+            keeper_evidence = dict(keeper.get("evidence") or {})
+            sample_refs = self._normalize_ref_list(keeper_evidence.get("sample_refs", []))
+            merged_conflict_ids = MemoryStore._normalize_conflict_rule_ids(keeper.get("conflict_rule_ids", []))
+            for entry in survivors[1:]:
+                merged_rule_id = str(entry.get("rule_id", "")).strip()
+                merged_away.add(merged_rule_id)
+                merged_into[merged_rule_id] = keeper_rule_id
+                other_evidence = dict(entry.get("evidence") or {})
+                for note_id in self._normalize_ref_list(other_evidence.get("sample_refs", [])):
+                    if note_id not in sample_refs:
+                        sample_refs.append(note_id)
+                merged_conflict_ids.extend(
+                    MemoryStore._normalize_conflict_rule_ids(entry.get("conflict_rule_ids", []))
+                )
+            keeper_evidence["sample_refs"] = sample_refs[:200]
+            keeper_evidence["support_count"] = len(keeper_evidence["sample_refs"])
+            keeper["evidence"] = keeper_evidence
+            self._set_conflict_rule_ids(
+                keeper,
+                [rule_id for rule_id in merged_conflict_ids if rule_id not in set(group)],
+            )
+            keeper["timestamp"] = now
+
+        entries = [entry for entry in entries if str(entry.get("rule_id", "")).strip() not in merged_away]
+        self._redirect_conflict_rule_ids(entries, merged_into)
+        by_id = {str(entry.get("rule_id", "")).strip(): entry for entry in entries if str(entry.get("rule_id", "")).strip()}
+
+        redirected_conflict_groups: list[list[str]] = []
+        for group in conflict_groups:
+            redirected_group: list[str] = []
+            for rule_id in group:
+                target_rule_id = str(merged_into.get(rule_id, rule_id)).strip()
+                if target_rule_id and target_rule_id not in redirected_group:
+                    redirected_group.append(target_rule_id)
+            if len(redirected_group) >= 2:
+                redirected_conflict_groups.append(redirected_group)
+        conflict_groups = redirected_conflict_groups
+        self._apply_conflict_groups(by_id, conflict_groups)
+        self._sync_conflict_rule_ids(entries)
+
+        # Add brand-new rules.
+        base_index = len(entries)
+        for idx, payload in enumerate(decision.get("new_rules", [])):
+            if not isinstance(payload, dict):
+                continue
+            note_ids = self._normalize_ref_list(payload.get("support_note_ids", []), allowed=available_note_ids)
+            if not note_ids:
+                continue
+            normalized = self.memory._normalize_rule_payload(scope, payload, base_index + idx)
+            normalized["timestamp"] = now
+            normalized["injectable"] = True
+            normalized["status"] = "active"
+            duplicate_rule_id = self._find_near_duplicate_rule_id(
+                entries,
+                normalized,
+                hinted_rule_id=str(payload.get("closest_existing_rule_id", "")).strip(),
+            )
+            if duplicate_rule_id and duplicate_rule_id in by_id:
+                target = by_id[duplicate_rule_id]
+                evidence = dict(target.get("evidence") or {})
+                merged_refs = self._normalize_ref_list(evidence.get("sample_refs", []))
+                for note_id in note_ids:
+                    if note_id not in merged_refs:
+                        merged_refs.append(note_id)
+                evidence["sample_refs"] = merged_refs[:200]
+                evidence["support_count"] = len(evidence["sample_refs"])
+                target["evidence"] = evidence
+                target["timestamp"] = now
+                logger.info(
+                    f"[Distill Notes→MEMORY] {scope}: merged near-duplicate new rule into {duplicate_rule_id}"
+                )
+                continue
+            evidence = dict(normalized.get("evidence") or {})
+            evidence["sample_refs"] = note_ids[:200]
+            evidence["support_count"] = len(evidence["sample_refs"])
+            normalized["evidence"] = evidence
+            entries.append(normalized)
+            rule_id = str(normalized.get("rule_id", "")).strip()
+            if rule_id:
+                by_id[rule_id] = normalized
+
+        by_id = {str(entry.get("rule_id", "")).strip(): entry for entry in entries if str(entry.get("rule_id", "")).strip()}
+        self._sync_conflict_rule_ids(entries)
+
+        # Recompute injectable/confidence from cumulative support plus persisted conflict graph.
+        for entry in entries:
+            rule_id = str(entry.get("rule_id", "")).strip()
+            support_count = self._entry_support_count(entry)
+            max_conflict_support = self._max_conflict_support(entry, by_id)
+            entry["confidence"] = self._score_rule_confidence(
+                support_count=support_count,
+                last_seen_at=float(entry.get("timestamp", now) or now),
+                max_conflict_support_count=max_conflict_support,
+            )
+            entry["injectable"] = not any(
+                self._entry_support_count(other) > support_count
+                for other_id in MemoryStore._normalize_conflict_rule_ids(entry.get("conflict_rule_ids", []))
+                for other in [by_id.get(other_id)]
+                if other is not None
+            )
+            entry["status"] = "active"
+
+        entries.sort(
+            key=lambda entry: (
+                not bool(entry.get("injectable", True)),
+                -float(entry.get("confidence", 0.0) or 0.0),
+                -self._entry_support_count(entry),
+            )
+        )
+        return self.memory._dedupe_rule_ids(entries)
+
+    @staticmethod
+    def _validate_memory_rule_payload(payload: dict[str, Any]) -> list[str]:
+        if not isinstance(payload, dict):
+            return ["rule payload is not a dict"]
+
+        kind = str(payload.get("kind", "")).strip()
+        preferred_tools = set(
+            _canonicalize_tool_list(
+                [str(item).strip() for item in payload.get("preferred_tools", []) if str(item).strip()]
+            )
+        )
+        avoid_tools = set(
+            _canonicalize_tool_list(
+                [str(item).strip() for item in payload.get("avoid_tools", []) if str(item).strip()]
+            )
+        )
+        preferred_tool_chains = {
+            tuple(chain)
+            for chain in _canonicalize_tool_chain_list(payload.get("preferred_tool_chains", []))
+        }
+        avoid_tool_chains = {
+            tuple(chain)
+            for chain in _canonicalize_tool_chain_list(payload.get("avoid_tool_chains", []))
+        }
+
+        errors: list[str] = []
+        overlapping_tools = sorted(preferred_tools & avoid_tools)
+        if overlapping_tools:
+            errors.append(
+                f"same tool appears in preferred and avoid fields: {json.dumps(overlapping_tools, ensure_ascii=False)}"
+            )
+        overlapping_chains = sorted(preferred_tool_chains & avoid_tool_chains)
+        if overlapping_chains:
+            errors.append(
+                f"same tool chain appears in preferred and avoid fields: {json.dumps([list(chain) for chain in overlapping_chains], ensure_ascii=False)}"
+            )
+        if kind == "tool_failure" and (preferred_tools or preferred_tool_chains):
+            errors.append("tool_failure rule contains preferred_* guidance")
+        if kind == "tool_selection" and (avoid_tools or avoid_tool_chains):
+            errors.append("tool_selection rule contains avoid_* guidance")
+        return errors
+
+    def _validate_memory_update_decision(self, decision: dict[str, Any], *, single_note_ids: set[str] | None = None,
+                                         existing_entries: list[dict[str, Any]] | None = None) -> list[str]:
+        errors: list[str] = []
+        for idx, payload in enumerate(decision.get("new_rules", [])):
+            rule_errors = self._validate_memory_rule_payload(payload)
+            if rule_errors:
+                rule_label = str(payload.get("rule_id", "")).strip() or f"new_rules[{idx}]"
+                for err in rule_errors:
+                    errors.append(f"{rule_label}: {err}")
+        if single_note_ids:
+            existing = {str(e.get("rule_id")): e for e in (existing_entries or [])}
+            for item in decision.get("new_rules", []) + decision.get("support_updates", []):
+                rule = existing.get(str(item.get("rule_id")), item)
+                refs = set(item.get("support_note_ids") or [])
+                if refs & single_note_ids and (rule.get("kind") in {"tool_selection", "tool_failure"}
+                        or any(rule.get(k) for k in ("preferred_tools", "avoid_tools", "preferred_tool_chains", "avoid_tool_chains"))):
+                    errors.append("Single-execution notes cannot support relative tool selection/failure rules; use non-comparative observations only")
+            for group in decision.get("merge_groups", []):
+                rules = [existing[str(rule_id)] for rule_id in group if str(rule_id) in existing]
+                refs = {ref for rule in rules for ref in MemoryStore._entry_note_refs(rule)}
+                refs.update(ref for item in decision.get("support_updates", [])
+                            if str(item.get("rule_id")) in {str(rule_id) for rule_id in group}
+                            for ref in item.get("support_note_ids", []))
+                relative = any(rule.get("kind") in {"tool_selection", "tool_failure"}
+                    or any(rule.get(k) for k in ("preferred_tools", "avoid_tools", "preferred_tool_chains", "avoid_tool_chains"))
+                    for rule in rules)
+                if relative and refs & single_note_ids:
+                    errors.append("Single-execution support cannot be merged into a relative tool rule")
+        return errors
+
+    @staticmethod
+    def _normalize_task_for_notes(task: str) -> str:
+        """Map dataset task names to the task labels stored in notes."""
+        return {
+            "mcqa": "qa",
+            "trend": "classification",
+        }.get(task, task)
+
+    @staticmethod
+    def _denormalize_task_from_notes(task: str) -> str:
+        """Map note task labels back to canonical memory scope names."""
+        return {
+            "qa": "mcqa",
+            "classification": "trend",
+        }.get(task, task)
+
+    @staticmethod
+    def _parse_note_sections(note: str) -> dict[str, Any]:
+        """Parse either the new multi-section note format or legacy single-line notes."""
+        import re
+
+        titles = {
+            "Scope",
+            "Source",
+            "Task",
+            "Task Prompt",
+            "Numeric Time Series",
+            "Text Context",
+            "Winner Tools",
+            "Observed Tools",
+            "Evidence Kind",
+            "Tools",
+            "Winner Tool",
+            "Winner Generator Tools",
+            "Winner Validation Tools",
+            "Prediction",
+            "Metrics",
+            "Fingerprint",
+            "Approaches",
+            "Candidates",
+            "Analysis",
+            "Pred",
+            "GT",
+        }
+        sections: dict[str, Any] = {"header": "", "status": "", "sections": {}}
+
+        raw_lines = note.splitlines()
+        lines = [line.rstrip() for line in raw_lines]
+        first_content = ""
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                first_content = stripped
+                break
+
+        header_match = re.match(
+            r"(?:###\s*)?(?:\[[^\]]+\]\s+)?([^\n]+?)\s+[—-]\s+(OK|FAIL|SCORED|LOGGED)\s*$",
+            first_content,
+        )
+        if header_match:
+            sections["header"] = header_match.group(1).strip()
+            sections["status"] = header_match.group(2).strip()
+        else:
+            inline_match = re.match(r"\[([^\]]+)\]\s+(OK|FAIL|SCORED|LOGGED)\b", first_content)
+            if inline_match:
+                sections["header"] = inline_match.group(1).strip()
+                sections["status"] = inline_match.group(2).strip()
+
+        current_title: str | None = None
+        buffer: list[str] = []
+
+        def flush() -> None:
+            nonlocal current_title, buffer
+            if current_title is None:
+                return
+            content = "\n".join(buffer).strip()
+            sections["sections"][current_title] = content
+            current_title = None
+            buffer = []
+
+        for line in lines:
+            stripped = line.strip()
+            if stripped in {
+                first_content,
+                f"### {first_content}",
+            } and sections["status"]:
+                continue
+            if stripped.endswith(":") and stripped[:-1] in titles:
+                flush()
+                current_title = stripped[:-1]
+                continue
+            if current_title is not None:
+                buffer.append(line)
+        flush()
+        return sections
+
+    @staticmethod
+    def _extract_tools_from_note(note: str) -> list[str]:
+        import re
+
+        parsed = DistillationAgent._parse_note_sections(note)
+        tools_section = parsed["sections"].get("Tools", "").strip()
+        if not tools_section:
+            tools_section = parsed["sections"].get("Observed Tools", "").strip()
+        if not tools_section:
+            tools_section = parsed["sections"].get("Winner Tools", "").strip()
+        if not tools_section:
+            tools_section = parsed["sections"].get("Winner Tool", "").strip()
+        if not tools_section:
+            tools_section = parsed["sections"].get("Winner Generator Tools", "").strip()
+        if tools_section:
+            tools: list[str] = []
+            for line in tools_section.splitlines():
+                item = line.strip()
+                if item.startswith("- "):
+                    item = item[2:].strip()
+                if item and item not in _FRAMEWORK_TOOLS and item != "none":
+                    tools.append(item)
+            return tools
+
+        legacy_match = re.search(r"(?:Tools|Winner Tools|Winner Tool|Winner Generator Tools):\s*(.+?)(?:\s*\|)", note)
+        if not legacy_match:
+            return []
+        chain = [t.strip() for t in legacy_match.group(1).split("→")]
+        return [t for t in chain if t and t not in _FRAMEWORK_TOOLS and t != "none"]
+
+    @staticmethod
+    def _extract_metrics_from_note(note: str) -> dict[str, float]:
+        import re
+
+        parsed = DistillationAgent._parse_note_sections(note)
+        metrics_section = parsed["sections"].get("Metrics", "").strip()
+        metrics: dict[str, float] = {}
+        if metrics_section:
+            for line in metrics_section.splitlines():
+                item = line.strip()
+                if item.startswith("- "):
+                    item = item[2:].strip()
+                if ":" not in item:
+                    continue
+                key, value = item.split(":", 1)
+                try:
+                    metrics[key.strip()] = float(value.strip())
+                except ValueError:
+                    continue
+            return metrics
+
+        legacy_match = re.search(r"Metrics:\s*(.+?)(?:\s*\||$)", note)
+        if not legacy_match:
+            return {}
+        for metric in legacy_match.group(1).split(","):
+            item = metric.strip()
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            try:
+                metrics[key.strip()] = float(value.strip())
+            except ValueError:
+                continue
+        return metrics
+
+    @staticmethod
+    def _extract_prediction_and_gt(note: str) -> tuple[str, str]:
+        import re
+
+        parsed = DistillationAgent._parse_note_sections(note)
+        pred = parsed["sections"].get("Prediction")
+        if pred is not None:
+            return pred.strip(), parsed["sections"].get("GT", "").strip()
+
+        legacy_match = re.search(r"Pred:\s*(.+?)\s*\|\s*GT:\s*(.+?)(?:\s*\||$)", note)
+        if legacy_match:
+            return legacy_match.group(1).strip(), legacy_match.group(2).strip()
+        return "", ""
+
+    @staticmethod
+    def _compute_statistics(notes: list[str]) -> str:
+        from collections import Counter, defaultdict
+
+        tool_outcomes: dict[str, Counter] = defaultdict(Counter)
+        labels_pred: Counter = Counter()
+        labels_gt: Counter = Counter()
+        metric_sums: dict[str, list[float]] = {}
+        outcome_counts: Counter = Counter()
+        ordered_outcomes = ("OK", "FAIL", "SCORED", "LOGGED")
+
+        for note in notes:
+            parsed = DistillationAgent._parse_note_sections(note)
+            status = str(parsed.get("status", "")).strip().upper() or "UNKNOWN"
+            outcome_counts[status] += 1
+
+            if not parsed["sections"].get("Evidence Kind", "").startswith("single_execution"):
+                for tool in DistillationAgent._extract_tools_from_note(note):
+                    tool_outcomes[tool][status] += 1
+
+            pred, gt = DistillationAgent._extract_prediction_and_gt(note)
+            if pred or gt:
+                p, g = pred, gt
+                if len(p) < 30:
+                    labels_pred[p] += 1
+                if len(g) < 30:
+                    labels_gt[g] += 1
+
+            for key, value in DistillationAgent._extract_metrics_from_note(note).items():
+                metric_sums.setdefault(key, []).append(value)
+
+        total_runs = sum(outcome_counts.values())
+        outcome_bits = [
+            f"{outcome}={outcome_counts[outcome]}"
+            for outcome in ordered_outcomes
+            if outcome_counts[outcome]
+        ]
+        if outcome_counts["UNKNOWN"]:
+            outcome_bits.append(f"UNKNOWN={outcome_counts['UNKNOWN']}")
+
+        lines: list[str] = []
+        lines.append(
+            f"Total runs: {total_runs}" + (f" ({', '.join(outcome_bits)})" if outcome_bits else "")
+        )
+
+        all_tools = set(tool_outcomes)
+        if all_tools:
+            lines.append("\nWinner-tool occurrence by note outcome:")
+            for t in sorted(all_tools, key=lambda x: -sum(tool_outcomes[x].values())):
+                counts = tool_outcomes[t]
+                total = sum(counts.values())
+                per_tool_bits = [
+                    f"{outcome}={counts[outcome]}"
+                    for outcome in ordered_outcomes
+                    if counts[outcome]
+                ]
+                if counts["UNKNOWN"]:
+                    per_tool_bits.append(f"UNKNOWN={counts['UNKNOWN']}")
+                lines.append(
+                    f"  {t}: total={total}" + (f" ({', '.join(per_tool_bits)})" if per_tool_bits else "")
+                )
+
+        if labels_gt and len(labels_gt) <= 10:
+            lines.append("\nGround truth label distribution:")
+            for label, cnt in labels_gt.most_common():
+                lines.append(f"  '{label}': {cnt}")
+            lines.append("Predicted label distribution:")
+            for label, cnt in labels_pred.most_common():
+                lines.append(f"  '{label}': {cnt}")
+
+        if metric_sums:
+            lines.append("\nMetric averages:")
+            for k, vals in sorted(metric_sums.items()):
+                avg = sum(vals) / len(vals)
+                lines.append(f"  {k}: avg={avg:.3f} (n={len(vals)})")
+
+        return "\n".join(lines) if lines else "(no statistics available)"
+
+    @staticmethod
+    def _compute_tool_stats(notes: list[str]) -> str:
+        """Extract per-tool performance statistics for TOOLS.md distillation."""
+        from collections import Counter, defaultdict
+
+        tool_outcomes: dict[str, Counter] = defaultdict(Counter)
+        tool_metrics: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+        ordered_outcomes = ("OK", "FAIL", "SCORED", "LOGGED")
+
+        for note in notes:
+            parsed = DistillationAgent._parse_note_sections(note)
+            status = str(parsed.get("status", "")).strip().upper() or "UNKNOWN"
+            if parsed["sections"].get("Evidence Kind", "").startswith("single_execution"):
+                continue
+            chain = DistillationAgent._extract_tools_from_note(note)
+            if not chain:
+                continue
+
+            metric_vals = DistillationAgent._extract_metrics_from_note(note)
+
+            for tool in chain:
+                tool_outcomes[tool][status] += 1
+                for metric_key, metric_value in metric_vals.items():
+                    tool_metrics[tool][metric_key].append(metric_value)
+
+        lines = []
+        all_tools = sorted(
+            set(tool_outcomes),
+            key=lambda x: -sum(tool_outcomes[x].values()),
+        )
+        for t in all_tools:
+            counts = tool_outcomes[t]
+            total = sum(counts.values())
+            per_tool_bits = [
+                f"{outcome}={counts[outcome]}"
+                for outcome in ordered_outcomes
+                if counts[outcome]
+            ]
+            if counts["UNKNOWN"]:
+                per_tool_bits.append(f"UNKNOWN={counts['UNKNOWN']}")
+            line = f"- **{t}**: {total} winner-notes"
+            if per_tool_bits:
+                line += f" | {', '.join(per_tool_bits)}"
+            if t in tool_metrics:
+                metric_parts = []
+                for mk, mvs in sorted(tool_metrics[t].items()):
+                    avg = sum(mvs) / len(mvs)
+                    metric_parts.append(f"{mk}={avg:.3f}")
+                if metric_parts:
+                    line += f" | {', '.join(metric_parts)}"
+            lines.append(line)
+
+        return "\n".join(lines) if lines else "(no tool data)"
+
+    @staticmethod
+    def _tool_boundary_text(entry: dict[str, Any]) -> str:
+        summary = str(entry.get("summary", "")).strip().rstrip(".")
+        conditions = [str(item).strip().rstrip(".") for item in entry.get("conditions", []) if str(item).strip()]
+        kind = str(entry.get("kind", "")).strip()
+        preferred = [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()]
+        avoid = [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()]
+
+        cond_text = "; ".join(conditions[:2]) if conditions else ""
+
+        action_text = ""
+        if kind == "tool_selection":
+            if preferred:
+                action_text = f"prefer {preferred[0]}"
+            elif summary:
+                action_text = summary
+        elif kind == "tool_failure":
+            if avoid:
+                action_text = f"avoid {', '.join(avoid[:2])}"
+            elif summary:
+                action_text = summary
+        elif summary:
+            action_text = summary
+
+        if cond_text and action_text:
+            return f"{cond_text}: {action_text}"[:160]
+        if action_text:
+            return action_text[:160]
+        return cond_text[:160]
+
+    @staticmethod
+    def _tool_chain_boundary_text(
+        tool_name: str,
+        tool_chain: list[str],
+        boundary_text: str,
+    ) -> str:
+        max_len = 160
+        clean_tool = str(tool_name).strip()
+        clean_chain = [str(item).strip() for item in tool_chain if str(item).strip()]
+        if not clean_tool or not clean_chain:
+            return boundary_text[:max_len]
+
+        chain_text = _tool_chain_text(clean_chain)
+        try:
+            idx = clean_chain.index(clean_tool)
+        except ValueError:
+            return boundary_text[:max_len]
+
+        if idx == 0:
+            role_text = f"use as the first step in {chain_text}"
+        else:
+            role_text = f"use after {clean_chain[idx - 1]} in {chain_text}"
+
+        if not boundary_text:
+            return role_text[:max_len]
+
+        remaining = max_len - len(role_text) - 2
+        if remaining <= 0:
+            return role_text[:max_len]
+        prefix = boundary_text[:remaining].rstrip(" ;,:")
+        return f"{prefix}; {role_text}"
+
+    def _build_tool_evidence_from_memory(self, scope: str) -> dict[str, dict[str, Any]]:
+        """Collect scope-local tool-centered evidence bundles from MEMORY rules."""
+        from collections import defaultdict
+
+        all_entries = [
+            entry for entry in self.memory.get_all_entries()
+            if str(entry.get("scope", "")).strip() == scope
+        ]
+        grouped: dict[str, dict[str, list[tuple[int, str]]]] = defaultdict(
+            lambda: {
+                "when_it_helps": [],
+                "when_to_avoid": [],
+                "output_risks": [],
+            }
+        )
+
+        for entry in all_entries:
+            support = self._entry_support_count(entry)
+            if support <= 0:
+                continue
+            kind = str(entry.get("kind", "")).strip()
+            boundary_text = self._tool_boundary_text(entry)
+            if not boundary_text:
+                continue
+
+            preferred = [str(item).strip() for item in entry.get("preferred_tools", []) if str(item).strip()]
+            avoid = [str(item).strip() for item in entry.get("avoid_tools", []) if str(item).strip()]
+            preferred_chains = _canonicalize_tool_chain_list(entry.get("preferred_tool_chains", []))
+            avoid_chains = _canonicalize_tool_chain_list(entry.get("avoid_tool_chains", []))
+
+            for tool_name in preferred:
+                grouped[tool_name]["when_it_helps"].append((support, boundary_text))
+
+            for tool_name in avoid:
+                grouped[tool_name]["when_to_avoid"].append((support, boundary_text))
+                if kind == "tool_failure":
+                    grouped[tool_name]["output_risks"].append((support, boundary_text))
+
+            for tool_chain in preferred_chains:
+                for tool_name in tool_chain:
+                    grouped[tool_name]["when_it_helps"].append(
+                        (support, self._tool_chain_boundary_text(tool_name, tool_chain, boundary_text))
+                    )
+
+            for tool_chain in avoid_chains:
+                for tool_name in tool_chain:
+                    chain_boundary_text = self._tool_chain_boundary_text(tool_name, tool_chain, boundary_text)
+                    grouped[tool_name]["when_to_avoid"].append((support, chain_boundary_text))
+                    if kind == "tool_failure":
+                        grouped[tool_name]["output_risks"].append((support, chain_boundary_text))
+
+        tool_evidence: dict[str, dict[str, Any]] = {}
+        for tool_name, buckets in grouped.items():
+            normalized: dict[str, list[str]] = {}
+            for field, items in buckets.items():
+                dedup: list[str] = []
+                seen: set[str] = set()
+                for _, text in sorted(items, key=lambda item: (-item[0], item[1])):
+                    if text in seen:
+                        continue
+                    seen.add(text)
+                    dedup.append(text)
+                if dedup:
+                    normalized[field] = dedup[:2]
+            if normalized.get("when_it_helps") or normalized.get("when_to_avoid") or normalized.get("output_risks"):
+                tool_evidence[tool_name] = {
+                    "when_it_helps": normalized.get("when_it_helps", []),
+                    "when_to_avoid": normalized.get("when_to_avoid", []),
+                    "output_risks": normalized.get("output_risks", []),
+                }
+
+        return tool_evidence
+
+    # ── Notes → MEMORY.md ─────────────────────────────────────────────
+
+    async def maybe_distill_notes_to_memory(self, scope: str, *, target_seq: int | None = None, force: bool = False) -> bool:
+        key = scope
+        state = await self._get_scope_state(key)
+        done_seq = int(state.get("notes_to_memory_done_seq", 0) or 0)
+        note_items = self.notes.get_scope_note_items(key)
+        current = len(note_items)
+        target = min(int(target_seq or current), current)
+        if target <= done_seq:
+            return False
+        if not force and not self._threshold_reached(target, done_seq, _DISTILL_L1_TO_L2):
+            return False
+
+        pending_notes = note_items[done_seq:target]
+        if len(pending_notes) < 2 and not force:
+            return False
+
+        logger.info(f"[Distill Notes→MEMORY] {key}: processing notes {done_seq + 1}-{target} of {current}")
+
+        await self.notes.resolve_conflicts(query=scope, scope=scope)
+
+        note_texts = [item["text"] for item in pending_notes]
+        available_note_ids = {item["id"] for item in pending_notes}
+        single_note_ids = {item["id"] for item in note_items
+            if self._parse_note_sections(item["text"])["sections"].get("Evidence Kind", "").startswith("single_execution")}
+        statistics = self._compute_statistics(note_texts)
+        notes_text = "\n\n".join(
+            f"- note_id={item['id']}\n{item['text']}"
+            for item in pending_notes
+        )
+
+        existing_memory = self.memory.get_entries(key)
+        existing_blocks: list[str] = []
+        for e in existing_memory:
+            existing_blocks.append(
+                "\n".join(
+                    [
+                        f"  - rule_id={e.get('rule_id', '')}",
+                        f"    kind={e.get('kind', '')}",
+                        f"    summary={e.get('summary', '')}",
+                        f"    conditions={json.dumps(e.get('conditions', []), ensure_ascii=False)}",
+                        f"    preferred_tools={json.dumps(e.get('preferred_tools', []), ensure_ascii=False)}",
+                        f"    avoid_tools={json.dumps(e.get('avoid_tools', []), ensure_ascii=False)}",
+                        f"    preferred_tool_chains={json.dumps(e.get('preferred_tool_chains', []), ensure_ascii=False)}",
+                        f"    avoid_tool_chains={json.dumps(e.get('avoid_tool_chains', []), ensure_ascii=False)}",
+                        f"    rationale={e.get('rationale', '')}",
+                        f"    support_count={self._entry_support_count(e)}",
+                        f"    support_note_ids={json.dumps(self._entry_note_refs(e), ensure_ascii=False)}",
+                        f"    conflict_rule_ids={json.dumps(MemoryStore._normalize_conflict_rule_ids(e.get('conflict_rule_ids', [])), ensure_ascii=False)}",
+                        f"    last_seen_at={e.get('timestamp', 0.0)}",
+                        f"    confidence={e.get('confidence', 0.0)}",
+                        f"    injectable={e.get('injectable', True)}",
+                    ]
+                )
+            )
+        existing_text = "\n\n".join(existing_blocks) if existing_blocks else "(none yet)"
+
+        max_attempts = max(1, int(_NOTES_TO_MEMORY_EMPTY_RETRY_ATTEMPTS))
+        validation_feedback = ""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                prompt = NOTES_TO_MEMORY_PROMPT.format(
+                    scope=key, total=len(pending_notes),
+                    statistics=statistics, notes=notes_text,
+                    memory_rule_cap=_MEMORY_RULE_CAP,
+                    existing_memory=existing_text,
+                )
+                if validation_feedback:
+                    prompt = (
+                        f"{prompt}\n\n"
+                        "## Validation Feedback From Your Previous Attempt\n"
+                        "Your previous JSON contained internally inconsistent rule structure.\n"
+                        "Fix the issues below in this retry. Do not keep the same invalid structure.\n"
+                        f"{validation_feedback}"
+                    )
+                resp = await self._complete_with_distill_retries(
+                    stage_label=f"Distill Notes→MEMORY {key}",
+                    messages=[
+                        {"role": "system",
+                         "content": (
+                             "You are a strategy analyst updating structured MEMORY rules. "
+                             "Return JSON only. Prefer supporting or merging existing rules over inventing duplicates. "
+                             "Rules must describe task-solving behavior only, never framework/orchestration behavior."
+                         )},
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format="json",
+                )
+                if resp and resp.parsed and isinstance(resp.parsed, dict):
+                    validation_errors = self._validate_memory_update_decision(resp.parsed, single_note_ids=single_note_ids, existing_entries=existing_memory)
+                    if validation_errors:
+                        validation_feedback = "\n".join(f"- {item}" for item in validation_errors)
+                        if attempt < max_attempts:
+                            logger.warning(
+                                f"[Distill Notes→MEMORY] {key}: invalid structured decision "
+                                f"(attempt {attempt}/{max_attempts}); retrying with feedback: "
+                                f"{'; '.join(validation_errors)}"
+                            )
+                            continue
+                        raise ValueError(
+                            f"invalid structured decision after {max_attempts} attempts: "
+                            f"{'; '.join(validation_errors)}"
+                        )
+                    updated_entries = self._apply_memory_update_decision(
+                        key, existing_memory, resp.parsed, available_note_ids=available_note_ids
+                    )
+                    suspicious_empty_distill = not existing_memory and not updated_entries
+                    if suspicious_empty_distill and attempt < max_attempts:
+                        logger.warning(
+                            f"[Distill Notes→MEMORY] {key}: parsed JSON but produced 0 rules from non-empty notes "
+                            f"(attempt {attempt}/{max_attempts}); retrying"
+                        )
+                        continue
+                    self.memory.replace_entries(key, updated_entries)
+                    logger.info(
+                        f"[Distill Notes→MEMORY] {key}: updated to {len(self.memory.get_entries(key))} rules "
+                    )
+                    return not suspicious_empty_distill
+            except Exception as e:
+                logger.warning(f"[Distill Notes→MEMORY] {key} failed: {e}")
+                return False
+        return False
+
+    # ── Notes → TOOLS.md ──────────────────────────────────────────────
+
+    async def maybe_distill_memory_to_tools(self, scope: str) -> bool:
+        """Rebuild scope-local tool cards from the current full MEMORY view."""
+        full_notes = self.notes.get_recent_notes(10000)
+        if full_notes:
+            self._update_scope_counts(full_notes)
+
+        tool_evidence = self._build_tool_evidence_from_memory(scope)
+        if not tool_evidence:
+            self.tools.replace(scope, {})
+            logger.info(f"[Distill MEMORY→TOOLS] Rebuilt 0 tool notes for {scope}")
+            return True
+
+        existing_text = "\n".join(
+            f"- **{k}**: {self.tools._render_note_payload(v)}"
+            for k, v in self.tools.get_notes(scope).items()
+        ) if self.tools.get_notes(scope) else "(none yet)"
+        tool_evidence_text = json.dumps(tool_evidence, ensure_ascii=False, indent=2)
+
+        prompt = MEMORY_TO_TOOLS_PROMPT.format(
+            tool_evidence=tool_evidence_text,
+            existing_tools=existing_text,
+        )
+
+        resp = await self._complete_with_distill_retries(
+            stage_label=f"Distill MEMORY→TOOLS {scope}",
+            messages=[
+                {"role": "system", "content": "You write concise single-tool boundary cards. Return JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format="json",
+        )
+        if resp and resp.parsed and isinstance(resp.parsed, dict) and isinstance(resp.parsed.get("tool_notes"), dict):
+            self.tools.replace(scope, resp.parsed["tool_notes"])
+            logger.info(f"[Distill MEMORY→TOOLS] Rebuilt {len(resp.parsed['tool_notes'])} tool notes for {scope}")
+            return True
+        return False
+
+    def _update_scope_counts(self, notes: list[str]) -> None:
+        """Parse notes and rebuild per-scope tool usage counters.
+
+        Notes now prefer canonical ``[scope_key]`` headers, but we still
+        accept the legacy ``[domain/task]`` format for backward
+        compatibility during migration.
+        """
+        scope_tool_counts: dict[str, dict[str, int]] = {}
+
+        for note in notes:
+            scope = self._extract_scope_from_note(note)
+            if not scope:
+                continue
+            bucket = scope_tool_counts.setdefault(scope, {})
+            for tool in self._extract_tools_from_note(note):
+                bucket[tool] = bucket.get(tool, 0) + 1
+
+        for scope, counts in scope_tool_counts.items():
+            self.tools.record_scope_usage(scope, counts)
+
+    def _extract_scope_from_note(self, note: str) -> str:
+        """Extract the canonical scope key from a note block."""
+        import re
+
+        parsed = self._parse_note_sections(note)
+        scope = str(parsed["sections"].get("Scope") or parsed.get("header") or "").strip()
+        if not scope:
+            match = re.search(r"(?:^|\n)\[([^\]]+)\]\s+(?:OK|FAIL|SCORED|LOGGED)\b", note)
+            if not match:
+                return ""
+            scope = match.group(1).strip()
+        if not scope:
+            return ""
+        if "/" in scope:
+            domain, task = scope.split("/", 1)
+            return f"{domain}_{self._denormalize_task_from_notes(task)}"
+        return scope
+
+    # ── MEMORY → cross_domain scope ──────────────────────────────────────
+
+    async def maybe_distill_memory_to_cross_domain(self, bucket: str) -> bool:
+        cross_scope = _cross_domain_scope_for_bucket(bucket)
+        all_memory = [
+            entry for entry in self.memory.get_all_entries()
+            if _task_bucket_from_scope(str(entry.get("scope", "")).strip()) == bucket
+            and not _is_cross_domain_scope(str(entry.get("scope", "")).strip())
+        ]
+        if len(all_memory) < 4:
+            self.memory.replace_entries(cross_scope, [])
+            logger.info(f"[Distill MEMORY→cross_domain] {bucket}: cleared cross-domain rules")
+            return True
+
+        logger.info(f"[Distill MEMORY→cross_domain] {bucket}: rebuilding from {len(all_memory)} rules")
+
+        memory_lines = []
+        for entry in all_memory:
+            preferred = ", ".join(entry.get("preferred_tools", [])[:4])
+            avoid = ", ".join(entry.get("avoid_tools", [])[:4])
+            preferred_paths = " || ".join(
+                _tool_chain_text(chain)
+                for chain in _canonicalize_tool_chain_list(entry.get("preferred_tool_chains", []))[:2]
+            )
+            avoid_paths = " || ".join(
+                _tool_chain_text(chain)
+                for chain in _canonicalize_tool_chain_list(entry.get("avoid_tool_chains", []))[:2]
+            )
+            parts = [
+                f"  rule_id={entry.get('rule_id', '')}",
+                f"scope={entry.get('scope', '?')}",
+                f"summary={entry.get('summary', '')}",
+                f"support_count={self._entry_support_count(entry)}",
+            ]
+            if preferred_paths:
+                parts.append(f"prefer_tool_chains={preferred_paths}")
+            if preferred:
+                parts.append(f"prefer_tools={preferred}")
+            if avoid_paths:
+                parts.append(f"avoid_tool_chains={avoid_paths}")
+            if avoid:
+                parts.append(f"avoid_tools={avoid}")
+            memory_lines.append(" | ".join(parts))
+        memory_text = "\n".join(memory_lines)
+
+        existing_cross = self.memory.get_cross_domain_entries(bucket)
+        existing_text = "\n".join(
+            f"  - {e.get('summary', '')}" for e in existing_cross
+        ) if existing_cross else "(none yet)"
+
+        prompt = MEMORY_TO_CROSS_DOMAIN_PROMPT.format(
+            allowed_tool_names=", ".join(sorted(_available_tool_names())),
+            all_memory_entries=memory_text,
+            existing_cross_domain=existing_text,
+        )
+
+        resp = await self._complete_with_distill_retries(
+            stage_label=f"Distill MEMORY→cross_domain {bucket}",
+            messages=[
+                {"role": "system",
+                 "content": "You synthesize cross-domain MEMORY rules from per-scope rules. Return JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format="json",
+        )
+        if resp and resp.parsed and "rules" in resp.parsed:
+            removed_rule_ids = resp.parsed.get("removed_rule_ids", [])
+            new_entries = []
+            for i, rule in enumerate(resp.parsed["rules"]):
+                if not isinstance(rule, dict):
+                    continue
+                normalized = self.memory._normalize_rule_payload(cross_scope, rule, i)
+                source_rule_ids = self._normalize_ref_list(
+                    rule.get("source_rule_ids", []),
+                    allowed={
+                        str(entry.get("rule_id", "")).strip()
+                        for entry in all_memory
+                        if str(entry.get("rule_id", "")).strip()
+                    },
+                )
+                note_refs = self._source_rule_note_refs(source_rule_ids)
+                evidence = normalized.get("evidence", {})
+                evidence["sample_refs"] = note_refs
+                evidence["support_count"] = len(note_refs)
+                normalized["evidence"] = evidence
+                normalized["source_rule_ids"] = source_rule_ids
+                new_entries.append(normalized)
+            if removed_rule_ids:
+                allowed_removed = {str(item).strip() for item in removed_rule_ids if str(item).strip()}
+                new_entries = [
+                    entry for entry in new_entries
+                    if str(entry.get("rule_id", "")).strip() not in allowed_removed
+                ]
+            self.memory.replace_entries(cross_scope, new_entries)
+            n_cross = len(self.memory.get_cross_domain_entries(bucket))
+            logger.info(
+                f"[Distill MEMORY→cross_domain] {bucket}: updated to {n_cross} cross-domain rules "
+                f"(removed {len(removed_rule_ids)})"
+            )
+            return True
+        return False
+
+    # ── MEMORY → PLAYBOOKS/ ────────────────────────────────────────────
+
+    async def maybe_distill_memory_to_skills(self, scope: str) -> bool:
+        """Rebuild a SKILLS/ SOP from the current full MEMORY view for one scope."""
+        entries = self.memory.get_entries(scope)
+        if len(entries) < 3:
+            self.skills.delete_skill(scope)
+            return True
+
+        skill_entries: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            evidence = entry.get("evidence") or {}
+            conditions = entry.get("conditions") or []
+            if not isinstance(conditions, list):
+                conditions = [str(conditions)]
+            preferred_tools = entry.get("preferred_tools") or []
+            avoid_tools = entry.get("avoid_tools") or []
+            preferred_tool_chains = entry.get("preferred_tool_chains") or []
+            avoid_tool_chains = entry.get("avoid_tool_chains") or []
+            skill_entries.append(
+                "\n".join(
+                    [
+                        f"- rule_id: {entry.get('rule_id', '')}",
+                        f"  kind: {entry.get('kind', '')}",
+                        f"  summary: {entry.get('summary', '')}",
+                        f"  conditions: {json.dumps([str(c) for c in conditions if str(c).strip()], ensure_ascii=False)}",
+                        f"  rationale: {entry.get('rationale', '')}",
+                        f"  preferred_tools: {json.dumps(preferred_tools, ensure_ascii=False, default=str)}",
+                        f"  avoid_tools: {json.dumps(avoid_tools, ensure_ascii=False, default=str)}",
+                        f"  preferred_tool_chains: {json.dumps(preferred_tool_chains, ensure_ascii=False, default=str)}",
+                        f"  avoid_tool_chains: {json.dumps(avoid_tool_chains, ensure_ascii=False, default=str)}",
+                        f"  support_count: {self._entry_support_count(entry)}",
+                        f"  injectable: {entry.get('injectable', True)}",
+                    ]
+                )
+            )
+        entries_text = "\n\n".join(skill_entries)
+        existing_skill = self.skills.get_skill(scope)
+
+        prompt = MEMORY_TO_SKILLS_PROMPT.format(
+            scope=scope,
+            memory_entries=entries_text,
+            existing_skill=existing_skill or "(none yet)",
+        )
+
+        resp = await self._complete_with_distill_retries(
+            stage_label=f"Distill MEMORY→SKILLS {scope}",
+            messages=[
+                {"role": "system",
+                 "content": "You write concise operational guides for a time-series agent. Return plain Markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            min_text_len=50,
+        )
+        if resp and resp.text and len(resp.text.strip()) > 50:
+            normalized_skill = self._normalize_skill_markdown(scope, resp.text.strip(), entries)
+            if not normalized_skill:
+                logger.warning(
+                    f"[Distill MEMORY→SKILLS] Rejected invalid skill markdown for {scope} "
+                    f"(missing required sections or valid Source Rule IDs)"
+                )
+                return False
+            self.skills.update_skill(scope, normalized_skill)
+            self.skills.delete_skill_metadata(scope)
+            logger.info(f"[Distill MEMORY→SKILLS] Updated SOP for {scope}")
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_skill_markdown(
+        scope: str,
+        skill_markdown: str,
+        entries: list[dict[str, Any]],
+    ) -> str:
+        allowed_rule_ids = {
+            str(entry.get("rule_id", "")).strip()
+            for entry in entries
+            if isinstance(entry, dict) and str(entry.get("rule_id", "")).strip()
+        }
+        parsed_blocks = _parse_skill_markdown_blocks(skill_markdown)
+        if not parsed_blocks:
+            return ""
+        seen_titles: set[str] = set()
+        normalized_blocks: list[dict[str, Any]] = []
+        for raw_block in parsed_blocks:
+            title = str(raw_block.get("title", "")).strip()
+            if not title or not title.startswith("### Skill ") or title in seen_titles:
+                return ""
+            source_rule_ids: list[str] = []
+            seen_rule_ids: set[str] = set()
+            for raw_rule_id in raw_block.get("source_rule_ids", []):
+                rule_id = str(raw_rule_id).strip()
+                if not rule_id or rule_id not in allowed_rule_ids or rule_id in seen_rule_ids:
+                    continue
+                seen_rule_ids.add(rule_id)
+                source_rule_ids.append(rule_id)
+            sections = raw_block.get("sections") if isinstance(raw_block.get("sections"), dict) else {}
+            normalized_sections: dict[str, list[str]] = {}
+            for section_name in _SKILL_SECTION_ORDER:
+                normalized_sections[section_name] = [
+                    str(item).rstrip()
+                    for item in sections.get(section_name, [])
+                    if str(item).strip()
+                ]
+            if (
+                not source_rule_ids
+                or not normalized_sections["Trigger"]
+                or not normalized_sections["Core Idea"]
+                or not normalized_sections["Workflow"]
+                or not normalized_sections["Evidence"]
+            ):
+                return ""
+            normalized_blocks.append(
+                {
+                    "title": title,
+                    "source_rule_ids": source_rule_ids,
+                    "sections": normalized_sections,
+                }
+            )
+            seen_titles.add(title)
+        return _render_skill_markdown_blocks(normalized_blocks, include_source_rule_ids=True)
+
+    async def maybe_distill_memory_to_skills_decision(self, scope: str) -> bool:
+        """Rebuild a SKILLS_DECISION/ guide from the current full MEMORY view."""
+        entries = self.memory.get_entries(scope)
+        if len(entries) < 3:
+            self.skills_decision.delete_skill_decision(scope)
+            return True
+
+        decision_entries: list[str] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            evidence = entry.get("evidence") or {}
+            conditions = entry.get("conditions") or []
+            if not isinstance(conditions, list):
+                conditions = [str(conditions)]
+            preferred_tools = entry.get("preferred_tools") or []
+            avoid_tools = entry.get("avoid_tools") or []
+            preferred_tool_chains = entry.get("preferred_tool_chains") or []
+            avoid_tool_chains = entry.get("avoid_tool_chains") or []
+            decision_entries.append(
+                "\n".join(
+                    [
+                        f"- rule_id: {entry.get('rule_id', '')}",
+                        f"  kind: {entry.get('kind', '')}",
+                        f"  summary: {entry.get('summary', '')}",
+                        f"  conditions: {json.dumps([str(c) for c in conditions if str(c).strip()], ensure_ascii=False)}",
+                        f"  rationale: {entry.get('rationale', '')}",
+                        f"  preferred_tools: {json.dumps(preferred_tools, ensure_ascii=False, default=str)}",
+                        f"  avoid_tools: {json.dumps(avoid_tools, ensure_ascii=False, default=str)}",
+                        f"  preferred_tool_chains: {json.dumps(preferred_tool_chains, ensure_ascii=False, default=str)}",
+                        f"  avoid_tool_chains: {json.dumps(avoid_tool_chains, ensure_ascii=False, default=str)}",
+                        f"  support_count: {self._entry_support_count(entry)}",
+                        f"  injectable: {entry.get('injectable', True)}",
+                        f"  evidence_refs: {json.dumps(evidence.get('sample_refs', []), ensure_ascii=False, default=str)}",
+                    ]
+                )
+            )
+        entries_text = "\n\n".join(decision_entries)
+        existing_skill_decision = self.skills_decision.get_skill_decision(scope)
+
+        prompt = MEMORY_TO_SKILLS_DECISION_PROMPT.format(
+            scope=scope,
+            memory_entries=entries_text,
+            existing_skill_decision=existing_skill_decision or "(none yet)",
+        )
+
+        resp = await self._complete_with_distill_retries(
+            stage_label=f"Distill MEMORY→SKILLS_DECISION {scope}",
+            messages=[
+                {"role": "system",
+                 "content": "You write concise decision-explanation guides for a time-series agent. Return plain Markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            min_text_len=50,
+        )
+        if resp and resp.text and len(resp.text.strip()) > 50:
+            self.skills_decision.update_skill_decision(scope, resp.text.strip())
+            logger.info(f"[Distill MEMORY→SKILLS_DECISION] Updated decision guide for {scope}")
+            return True
+        return False
+
+    # ── Orchestration ─────────────────────────────────────────────────
+
+    async def on_new_note(self, scope: str) -> None:
+        """Backward-compatible wrapper for single-scope commits."""
+        await self.on_scope_commit([scope])
+        await self.on_global_commit([scope])
+
+    async def force_distill_all(self) -> None:
+        """Force a full rebuild from current notes/memory sources."""
+        scopes = set()
+        for scope, _path in _ScopeStorageCodec.iter_scope_paths(MEMORY_DIR, ".json"):
+            scopes.add(scope)
+        notes = self.notes.get_recent_notes(10000)
+        for note in notes:
+            scope = self._extract_scope_from_note(note)
+            if scope:
+                scopes.add(scope)
+
+        for scope in scopes:
+            if _is_cross_domain_scope(scope):
+                continue
+            note_total = self.notes.scoped_total(scope)
+            await self._update_scope_state(
+                scope,
+                notes_total_seq=note_total,
+                notes_to_memory_done_seq=0,
+                notes_to_memory_inflight=False,
+                memory_fingerprint="",
+                memory_to_skills_done_fingerprint="",
+                memory_to_skills_inflight=False,
+                memory_to_skills_decision_done_fingerprint="",
+                memory_to_skills_decision_inflight=False,
+                memory_to_tools_done_fingerprint="",
+                memory_to_tools_inflight=False,
+                pending_snapshot_notes_from_seq=0,
+                pending_snapshot_notes_to_seq=0,
+                pending_snapshot_memory_fingerprint="",
+            )
+            self._ensure_scope_worker(scope, force=True)
+
+        buckets = sorted({_task_bucket_from_scope(scope) for scope in scopes if not _is_cross_domain_scope(scope)})
+        for bucket in buckets:
+            if not bucket:
+                continue
+            await self._update_bucket_state(
+                bucket,
+                memory_fingerprint="",
+                memory_to_cross_done_fingerprint="",
+                memory_to_cross_inflight=False,
+            )
+            self._ensure_bucket_worker(bucket, force=True)
+        await self.distill_pending_all()
+
+    @staticmethod
+    def _normalize_scope_list(scope_keys: list[str] | None) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw_scope in scope_keys or []:
+            scope = str(raw_scope).strip()
+            if not scope or scope in seen or _is_cross_domain_scope(scope):
+                continue
+            seen.add(scope)
+            ordered.append(scope)
+        return ordered
+
+    async def _drain_scope_notes_once(self, scope: str) -> bool:
+        with _exclusive_file_lock(_scope_lock_path(scope)):
+            notes_total = self.notes.scoped_total(scope)
+            state = await self._update_scope_state(scope, notes_total_seq=notes_total)
+            done_seq = int(state.get("notes_to_memory_done_seq", 0) or 0)
+            if notes_total <= done_seq:
+                return False
+
+            target_seq = notes_total
+            await self._update_scope_state(scope, notes_to_memory_inflight=True)
+            try:
+                success = await self.maybe_distill_notes_to_memory(scope, target_seq=target_seq, force=True)
+            finally:
+                await self._update_scope_state(scope, notes_to_memory_inflight=False)
+            if not success:
+                return False
+
+            memory_fp = self._scope_memory_fingerprint(scope)
+            pending_from_seq = int(state.get("pending_snapshot_notes_from_seq", 0) or 0)
+            if pending_from_seq <= 0:
+                pending_from_seq = done_seq + 1
+            await self._update_scope_state(
+                scope,
+                notes_to_memory_done_seq=target_seq,
+                memory_fingerprint=memory_fp,
+                pending_snapshot_notes_from_seq=pending_from_seq,
+                pending_snapshot_notes_to_seq=target_seq,
+                pending_snapshot_memory_fingerprint=memory_fp,
+            )
+            return True
+
+    async def _drain_scope_post_memory_once(self, scope: str) -> bool:
+        with _exclusive_file_lock(_scope_lock_path(scope)):
+            progressed = False
+            state = await self._get_scope_state(scope)
+            memory_fp = self._scope_memory_fingerprint(scope)
+            if memory_fp != str(state.get("memory_fingerprint", "") or ""):
+                state = await self._update_scope_state(scope, memory_fingerprint=memory_fp)
+
+            if memory_fp and memory_fp != str(state.get("memory_to_skills_done_fingerprint", "") or ""):
+                await self._update_scope_state(scope, memory_to_skills_inflight=True)
+                try:
+                    success = await self.maybe_distill_memory_to_skills(scope)
+                finally:
+                    await self._update_scope_state(scope, memory_to_skills_inflight=False)
+                if success:
+                    await self._update_scope_state(scope, memory_to_skills_done_fingerprint=memory_fp)
+                    progressed = True
+            elif not memory_fp and str(state.get("memory_to_skills_done_fingerprint", "") or ""):
+                if self.skills.get_skill(scope):
+                    self.skills.delete_skill(scope)
+                await self._update_scope_state(scope, memory_to_skills_done_fingerprint="")
+                progressed = True
+
+            state = await self._get_scope_state(scope)
+            if memory_fp and memory_fp != str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""):
+                await self._update_scope_state(scope, memory_to_skills_decision_inflight=True)
+                try:
+                    success = await self.maybe_distill_memory_to_skills_decision(scope)
+                finally:
+                    await self._update_scope_state(scope, memory_to_skills_decision_inflight=False)
+                if success:
+                    await self._update_scope_state(scope, memory_to_skills_decision_done_fingerprint=memory_fp)
+                    progressed = True
+            elif not memory_fp and str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""):
+                if self.skills_decision.get_skill_decision(scope):
+                    self.skills_decision.delete_skill_decision(scope)
+                await self._update_scope_state(scope, memory_to_skills_decision_done_fingerprint="")
+                progressed = True
+
+            state = await self._get_scope_state(scope)
+            if memory_fp and memory_fp != str(state.get("memory_to_tools_done_fingerprint", "") or ""):
+                await self._update_scope_state(scope, memory_to_tools_inflight=True)
+                try:
+                    success = await self.maybe_distill_memory_to_tools(scope)
+                finally:
+                    await self._update_scope_state(scope, memory_to_tools_inflight=False)
+                if success:
+                    await self._update_scope_state(scope, memory_to_tools_done_fingerprint=memory_fp)
+                    progressed = True
+            elif not memory_fp and str(state.get("memory_to_tools_done_fingerprint", "") or ""):
+                if self.tools.get_notes(scope):
+                    self.tools.replace(scope, {})
+                await self._update_scope_state(scope, memory_to_tools_done_fingerprint="")
+                progressed = True
+
+            return progressed
+
+    async def _drain_bucket_cross_once(self, bucket: str) -> bool:
+        if not bucket:
+            return False
+        with _exclusive_file_lock(_bucket_lock_path(bucket)):
+            memory_fp = self._bucket_memory_fingerprint(bucket)
+            state = await self._update_bucket_state(bucket, memory_fingerprint=memory_fp)
+            if not memory_fp:
+                cross_scope = _cross_domain_scope_for_bucket(bucket)
+                progressed = False
+                if self.memory.get_entries(cross_scope):
+                    self.memory.replace_entries(cross_scope, [])
+                    progressed = True
+                if str(state.get("memory_to_cross_done_fingerprint", "") or ""):
+                    await self._update_bucket_state(bucket, memory_to_cross_done_fingerprint="")
+                    progressed = True
+                return progressed
+            if memory_fp == str(state.get("memory_to_cross_done_fingerprint", "") or ""):
+                return False
+
+            await self._update_bucket_state(bucket, memory_to_cross_inflight=True)
+            try:
+                success = await self.maybe_distill_memory_to_cross_domain(bucket)
+            finally:
+                await self._update_bucket_state(bucket, memory_to_cross_inflight=False)
+            if not success:
+                return False
+
+            await self._update_bucket_state(bucket, memory_to_cross_done_fingerprint=memory_fp)
+            return True
+
+    async def _finalize_scope_snapshot_once(self, scope: str) -> bool:
+        with _exclusive_file_lock(_scope_lock_path(scope)):
+            state = await self._get_scope_state(scope)
+            pending_from_seq = int(state.get("pending_snapshot_notes_from_seq", 0) or 0)
+            pending_to_seq = int(state.get("pending_snapshot_notes_to_seq", 0) or 0)
+            pending_snapshot_fp = str(state.get("pending_snapshot_memory_fingerprint", "") or "")
+            memory_fp = self._scope_memory_fingerprint(scope)
+            if pending_to_seq < pending_from_seq or pending_from_seq <= 0:
+                return False
+            if pending_snapshot_fp != memory_fp:
+                notes_done_seq = int(state.get("notes_to_memory_done_seq", 0) or 0)
+                skills_fp = str(state.get("memory_to_skills_done_fingerprint", "") or "")
+                skills_decision_fp = str(state.get("memory_to_skills_decision_done_fingerprint", "") or "")
+                tools_fp = str(state.get("memory_to_tools_done_fingerprint", "") or "")
+                converged_to_current_memory = (
+                    memory_fp
+                    and pending_to_seq <= notes_done_seq
+                    and memory_fp == skills_fp
+                    and memory_fp == skills_decision_fp
+                    and memory_fp == tools_fp
+                )
+                if not converged_to_current_memory:
+                    return False
+                pending_snapshot_fp = memory_fp
+                await self._update_scope_state(
+                    scope,
+                    pending_snapshot_memory_fingerprint=memory_fp,
+                )
+
+            await self._append_memory_history_snapshot(
+                scope=scope,
+                notes_from_seq=pending_from_seq,
+                notes_to_seq=pending_to_seq,
+                memory_fingerprint=pending_snapshot_fp,
+            )
+            await self._update_scope_state(
+                scope,
+                pending_snapshot_notes_from_seq=0,
+                pending_snapshot_notes_to_seq=0,
+                pending_snapshot_memory_fingerprint="",
+            )
+            return True
+
+    async def _distill_pending_scope_list(self, scope_list: list[str]) -> None:
+        if not scope_list:
+            return
+
+        bucket_list = sorted({_task_bucket_from_scope(scope) for scope in scope_list if _task_bucket_from_scope(scope)})
+        bucket_to_scopes: dict[str, list[str]] = {}
+        for scope in scope_list:
+            bucket = _task_bucket_from_scope(scope)
+            if bucket:
+                bucket_to_scopes.setdefault(bucket, []).append(scope)
+
+        for scope in scope_list:
+            await self._update_scope_state(scope, notes_total_seq=self.notes.scoped_total(scope))
+
+        while True:
+            unresolved = []
+            for scope in scope_list:
+                state = await self._get_scope_state(scope)
+                if self.notes.scoped_total(scope) > int(state.get("notes_to_memory_done_seq", 0) or 0):
+                    unresolved.append(scope)
+            if not unresolved:
+                break
+            progressed = any(await asyncio.gather(*(self._drain_scope_notes_once(scope) for scope in unresolved)))
+            if not progressed:
+                raise RuntimeError(f"distill_pending notes->memory made no progress; unresolved_scopes={sorted(unresolved)}")
+
+        while True:
+            unresolved = []
+            for scope in scope_list:
+                state = await self._get_scope_state(scope)
+                memory_fp = self._scope_memory_fingerprint(scope)
+                if memory_fp != str(state.get("memory_to_skills_done_fingerprint", "") or ""):
+                    unresolved.append(scope)
+                    continue
+                if memory_fp != str(state.get("memory_to_skills_decision_done_fingerprint", "") or ""):
+                    unresolved.append(scope)
+                    continue
+                if memory_fp != str(state.get("memory_to_tools_done_fingerprint", "") or ""):
+                    unresolved.append(scope)
+            if not unresolved:
+                break
+            progressed = any(await asyncio.gather(*(self._drain_scope_post_memory_once(scope) for scope in unresolved)))
+            if not progressed:
+                raise RuntimeError(
+                    "distill_pending memory->derived made no progress; "
+                    f"unresolved_scopes={sorted(unresolved)}"
+                )
+
+        while True:
+            unresolved = []
+            for bucket in bucket_list:
+                state = await self._get_bucket_state(bucket)
+                if self._bucket_memory_fingerprint(bucket) != str(state.get("memory_to_cross_done_fingerprint", "") or ""):
+                    unresolved.append(bucket)
+            if not unresolved:
+                break
+            progressed = any(await asyncio.gather(*(self._drain_bucket_cross_once(bucket) for bucket in unresolved)))
+            if not progressed:
+                raise RuntimeError(
+                    "distill_pending memory->cross_domain made no progress; "
+                    f"unresolved_buckets={sorted(unresolved)}"
+                )
+
+        while True:
+            unresolved = []
+            for scope in scope_list:
+                state = await self._get_scope_state(scope)
+                if int(state.get("pending_snapshot_notes_to_seq", 0) or 0) > 0:
+                    unresolved.append(scope)
+            if not unresolved:
+                break
+            progressed = any(await asyncio.gather(*(self._finalize_scope_snapshot_once(scope) for scope in unresolved)))
+            if not progressed:
+                raise RuntimeError(
+                    "distill_pending snapshot finalize made no progress; "
+                    f"unresolved_scopes={sorted(unresolved)}"
+                )
+
+    def _active_distillation_workers(
+        self, scope_list: list[str] | None = None,
+    ) -> list[asyncio.Task]:
+        """Snapshot workers for selected scopes, or every worker for ``None``."""
+        if scope_list is None:
+            workers = [*self._scope_workers.values(), *self._bucket_workers.values()]
+        else:
+            buckets = {_task_bucket_from_scope(scope) for scope in scope_list}
+            workers = [self._scope_workers.get(scope) for scope in scope_list]
+            workers.extend(self._bucket_workers.get(bucket) for bucket in buckets if bucket)
+        return list(dict.fromkeys(
+            task for task in workers
+            if task and not task.done() and task is not asyncio.current_task()
+        ))
+
+    async def _await_active_scope_and_bucket_workers(
+        self,
+        scope_list: list[str] | None = None,
+    ) -> None:
+        """Wait for overlapping background distill workers before a sync drain.
+
+        New definition:
+            Explicit shutdown flush must not race the already-running
+            background scope/bucket workers for the same scopes. Otherwise the
+            current process can try to take the same on-disk scope lock twice
+            and block itself forever during shutdown.
+        """
+        # A scope worker can create its bucket worker while we await it. Joining
+        # only the first snapshot can let the synchronous drain take that new
+        # worker's flock on this same event loop and deadlock the process.
+        while pending := self._active_distillation_workers(scope_list):
+            await asyncio.gather(*pending)
+
+    async def cancel_pending_distillation(self) -> None:
+        """Cancel and join all workers before their owner closes its ledger.
+
+        The caller must first stop committing new notes. Recheck the registry
+        after each join because cancellation cleanup can create another worker.
+        Expected worker cancellation is consumed; cleanup failures and cancellation
+        of this caller are surfaced only after every registered worker has stopped.
+        """
+        failures: list[BaseException] = []
+        interrupted: asyncio.CancelledError | None = None
+        while pending := self._active_distillation_workers():
+            for worker in pending:
+                worker.cancel()
+            try:
+                results = await asyncio.gather(*pending, return_exceptions=True)
+            except asyncio.CancelledError as exc:
+                interrupted = exc
+                results = [
+                    worker.exception() for worker in pending
+                    if worker.done() and not worker.cancelled()
+                ]
+            failures.extend(
+                result for result in results
+                if isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            )
+        self._pending_scope_force.clear()
+        self._pending_bucket_force.clear()
+        if interrupted is not None:
+            raise interrupted
+        if failures:
+            raise failures[0]
+
+    async def distill_pending_scopes(self, scope_keys: list[str] | None) -> None:
+        """Drain pending distillation only for the provided non-cross-domain scopes."""
+        scope_list = self._normalize_scope_list(scope_keys)
+        await self._await_active_scope_and_bucket_workers(scope_list)
+        await self._distill_pending_scope_list(scope_list)
+
+    async def distill_pending_all(self) -> None:
+        """Drain all currently pending distillation work, including short tails."""
+        await self._await_active_scope_and_bucket_workers()
+        scopes = set()
+        for scope, _path in _ScopeStorageCodec.iter_scope_paths(MEMORY_DIR, ".json"):
+            scopes.add(scope)
+        notes = self.notes.get_recent_notes(10000)
+        for note in notes:
+            scope = self._extract_scope_from_note(note)
+            if scope:
+                scopes.add(scope)
+
+        await self._distill_pending_scope_list(
+            [scope for scope in scopes if not _is_cross_domain_scope(scope)]
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Unified Memory Interface
+# ═══════════════════════════════════════════════════════════════════════
+
+class HierarchicalMemory:
+    """Unified interface for TimeClaw's six-component memory system.
+
+    Components (aligned with OpenClaw naming):
+        soul_text   — Fixed SOUL.md (agent identity)
+        notes       — Notes (raw experience log)
+        memory      — MemoryStore (causal insights; per-scope rules are injectable,
+                       cross_domain rules are distilled/stored only)
+        tools       — ToolsStore (per-tool usage experience notes)
+        skills      — SkillsStore (scene-specific SOPs)
+        skills_decision — SkillsDecisionStore (user-facing decision guides)
+    """
+
+    def __init__(self, enabled: bool = True, reasoner_llm=None):
+        """Create memory with the pipeline-owned reasoner backend.
+
+        Sharing this backend keeps provider routing and the global request gate
+        identical to the rest of the pipeline.
+        """
+        self.enabled = enabled
+        self._scope_commit_locks: dict[str, asyncio.Lock] = {}
+        self._scope_commit_locks_guard = asyncio.Lock()
+        if enabled:
+            assert_not_quarantined(MEMORY_ROOT)
+            MEMORY_ROOT.mkdir(parents=True, exist_ok=True)
+            self.soul_text = load_soul()
+            self.notes = Notes(reasoner_llm=reasoner_llm)
+            self.memory = MemoryStore()
+            self.tools = ToolsStore()
+            self.skills = SkillsStore()
+            self.skills_decision = SkillsDecisionStore()
+            self.distiller = DistillationAgent(
+                self.notes, self.memory,
+                self.tools, self.skills, self.skills_decision,
+                reasoner_llm=reasoner_llm,
+            )
+            n_notes = self.notes.total
+            n_memory = self.memory.total()
+            n_cross = len(self.memory.get_cross_domain_entries())
+            n_tools = self.tools.total()
+            n_skills = self.skills.total()
+            n_skills_decision = self.skills_decision.total()
+            if n_notes + n_memory > 0:
+                logger.info(
+                    f"[AgentMemory] Loaded: "
+                    f"notes={n_notes}, MEMORY={n_memory} (cross_domain={n_cross}), "
+                    f"TOOLS={n_tools}, SKILLS={n_skills}, SKILLS_DECISION={n_skills_decision}"
+                )
+        else:
+            self.soul_text = ""
+            self.notes = None
+            self.memory = None
+            self.tools = None
+            self.skills = None
+            self.skills_decision = None
+            self.distiller = None
+
+    # Backward compatibility aliases
+    @property
+    def l1(self):
+        return self.notes
+
+    @property
+    def l2(self):
+        return self.memory
+
+    @property
+    def principles(self):
+        """Backward compat: returns memory store (cross_domain is inside)."""
+        return self.memory
+
+    @property
+    def playbooks(self):
+        """Backward compat: renamed to skills."""
+        return self.skills
+
+    @staticmethod
+    def _normalized_scope_keys(run_context: dict[str, Any]) -> list[str]:
+        scope_keys = run_context.get("scope_keys") or []
+        if not scope_keys:
+            scope_key = run_context.get("scope_key", "")
+            if scope_key:
+                scope_keys = [scope_key]
+        if not scope_keys:
+            domain = run_context.get("domain", "")
+            task = run_context.get("task", "")
+            if domain and task:
+                scope_keys = [f"{domain}_{task}"]
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw_scope in scope_keys:
+            scope = str(raw_scope).strip()
+            if not scope or scope in seen:
+                continue
+            seen.add(scope)
+            ordered.append(scope)
+        return ordered
+
+    async def _get_scope_commit_lock(self, scope: str) -> asyncio.Lock:
+        scope_name = str(scope).strip()
+        async with self._scope_commit_locks_guard:
+            lock = self._scope_commit_locks.get(scope_name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._scope_commit_locks[scope_name] = lock
+            return lock
+
+    async def record(self, **run_context) -> None:
+        if not self.enabled:
+            return
+        scope_keys = self._normalized_scope_keys(run_context)
+        if not scope_keys:
+            return
+
+        commit_locks = [
+            await self._get_scope_commit_lock(scope_key)
+            for scope_key in sorted(scope_keys)
+        ]
+        async with AsyncExitStack() as lock_stack:
+            for lock in commit_locks:
+                await lock_stack.enter_async_context(lock)
+
+            committed_scopes: list[str] = []
+            for scope_key in scope_keys:
+                await self.notes.add({**run_context, "scope_key": scope_key})
+                if scope_key:
+                    committed_scopes.append(scope_key)
+            if committed_scopes:
+                await self.distiller.on_commit(committed_scopes)
+
+    def get_memory(
+        self, query: str, domain: str = "", task: str = "",
+        scope_keys: list[str] | None = None,
+    ) -> str:
+        if not self.enabled:
+            return ""
+        parts = []
+        if self.soul_text:
+            parts.append(self.soul_text)
+        if scope_keys:
+            for scope in scope_keys:
+                mem = self.memory.get_prompt_section(scope=scope)
+                if mem:
+                    parts.append(mem)
+        else:
+            mem = self.memory.get_prompt_section(domain, task) if domain and task else ""
+            if mem:
+                parts.append(mem)
+        return "\n".join(parts)
+
+    def get_memory_entries(
+        self,
+        domain: str = "",
+        task: str = "",
+        scope_keys: list[str] | None = None,
+        *,
+        injectable_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return structured MEMORY rules for downstream sample-level selection.
+
+        New definition:
+        - `get_memory()` returns prompt-ready text
+        - `get_memory_entries()` returns the underlying structured rule objects
+          so downstream inference can select a sample-specific subset without
+          reparsing prompt text
+        """
+        if not self.enabled or not self.memory:
+            return []
+
+        merged: list[dict[str, Any]] = []
+        seen_rule_ids: set[str] = set()
+        scopes: list[str] = []
+
+        if scope_keys:
+            scopes.extend(
+                str(scope).strip()
+                for scope in scope_keys
+                if str(scope).strip()
+            )
+        else:
+            scope = f"{domain}_{task}" if domain and task else ""
+            if scope:
+                scopes.append(scope)
+
+        if domain:
+            scopes.append(str(domain).strip())
+
+        for scope in scopes:
+            for entry in self.memory.get_entries(scope):
+                if not isinstance(entry, dict):
+                    continue
+                if injectable_only and not bool(entry.get("injectable", True)):
+                    continue
+                rule_id = str(entry.get("rule_id", "")).strip()
+                if rule_id and rule_id in seen_rule_ids:
+                    continue
+                if rule_id:
+                    seen_rule_ids.add(rule_id)
+                merged.append(dict(entry))
+
+        merged.sort(
+            key=lambda entry: (
+                not bool(entry.get("injectable", True)),
+                -float(entry.get("confidence", 0.0) or 0.0),
+                -self.memory._entry_support_count(entry),
+                -float(entry.get("timestamp", 0.0) or 0.0),
+            )
+        )
+        return merged
+
+    def get_tool_notes(
+        self, domain: str = "", task: str = "",
+        tool_names: list[str] | None = None,
+        scope_keys: list[str] | None = None,
+    ) -> dict[str, str]:
+        if not self.enabled or not self.tools:
+            return {}
+        if scope_keys:
+            merged: dict[str, str] = {}
+            for scope in scope_keys:
+                names = tool_names or list(self.tools.get_notes(scope).keys())
+                scoped_notes = self.tools.get_prompt_for_tools(names, scope)
+                for tool_name, note in scoped_notes.items():
+                    existing = merged.get(tool_name, "")
+                    if existing == note:
+                        continue
+                    if existing and note and note not in existing:
+                        merged[tool_name] = f"{existing}\n{note}"
+                    else:
+                        merged[tool_name] = note or existing
+            return merged
+
+        scope = f"{domain}_{task}" if domain and task else ""
+        names = tool_names or list(self.tools.get_notes(scope).keys())
+        return self.tools.get_prompt_for_tools(names, scope)
+
+    def get_skill(self, domain: str, task: str, scope_keys: list[str] | None = None) -> str:
+        if not self.enabled or not self.skills:
+            return ""
+        if scope_keys:
+            parts = [self.skills.get_prompt_section(scope=scope) for scope in scope_keys]
+            return "\n".join(p for p in parts if p)
+        return self.skills.get_prompt_section(domain, task)
+
+    def get_skill_metadata(
+        self,
+        domain: str = "",
+        task: str = "",
+        scope_keys: list[str] | None = None,
+    ) -> dict[str, Any]:
+        if not self.enabled or not self.skills:
+            return {}
+        if scope_keys:
+            merged: list[dict[str, Any]] = []
+            for scope in scope_keys:
+                payload = self.skills.get_skill_metadata(scope)
+                if payload:
+                    merged.append(payload)
+            return {"scopes": merged}
+        scope = f"{domain}_{task}" if domain and task else ""
+        return self.skills.get_skill_metadata(scope)
+
+    def get_playbook(self, domain: str, task: str) -> str:
+        """Backward compatibility alias for get_skill."""
+        return self.get_skill(domain, task)
+
+    def get_skill_decision(
+        self,
+        domain: str,
+        task: str,
+        scope_keys: list[str] | None = None,
+    ) -> str:
+        if not self.enabled or not self.skills_decision:
+            return ""
+        if scope_keys:
+            parts = [
+                self.skills_decision.get_skill_decision(scope=scope)
+                for scope in scope_keys
+            ]
+            return "\n\n".join(p for p in parts if p)
+        scope = f"{domain}_{task}" if domain and task else ""
+        return self.skills_decision.get_skill_decision(scope)
+
+    async def flush(self) -> None:
+        if self.enabled and self.distiller:
+            await self.distiller.distill_pending_all()
+
+    async def force_distill(self) -> None:
+        if self.enabled and self.distiller:
+            await self.distiller.force_distill_all()
+
+    async def distill_pending(self) -> None:
+        if self.enabled and self.distiller:
+            await self.distiller.distill_pending_all()
+
+    async def distill_pending_scopes(self, scope_keys: list[str] | None) -> None:
+        if self.enabled and self.distiller:
+            await self.distiller.distill_pending_scopes(scope_keys)
+
+    async def cancel_pending_distillation(self) -> None:
+        """Stop all memory workers before an aborted learning phase ends."""
+        if self.enabled and self.distiller:
+            await self.distiller.cancel_pending_distillation()
+
+    def summary(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "notes": self.notes.total,
+            "memory_insights": self.memory.total(),
+            "cross_domain_insights": len(self.memory.get_cross_domain_entries()),
+            "tool_notes": self.tools.total(),
+            "skills": self.skills.total(),
+            "skills_decision": self.skills_decision.total(),
+        }

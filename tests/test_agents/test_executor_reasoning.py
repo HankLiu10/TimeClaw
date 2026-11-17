@@ -1,0 +1,8813 @@
+import json
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+import timeclaw.agents.executor as executor_module
+from timeclaw.agents.executor import (
+    DecisionOutputExhaustedError,
+    ExecutorAgent,
+    MaxStepsExhaustedError,
+)
+from timeclaw.agents.prompts import executor_prompt
+from timeclaw.clawhub.tool_base import ToolResult, ClawTool
+from timeclaw.core.tea_protocol import EnvironmentSnapshot, TaskEnvelope, TaskSpec
+from timeclaw.llm.base import LLMResponse
+
+
+@pytest.fixture
+def registered_forecast_fixtures(monkeypatch):
+    from timeclaw.clawhub import tool_registry
+    tool_registry.discover_and_register()
+    class ForecastFixture(ClawTool):
+        parameters_schema = {"type": "object", "properties": {}}
+        async def _run(self, ts_data, **params):
+            raise AssertionError("The test must replace the execution seam")
+    for name in ("tool_primary", "tool_outside", "tool_challenger"):
+        tool = ForecastFixture()
+        tool.name = name
+        monkeypatch.setitem(tool_registry._TOOL_INSTANCES, name, tool)
+
+
+def _decision_response(parsed: dict) -> LLMResponse:
+    return LLMResponse(
+        text=json.dumps(parsed, ensure_ascii=False),
+        parsed=parsed,
+        model="mock",
+    )
+
+
+def _structured_thought(
+    reason: str,
+    action: str,
+    *,
+    check: str = "The current path must satisfy the output contract using only evidence already present.",
+    self_check: str = "No additional tool result is required if the current payload is already grounded and complete.",
+    update: str = "Preserve the current evidence-grounded candidate unless a concrete validation failure requires correction.",
+) -> str:
+    return (
+        f"Reason: {reason} "
+        f"Check: {check} "
+        f"Self-check: {self_check} "
+        f"Update: {update} "
+        f"Action: {action}"
+    )
+
+
+async def _passing_reasoning_verdict(*_args, **_kwargs) -> dict:
+    return {"passed": True, "missing": [], "explanation": "ok"}
+
+
+async def _passing_execution_context_verdict(*_args, **_kwargs) -> dict:
+    return {"passed": True, "missing": [], "explanation": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_request_structured_decision_uses_json_completion_only():
+    captured_kwargs = {}
+
+    class _FakeLLM:
+        async def complete(self, conversation, response_format=None, model=None, **kwargs):
+            del conversation, model
+            captured_kwargs["response_format"] = response_format
+            captured_kwargs.update(kwargs)
+            parsed = {
+                "thought": "Reason: one branch already produced the supported label. Action: finish now.",
+                "done": True,
+                "answer": "stable",
+                "answer_type": "classification",
+                "confidence": 0.8,
+                "reasoning": "1. `llm_reasoning_classification` produced the label stable.",
+                "execution_context": {
+                    "tool_chain": ["llm_reasoning_classification"],
+                    "public_reasoning": [
+                        "`llm_reasoning_classification` returned stable from the observed branch.",
+                    ],
+                    "evidence_summary": "The executed classification branch returned stable.",
+                },
+                "control_context": {"completion_notes": ""},
+            }
+            return LLMResponse(
+                text=json.dumps(parsed, ensure_ascii=False),
+                parsed=parsed,
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_FakeLLM())
+    _response, decision = await executor._request_structured_decision(
+        [{"role": "user", "content": "dummy"}],
+        allow_tool_call=True,
+        allow_finish=True,
+        ordinary_tool_names=["llm_reasoning_classification"],
+        evaluate_tool_names=[],
+        spawn_available=False,
+        fallback_thought="fallback",
+        finish_mode="task",
+    )
+
+    assert captured_kwargs == {"response_format": "json", "temperature": 0.0}
+    assert decision["done"] is True
+    assert decision["answer"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_request_structured_decision_rejects_json_tool_outside_allowed_family():
+    class _FakeLLM:
+        async def complete(self, conversation, response_format=None, model=None, **kwargs):
+            del conversation, response_format, model, kwargs
+            parsed = {
+                "thought": "Reason: jump to an unsupported tool. Action: call a disallowed tool.",
+                "done": False,
+                "tool": "segment",
+                "args": {},
+            }
+            return LLMResponse(
+                text=json.dumps(parsed, ensure_ascii=False),
+                parsed=parsed,
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_FakeLLM())
+    _response, decision = await executor._request_structured_decision(
+        [{"role": "user", "content": "dummy"}],
+        allow_tool_call=True,
+        allow_finish=True,
+        ordinary_tool_names=["window_stats"],
+        evaluate_tool_names=[],
+        spawn_available=False,
+        fallback_thought="fallback",
+        finish_mode="task",
+    )
+
+    assert decision["_parse_failed"] is True
+    assert decision["thought"] == "invalid_decision_wrong_tool_family"
+
+
+@pytest.mark.asyncio
+async def test_request_structured_decision_accepts_nested_parsed_decision_wrapper():
+    class _FakeLLM:
+        async def complete(self, conversation, response_format=None, model=None, **kwargs):
+            del conversation, response_format, model, kwargs
+            inner = {
+                "thought": _structured_thought(
+                    "need the weather-aware branch first.",
+                    "call llm_reasoning_forecast.",
+                ),
+                "done": False,
+                "tool": "llm_reasoning_forecast",
+                "args": {
+                    "question": "forecast the next 24 points",
+                    "context": "cool storm boundary",
+                    "domain": "weather_aligned_short_forecast",
+                },
+            }
+            return LLMResponse(
+                text='选择工具: llm_reasoning_forecast\n参数: {"question": "forecast the next 24 points"}\n完成: false',
+                parsed={"decision": "选择工具: llm_reasoning_forecast", "parsed": inner},
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_FakeLLM())
+    _response, decision = await executor._request_structured_decision(
+        [{"role": "user", "content": "dummy"}],
+        allow_tool_call=True,
+        allow_finish=True,
+        ordinary_tool_names=["llm_reasoning_forecast"],
+        evaluate_tool_names=[],
+        spawn_available=False,
+        fallback_thought="parse failed",
+        finish_mode="task",
+    )
+
+    assert decision == {
+        "thought": _structured_thought(
+            "need the weather-aware branch first.",
+            "call llm_reasoning_forecast.",
+        ),
+        "done": False,
+        "tool": "llm_reasoning_forecast",
+        "args": {
+            "question": "forecast the next 24 points",
+            "context": "cool storm boundary",
+            "domain": "weather_aligned_short_forecast",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_returns_invalid_args_without_retry(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+
+    attempts = {"count": 0}
+    sleeps: list[float] = []
+
+    async def _fake_execute_tool_once(**_kwargs):
+        attempts["count"] += 1
+        return ToolResult.fail(
+            "invalid tool arguments at `start`: 318.5 is not valid under any of the given schemas",
+            error_kind="invalid_args",
+        )
+
+    async def _fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(executor, "_execute_tool_once", _fake_execute_tool_once)
+    monkeypatch.setattr(executor_module.asyncio, "sleep", _fake_sleep)
+
+    result = await executor._execute_tool(
+        "slice",
+        {"start": 318.5, "end": 390, "source_ref": "original_input"},
+        data=[0, 1, 2],
+        text_data=None,
+        images=None,
+    )
+
+    assert result is not None
+    assert result.success is False
+    assert result.metadata["error_kind"] == "invalid_args"
+    assert attempts["count"] == 1
+    assert sleeps == []
+
+
+def test_has_stepwise_reasoning_requires_numbered_tool_steps():
+    execution_log = [
+        {"tool": "chronos2_forecast"},
+        {"tool": "consistency_check"},
+    ]
+    reasoning = (
+        "1. chronos2_forecast was chosen because the task needed a 33-step forecast; "
+        "it produced a stable downward path, so I had a concrete candidate to validate.\n"
+        "2. consistency_check was chosen to verify plausibility; it showed the forecast "
+        "remained continuous with history, so I kept that candidate as the final answer."
+    )
+    assert ExecutorAgent._has_stepwise_reasoning(reasoning, execution_log) is True
+
+
+def test_build_subagent_slot_section_preserves_original_task_contract_in_branch_descriptions():
+    text = ExecutorAgent._build_subagent_slot_section(
+        [
+            {
+                "slot_id": 0,
+                "visible_candidates": ["slice", "llm_reasoning_correlation"],
+            }
+        ],
+        task_type="correlation",
+    )
+
+    assert "preserve the original task target, judgment window, and answer contract" in text
+
+
+def test_has_reusable_execution_context_requires_concrete_signal():
+    execution_log = [
+        {"tool": "llm_reasoning_qa"},
+    ]
+    weak_context = {
+        "tool_chain": ["llm_reasoning_qa"],
+        "public_reasoning": ['`llm_reasoning_qa` produced "C".'],
+        "evidence_summary": '`llm_reasoning_qa` produced "C".',
+    }
+    strong_context = {
+        "tool_chain": ["llm_reasoning_qa"],
+        "public_reasoning": [
+            "`llm_reasoning_qa` compared the article wording against the visible series and identified option C as the only choice that invents an unsupported one-week timing claim."
+        ],
+        "evidence_summary": "The decisive evidence was the mismatch between option C's short-term timing claim and the article text, which `llm_reasoning_qa` surfaced directly.",
+    }
+
+    assert ExecutorAgent._has_reusable_execution_context(weak_context, execution_log) is False
+    assert ExecutorAgent._has_reusable_execution_context(strong_context, execution_log) is True
+
+
+def test_memory_entry_role_tag_distinguishes_path_guardrail_and_contract():
+    assert ExecutorAgent._memory_entry_role_tag(
+        {
+            "kind": "tool_selection",
+            "summary": "Use a recent-slice reasoning path.",
+            "preferred_tool_chains": [["slice", "llm_reasoning_forecast"]],
+        }
+    ) == "path"
+    assert ExecutorAgent._memory_entry_role_tag(
+        {
+            "kind": "domain_heuristic",
+            "summary": "Reserve extreme buckets for cases where price and text agree.",
+        }
+    ) == "guardrail"
+    assert ExecutorAgent._memory_entry_role_tag(
+        {
+            "kind": "result_constraint",
+            "summary": "Return exactly 24 values.",
+        }
+    ) == "contract"
+
+
+def test_build_selected_experience_package_includes_role_discipline_section():
+    package = ExecutorAgent._build_selected_experience_package(
+        memory_entries=[
+            {
+                "rule_id": "rule_path",
+                "kind": "tool_selection",
+                "summary": "Use a recent-slice reasoning path.",
+                "preferred_tool_chains": [["slice", "llm_reasoning_forecast"]],
+                "injectable": True,
+            },
+            {
+                "rule_id": "rule_guardrail",
+                "kind": "domain_heuristic",
+                "summary": "Reserve extreme buckets for cases where price and text agree.",
+                "injectable": True,
+            },
+        ],
+        selected_rule_ids=["rule_path", "rule_guardrail"],
+        selector_guidance="Use the latest regime first.",
+        primary_path_tools=["slice"],
+        challenger_path_tools=["timesfm2_forecast"],
+        tool_prep_tools=[],
+    )
+
+    text = package["text"]
+    assert "## Experience Role Discipline" in text
+    assert "Primary drivers" in text
+    assert "Guardrails" in text
+
+
+def test_build_selected_packet_tool_notes_section_uses_packet_lanes_only():
+    executor = ExecutorAgent(llm=SimpleNamespace())
+
+    section = executor._build_selected_packet_tool_notes_section(
+        {
+            "slice": "Focus on the most recent regime.",
+            "llm_reasoning_forecast": "Compare candidate paths before finishing.",
+            "chronos2_forecast": "Fallback forecast tool.",
+        },
+        primary_path_tools=["slice", "llm_reasoning_forecast"],
+        challenger_path_tools=[],
+        tool_prep_tools=[],
+        task_type="forecast",
+    )
+
+    assert "## Packet Tool Notes" in section
+    assert "- slice: Focus on the most recent regime." in section
+    assert "- llm_reasoning_forecast: Compare candidate paths before finishing." in section
+    assert "chronos2_forecast" not in section
+
+
+def test_build_sample_packet_text_summarizes_selected_experience():
+    text = ExecutorAgent._build_sample_packet_text(
+        matched_skills_package={
+            "selected_titles": ["### Skill 1"],
+            "selected_rule_ids": ["scope::001", "scope::002"],
+        },
+        decision_skills_package={
+            "selected_titles": ["### Decision Skill 1"],
+        },
+        active_experience_package={
+            "selected_rule_ids": ["scope::002"],
+            "selector_guidance": "Start from the latest regime and keep the packet narrow.",
+            "selector_audit": {
+                "why_skills": "This skill matches the current regime pattern.",
+                "why_decision_skills": "Need a guardrail against overclaiming.",
+                "why_rules": "These rules are directly linked to the chosen skill.",
+                "why_tools": "These tools instantiate the selected path.",
+            },
+            "primary_path_tools": ["slice"],
+            "challenger_path_tools": ["timesfm2_forecast"],
+            "tool_prep_tools": ["segment"],
+        },
+        selected_packet_tool_notes="## Packet Tool Notes\n- slice: Focus on the latest window.",
+    )
+
+    assert "## Sample Packet" in text
+    assert "Operational skills: ### Skill 1" in text
+    assert "Judgment guardrails: ### Decision Skill 1" in text
+    assert "Skill-linked rule ids: scope::001, scope::002" in text
+    assert "Selected memory rule ids: scope::002" in text
+    assert "Prep tools: segment" in text
+    assert "Primary path tools: slice" in text
+    assert "Challenger path tools: timesfm2_forecast" in text
+    assert "## Packet Tool Notes" in text
+
+
+def test_build_llm_reasoning_context_prefers_sample_packet_and_packet_tool_notes():
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    plan = {
+        "task_description": "forecast task",
+        "task_type": "forecast",
+        "scope_keys": ["weather_aligned_short_forecast"],
+        "profiling_section": "Profile: recent cold snap",
+        "sample_packet_text": "## Sample Packet\n- Primary path tools: chronos2_forecast.",
+        "selected_packet_tool_notes": "## Packet Tool Notes\n- chronos2_forecast: keep horizon exact.",
+        "tool_notes_section": "Tool Notes:\n- chronos2_forecast: generic note.\n",
+        "memory_audit": {
+            "active_experience_text": "## Experience Role Discipline\nKeep the packet narrow.",
+        },
+    }
+
+    text = executor._build_llm_reasoning_context(plan, execution_log=[])
+
+    assert "## Sample Packet" in text
+    assert "## Packet Tool Notes" in text
+    assert "generic note" not in text
+    assert "## Experience Role Discipline" in text
+
+
+def test_trim_backup_skills_for_direct_reasoning_primary_path():
+    package = {
+        "selected_blocks": [
+            {
+                "title": "### Skill 1",
+                "raw_text": "Primary direct QA skill",
+                "tool_names": [],
+                "source_rule_ids": ["rule_primary"],
+            },
+            {
+                "title": "### Skill 3",
+                "raw_text": "Boundary challenger skill",
+                "tool_names": [],
+                "source_rule_ids": ["rule_boundary"],
+            },
+        ],
+        "selected_titles": ["### Skill 1", "### Skill 3"],
+        "selected_count": 2,
+        "selected_rule_ids": ["rule_primary", "rule_boundary"],
+    }
+
+    trimmed = ExecutorAgent._trim_redundant_challenger_only_backup_skills(
+        task_type="qa",
+        matched_skills_package=package,
+        primary_path_tools=["llm_reasoning_qa"],
+        challenger_path_tools=["value_at"],
+    )
+
+    assert trimmed["selected_titles"] == ["### Skill 1"]
+    assert trimmed["selected_count"] == 1
+    assert trimmed["selected_rule_ids"] == ["rule_primary"]
+
+
+def test_trim_active_experience_for_direct_reasoning_keeps_primary_and_contract():
+    package = {
+        "selected_entries": [
+            {"rule_id": "rule_primary", "kind": "tool_selection", "summary": "Use direct QA reasoning."},
+            {"rule_id": "rule_guardrail", "kind": "domain_heuristic", "summary": "Do not overclaim post-window moves."},
+            {"rule_id": "rule_contract", "kind": "result_constraint", "summary": "Return one letter only."},
+        ],
+        "selected_rule_ids": ["rule_primary", "rule_guardrail", "rule_contract"],
+        "selector_guidance": "",
+    }
+
+    trimmed = ExecutorAgent._trim_active_experience_for_direct_reasoning(
+        task_type="qa",
+        active_experience_package=package,
+        primary_path_tools=["llm_reasoning_qa"],
+        challenger_path_tools=[],
+        tool_prep_tools=[],
+    )
+
+    kept_ids = [str(entry.get("rule_id") or "") for entry in trimmed["selected_entries"]]
+    assert kept_ids == ["rule_primary", "rule_contract"]
+
+
+def test_trim_backup_decision_skills_for_direct_reasoning_keeps_primary_only():
+    package = {
+        "selected_blocks": [
+            {"title": "### Decision Skill 1", "raw_text": "Primary decision guidance"},
+            {"title": "### Decision Skill 4", "raw_text": "Backup decision guidance"},
+        ],
+        "selected_titles": ["### Decision Skill 1", "### Decision Skill 4"],
+        "selected_count": 2,
+    }
+
+    trimmed = ExecutorAgent._trim_backup_decision_skills_for_direct_reasoning(
+        task_type="qa",
+        decision_skills_package=package,
+        primary_path_tools=["llm_reasoning_qa"],
+    )
+
+    assert trimmed["selected_titles"] == ["### Decision Skill 1"]
+    assert trimmed["selected_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reuse_verdict_short_circuits_when_reasoning_and_context_are_objectively_sufficient(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    execution_log = [
+        {"tool": "chronos2_forecast"},
+        {"tool": "consistency_check"},
+    ]
+    reasoning = (
+        "1. `chronos2_forecast` was used to generate the 33-step candidate forecast and it produced a smooth downward path aligned with the recent series shape.\n"
+        "2. `consistency_check` validated that the candidate remained continuous with recent levels and did not introduce unrealistic jumps, so the forecast was kept as the final answer."
+    )
+    execution_context = {
+        "tool_chain": ["chronos2_forecast", "consistency_check"],
+        "public_reasoning": [
+            "`chronos2_forecast` generated the candidate forecast directly from the observed series and the path stayed smooth relative to the recent downward trajectory.",
+            "`consistency_check` confirmed that the candidate stayed continuous with recent levels and did not introduce unrealistic jumps.",
+        ],
+        "evidence_summary": "The accepted forecast came from `chronos2_forecast`, and `consistency_check` supported it by confirming continuity and plausibility against the recent series behavior.",
+    }
+
+    async def _unexpected_judge(*args, **kwargs):
+        raise AssertionError("objective sufficiency should skip the JSON judge")
+
+    monkeypatch.setattr(executor, "_complete_json_judge_response", _unexpected_judge)
+
+    context_verdict = await executor._execution_context_verdict(execution_context, execution_log)
+    reasoning_verdict = await executor._stepwise_reasoning_verdict(reasoning, execution_log)
+
+    assert context_verdict["passed"] is True
+    assert reasoning_verdict["passed"] is True
+
+
+def test_reasoning_tool_aliases_keep_exact_name_and_narrow_canonical_aliases():
+    assert ExecutorAgent._reasoning_tool_aliases("chronos2_forecast") == [
+        "chronos2_forecast",
+        "Chronos-2",
+    ]
+    assert ExecutorAgent._reasoning_tool_aliases("segment") == ["segment"]
+    assert ExecutorAgent._reasoning_tool_aliases("llm_reasoning_classification") == [
+        "llm_reasoning_classification"
+    ]
+
+
+def test_clean_repair_prompt_requires_decision_wrapper_in_non_terminal_mode():
+    prompt = ExecutorAgent._build_clean_repair_prompt(
+        expected_type="forecast",
+        task_type="forecast",
+        task_description="repair test",
+        execution_log=[],
+        recoverable_final=None,
+        feedback_messages=[],
+        terminal_json=False,
+    )
+
+    assert "`done=true`" in prompt
+    assert "bare final payload" in prompt
+    assert "`thought`" in prompt
+    assert "`Reason:`" in prompt
+    assert "`Action:`" in prompt
+
+
+def test_coerce_reasoning_text_accepts_list_payload():
+    reasoning = ExecutorAgent._coerce_reasoning_text([
+        "forecast model produced a 24-step answer",
+        "consistency_check kept the path plausible",
+    ])
+
+    assert reasoning == (
+        "1. forecast model produced a 24-step answer\n"
+        "2. consistency_check kept the path plausible"
+    )
+
+
+def test_normalize_legacy_decision_payload_accepts_reasoning_list():
+    decision = ExecutorAgent._normalize_legacy_decision_payload(
+        {
+            "thought": "Reason: evidence is already complete. Action: finish now.",
+            "done": True,
+            "answer": {"insight": "x", "recommendation": "y"},
+            "answer_type": "learning_summary",
+            "confidence": 0.8,
+            "reasoning": ["winner path beat baseline", "metrics confirmed the gap"],
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_forecast"],
+                "public_reasoning": ["`llm_reasoning_forecast` produced the accepted forecast."],
+                "evidence_summary": "The executed forecast path matched the accepted result.",
+            },
+            "control_context": {"completion_notes": ""},
+        },
+        allow_tool_call=False,
+        allow_finish=True,
+        finish_mode="learning_summary",
+    )
+
+    assert decision is not None
+    assert decision["reasoning"] == (
+        "1. winner path beat baseline\n"
+        "2. metrics confirmed the gap"
+    )
+
+
+def test_normalize_legacy_decision_payload_normalizes_structured_thought_object():
+    decision = ExecutorAgent._normalize_legacy_decision_payload(
+        {
+            "thought": {
+                "Reason": "two real forecast candidates were already evaluated",
+                "Action": "finish with the learning summary",
+            },
+            "done": True,
+            "answer": {"insight": "x", "recommendation": "y"},
+            "answer_type": "learning_summary",
+            "confidence": 0.8,
+            "reasoning": "1. Candidate comparison is complete.",
+        },
+        allow_tool_call=False,
+        allow_finish=True,
+        finish_mode="learning_summary",
+    )
+
+    assert decision is not None
+    assert decision["thought"] == _structured_thought(
+        "two real forecast candidates were already evaluated",
+        "finish with the learning summary",
+    )
+
+
+def test_normalize_legacy_decision_payload_accepts_bare_learning_summary_repair_payload():
+    decision = ExecutorAgent._normalize_legacy_decision_payload(
+        {
+            "answer": {
+                "insight": "trend-aware path won on the evaluated sample",
+                "recommendation": "prefer execution-grounded continuation when recent slope is decisive",
+            },
+            "confidence": 0.79,
+            "reasoning": [
+                "winner path preserved the observed slope",
+                "the alternative flattened the series too aggressively",
+            ],
+            "execution_context": {
+                "tool_chain": ["ets_forecast -> llm_reasoning_forecast"],
+                "public_reasoning": [
+                    "the ETS-informed continuation tracked the observed downtrend",
+                ],
+                "evidence_summary": "the continuation-style branch matched the data regime best",
+            },
+            "control_context": {"completion_notes": "repair-only"},
+        },
+        allow_tool_call=False,
+        allow_finish=True,
+        finish_mode="learning_summary",
+    )
+
+    assert decision is not None
+    assert decision["done"] is True
+    assert decision["answer_type"] == "learning_summary"
+    assert decision["answer"]["insight"] == "trend-aware path won on the evaluated sample"
+    assert decision["thought"] == (
+        "Reason: Repair mode already has enough execution-grounded evidence and the "
+        "remaining issue is only final packaging. "
+        "Check: The repaired final payload is already fully specified from the trace, "
+        "so no additional tool evidence is needed. "
+        "Self-check: The required final payload artifact is already present, and its "
+        "basic sanity condition is that the repaired payload is complete without further "
+        "tool output. "
+        "Update: Keep this repaired final candidate because there is no unresolved rival "
+        "candidate after repair. "
+        "Action: finish with the repaired final payload."
+    )
+
+
+def test_runtime_compatible_candidates_hide_granger_for_univariate_series():
+    from timeclaw.clawhub.tool_registry import clear_registry, discover_and_register
+
+    clear_registry()
+    discover_and_register()
+    candidates = ExecutorAgent._runtime_compatible_candidates(
+        ["granger_causality", "llm_reasoning_indicator", "spawn_subagent"],
+        current_data=[1.0, 2.0, 3.0],
+        current_series_state={"artifact_type": "series"},
+    )
+
+    assert "granger_causality" not in candidates
+    assert "llm_reasoning_indicator" in candidates
+    assert "spawn_subagent" in candidates
+
+
+def test_tool_runtime_incompatibility_message_explains_multichannel_requirement():
+    from timeclaw.clawhub.tool_registry import clear_registry, discover_and_register
+
+    clear_registry()
+    discover_and_register()
+    message = ExecutorAgent._tool_runtime_incompatibility_message(
+        "granger_causality",
+        current_data=[1.0, 2.0, 3.0],
+        current_series_state={"artifact_type": "series"},
+    )
+
+    assert message is not None
+    assert "at least 2 time-series channel" in message
+
+
+def test_should_enforce_stepwise_reasoning_only_in_train_mode():
+    assert ExecutorAgent._should_enforce_stepwise_reasoning("train") is True
+    assert ExecutorAgent._should_enforce_stepwise_reasoning("test") is False
+    assert ExecutorAgent._should_enforce_stepwise_reasoning(None) is False
+
+
+def test_coerce_llm_decision_rejects_pseudo_tool_transcript_after_json():
+    raw = (
+        '{"thought":"Reason: call tool. Action: run it","done":false,"tool":"llm_reasoning_qa","args":{"question":"q"}}'
+        'assistant to=llm_reasoning_qa {"question":"q"}'
+    )
+
+    decision = ExecutorAgent._coerce_llm_decision(
+        parsed=None,
+        text=raw,
+        fallback_thought="parse failed",
+    )
+
+    assert decision["_parse_failed"] is True
+    assert decision["thought"] == "json_followed_by_pseudo_tool_transcript"
+
+
+def test_coerce_llm_decision_lifts_misnested_learning_summary_metadata():
+    raw = {
+        "done": True,
+        "thought": "Reason: budget exhausted. Action: return summary.",
+        "answer": {
+            "insight": "forecast-then-indicator outperformed direct reasoning",
+            "recommendation": "compare derived indicators against indicator-space GT",
+            "answer_type": "learning_summary",
+            "confidence": 0.91,
+            "reasoning": "1. Two candidate paths were evaluated.",
+        },
+    }
+
+    decision = ExecutorAgent._coerce_llm_decision(
+        parsed=raw,
+        text=json.dumps(raw, ensure_ascii=False),
+        fallback_thought="parse failed",
+    )
+
+    assert decision["done"] is True
+    assert decision["answer_type"] == "learning_summary"
+    assert decision["confidence"] == 0.91
+    assert decision["reasoning"] == "1. Two candidate paths were evaluated."
+    assert decision["answer"] == {
+        "insight": "forecast-then-indicator outperformed direct reasoning",
+        "recommendation": "compare derived indicators against indicator-space GT",
+    }
+
+
+def test_invalid_json_self_correction_mentions_field_mixing_for_multiple_json():
+    msg = ExecutorAgent._invalid_json_self_correction_message(
+        "multiple_json_objects_in_one_reply"
+    )
+    assert "Do not append a second JSON object" in msg
+    assert "Do not mix tool-call fields" in msg
+    assert "`answer_type`" in msg
+
+
+def test_invalid_json_self_correction_explains_spawn_only_turn():
+    msg = ExecutorAgent._invalid_json_self_correction_message(
+        "invalid_decision_wrong_tool_family",
+        allow_tool_call=True,
+        allow_finish=False,
+        spawn_available=True,
+        ordinary_tool_names=[],
+        evaluate_tool_names=[],
+    )
+
+    assert "spawn-only turn" in msg
+    assert "`spawn_subagent`" in msg
+    assert "do not call ordinary tools" in msg.lower()
+
+
+def test_invalid_json_self_correction_explains_eval_only_turn():
+    msg = ExecutorAgent._invalid_json_self_correction_message(
+        "invalid_decision_wrong_tool_family",
+        allow_tool_call=True,
+        allow_finish=False,
+        spawn_available=False,
+        ordinary_tool_names=[],
+        evaluate_tool_names=["evaluate_batch_against_gt"],
+    )
+
+    assert "evaluation-only turn" in msg
+    assert "`evaluate_batch_against_gt`" in msg
+    assert "do not branch" in msg.lower()
+
+
+def test_learning_summary_contract_separates_execution_context_from_gt_comparison():
+    section = ExecutorAgent._build_learning_summary_contract_section()
+
+    assert "`answer.insight` and `answer.recommendation` are the only place" in section
+    assert "reusable evidence card for downstream inference" in section
+    assert "If no candidate was validated" in section
+    assert "`execution_context.tool_chain` should be `[]`" in section
+
+
+def test_empty_execution_context_allowed_for_failed_learning_summary():
+    allowed = ExecutorAgent._empty_execution_context_allowed_for_failed_learning_summary(
+        {
+            "tool_chain": [],
+            "public_reasoning": [],
+            "evidence_summary": "",
+        },
+        [
+            {
+                "tool": "evaluate_batch_against_gt",
+                "observation": {
+                    "results": [
+                        {"metrics": {"accuracy": 0.0, "correct": False}},
+                        {"metrics": {"accuracy": 0.0, "correct": False}},
+                    ]
+                },
+            }
+        ],
+    )
+
+    assert allowed is True
+
+
+def test_empty_execution_context_not_allowed_when_any_candidate_correct():
+    allowed = ExecutorAgent._empty_execution_context_allowed_for_failed_learning_summary(
+        {
+            "tool_chain": [],
+            "public_reasoning": [],
+            "evidence_summary": "",
+        },
+        [
+            {
+                "tool": "evaluate_against_gt",
+                "observation": {
+                    "metrics": {"accuracy": 1.0, "correct": True}
+                },
+            }
+        ],
+    )
+
+    assert allowed is False
+
+
+def test_build_state_update_message_includes_current_space_rule():
+    current_state = ExecutorAgent._initial_series_state([1.0, 2.0, 3.0])
+    latest_state = current_state
+
+    msg = ExecutorAgent._build_state_update_message(
+        current_series_state=current_state,
+        latest_artifact_state=latest_state,
+    )
+
+    assert "## Indexing Rule" in msg
+    assert "current_series_state.coordinate_system.current_space" in msg
+    assert "Treat `origin_space` as provenance only" in msg
+    assert "do not call index-sensitive tools with original-input indices" in msg
+
+
+def test_build_subagent_tool_backed_result_reuses_exact_tool_answer():
+    result = ExecutorAgent._build_subagent_tool_backed_result(
+        artifact={"tool": "llm_reasoning_indicator", "answer": {"macd": [-1.2, -1.1]}},
+        task_type="indicator",
+        execution_log=[{"tool": "llm_reasoning_indicator"}],
+        slot_id=3,
+        task_description="predict macd",
+        tools_hint=["llm_reasoning_indicator"],
+        branch_metadata={"path_type": "direct_indicator_only"},
+    )
+
+    assert result["answer"] == {"macd": [-1.2, -1.1]}
+    assert result["answer_type"] == "indicator"
+    assert result["tool_chain"] == ["llm_reasoning_indicator"]
+    assert "tool-produced result as its final candidate" in result["reasoning"]
+
+
+def test_thought_schema_requires_reason_then_action_labels():
+    schema = ExecutorAgent._thought_schema()
+
+    assert schema["type"] == "string"
+    assert "Reason:` then `Check:` then `Self-check:` then `Update:` then `Action:`" in schema["description"]
+    assert schema["pattern"] == r"^Reason:[\s\S]*Check:[\s\S]*Self-check:[\s\S]*Update:[\s\S]*Action:[\s\S]*$"
+
+
+def test_filter_agent_available_tool_names_hides_ensemble_forecast():
+    filtered = executor_prompt.filter_agent_available_tool_names(
+        ["timesfm2_forecast", "ensemble_forecast", "llm_reasoning_forecast"]
+    )
+
+    assert filtered == ["timesfm2_forecast", "llm_reasoning_forecast"]
+
+
+def test_filter_task_specific_candidates_removes_task_mismatched_reasoning_tools():
+    filtered = ExecutorAgent._filter_task_specific_candidates(
+        [
+            "llm_reasoning_qa",
+            "llm_reasoning_forecast",
+            "llm_reasoning_classification",
+            "basic_stats",
+        ],
+        task_type="forecast",
+        fingerprint={},
+    )
+
+    assert filtered == ["llm_reasoning_forecast", "basic_stats"]
+
+
+def test_filter_task_specific_candidates_hides_handle_missing_without_missing_values():
+    filtered = ExecutorAgent._filter_task_specific_candidates(
+        [
+            "handle_missing",
+            "llm_reasoning_qa",
+            "llm_reasoning_classification",
+            "window_stats",
+        ],
+        task_type="qa",
+        fingerprint={"missing_ratio": 0.0},
+    )
+
+    assert filtered == ["llm_reasoning_qa", "window_stats"]
+
+
+def test_task_mismatched_reasoning_tool_message_requires_task_compatible_reasoner():
+    msg = ExecutorAgent._task_mismatched_reasoning_tool_message(
+        task_type="forecast",
+        tool_name="llm_reasoning_qa",
+    )
+
+    assert "task-mismatched reasoning tool" in msg
+    assert "llm_reasoning_forecast" in msg
+    qa_msg = ExecutorAgent._task_mismatched_reasoning_tool_message(
+        task_type="qa",
+        tool_name="llm_reasoning_classification",
+    )
+    assert "task-mismatched reasoning tool" in qa_msg
+    assert "llm_reasoning_qa" in qa_msg
+
+
+def test_window_stats_description_mentions_origin_space_example():
+    from timeclaw.clawhub.processing.window_stats import tool as window_stats_tool
+
+    assert "origin_space=[144,168)" in window_stats_tool.description
+    assert "start=0, end=24" in window_stats_tool.description
+
+
+def test_initial_series_state_uses_general_coordinate_schema():
+    state = ExecutorAgent._initial_series_state([1.0, 2.0, 3.0, 4.0])
+
+    assert state["artifact_type"] == "series"
+    assert state["producer_tool"] == "initial_input"
+    assert state["shape"] == {"length": 4}
+    assert state["coordinate_system"] == {
+        "indexing": "positional",
+        "current_space": [0, 4],
+        "origin_space": [0, 4],
+        "relative_to": "original_input",
+    }
+    assert state["derivation"] == {"operation": "identity", "args": {}}
+    assert "current_index_range" not in state
+    assert "absolute_index_range_in_original" not in state
+
+
+def test_slice_artifact_state_uses_origin_space_instead_of_slice_specific_fields():
+    previous_state = ExecutorAgent._initial_series_state(list(range(128)))
+
+    state = ExecutorAgent._artifact_state_from_result(
+        tool_name="slice",
+        result_data=[79, 80, 81],
+        downstream_data=list(range(48)),
+        previous_series_state=previous_state,
+        tool_args={"start": 79, "end": 127},
+    )
+
+    assert state["artifact_type"] == "series"
+    assert state["producer_tool"] == "slice"
+    assert state["parent_artifact_type"] == "series"
+    assert state["shape"] == {"length": 48}
+    assert state["coordinate_system"] == {
+        "indexing": "positional",
+        "current_space": [0, 48],
+        "origin_space": [79, 127],
+        "relative_to": "original_input",
+    }
+    assert state["derivation"] == {
+        "operation": "slice",
+        "args": {"start": 79, "end": 127},
+    }
+    assert "slice_relative_to_current_before_slice" not in state
+    assert "current_index_range" not in state
+    assert "absolute_index_range_in_original" not in state
+
+
+def test_has_stepwise_reasoning_rejects_brief_summary():
+    execution_log = [
+        {"tool": "chronos2_forecast"},
+        {"tool": "consistency_check"},
+    ]
+    reasoning = (
+        "The forecast looked reasonable and passed consistency checks, so I used it."
+    )
+    assert ExecutorAgent._has_stepwise_reasoning(reasoning, execution_log) is False
+
+
+def test_has_stepwise_reasoning_accepts_candidate_based_main_reasoning():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "arima_forecast"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "ets_forecast"}],
+                    },
+                },
+            ],
+        },
+        {"tool": "evaluate_batch_against_gt"},
+    ]
+    reasoning = (
+        "1. I compared the arima_forecast and ets_forecast candidate paths because they "
+        "captured different decline shapes for the target indicator.\n"
+        "2. ETS matched the realized trajectory more closely than ARIMA, so I selected "
+        "the ETS-based summary and recommendation as the final result."
+    )
+    assert ExecutorAgent._has_stepwise_reasoning(reasoning, execution_log) is True
+
+
+def test_has_stepwise_reasoning_accepts_candidate_aliases_not_exact_tool_ids():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "arima_forecast"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "ets_forecast"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "llm_reasoning_indicator"}],
+                    },
+                },
+            ],
+        },
+        {"tool": "evaluate_batch_against_gt"},
+    ]
+    reasoning = (
+        "1. ARIMA-based forecasting produced a path that flattened too quickly.\n"
+        "2. ETS-based forecasting preserved the smooth downward regime more faithfully.\n"
+        "3. Direct multimodal LLM indicator reasoning stayed too elevated relative to the technical trend.\n"
+        "4. The decisive evidence was that ETS matched the realized downward shape most closely."
+    )
+    assert ExecutorAgent._has_stepwise_reasoning(reasoning, execution_log) is True
+
+
+def test_has_stepwise_reasoning_prefers_candidate_paths_over_top_level_rewrite_tools():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "chronos2_forecast"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "timesfm2_forecast"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "llm_reasoning_forecast"}],
+                    },
+                },
+            ],
+        },
+        {"tool": "entropy"},
+        {"tool": "evaluate_batch_against_gt"},
+        {"tool": "llm_reasoning_qa"},
+        {"tool": "llm_reasoning_qa"},
+    ]
+    reasoning = (
+        "1. The chronos2_forecast branch best preserved the short-term cooling and diurnal swing.\n"
+        "2. The timesfm2_forecast branch was competitive but stayed slightly too warm on the realized path.\n"
+        "3. The direct multimodal llm forecast branch over-smoothed the hourly structure.\n"
+        "4. Ground-truth comparison separated the candidates, so I selected the Chronos-based result."
+    )
+    assert ExecutorAgent._has_stepwise_reasoning(reasoning, execution_log) is True
+
+
+def test_has_stepwise_reasoning_rejects_orchestration_tool_names():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "arima_forecast"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "ets_forecast"}],
+                    },
+                },
+            ],
+        },
+        {"tool": "evaluate_batch_against_gt"},
+    ]
+    reasoning = (
+        "1. I used spawn_subagent to create candidates.\n"
+        "2. I used evaluate_batch_against_gt to choose the winner."
+    )
+    assert ExecutorAgent._has_stepwise_reasoning(reasoning, execution_log) is False
+
+
+def test_stepwise_reasoning_correction_message_prefers_candidates_and_forbids_extra_tools():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "chronos2_forecast"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [{"tool": "timesfm2_forecast"}],
+                    },
+                },
+            ],
+        },
+        {"tool": "entropy"},
+        {"tool": "llm_reasoning_qa"},
+    ]
+
+    msg = ExecutorAgent._stepwise_reasoning_correction_message(execution_log)
+
+    assert "chronos2_forecast, timesfm2_forecast" in msg
+    assert "llm_reasoning_qa" not in msg
+    assert "Do not call another tool" in msg
+
+
+@pytest.mark.asyncio
+async def test_stepwise_reasoning_verdict_exposes_exact_names_and_canonical_aliases():
+    seen_messages = []
+
+    class _LLM:
+        async def complete(self, messages, **_kwargs):
+            nonlocal seen_messages
+            seen_messages = messages
+            return LLMResponse(
+                text="",
+                parsed={
+                    "passed": False,
+                    "missing": ["explicit_names", "decisive_evidence"],
+                    "explanation": "candidate names were not explicit enough",
+                },
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_LLM())
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "chronos2_forecast"},
+                            {"tool": "llm_reasoning_forecast"},
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "timesfm2_forecast"},
+                            {"tool": "llm_reasoning_forecast"},
+                        ],
+                    },
+                },
+            ],
+        }
+    ]
+
+    verdict = await executor._stepwise_reasoning_verdict(
+        "1. One path used a forecasting baseline.\n2. It matched the task better.",
+        execution_log,
+    )
+
+    assert verdict["passed"] is False
+    assert verdict["missing"] == ["explicit_names", "decisive_evidence"]
+    prompt_text = seen_messages[1]["content"]
+    assert "chronos2_forecast -> llm_reasoning_forecast" in prompt_text
+    assert "timesfm2_forecast -> llm_reasoning_forecast" in prompt_text
+    assert "chronos2_forecast: Chronos-2" in prompt_text
+    assert "timesfm2_forecast: TimesFM 2.0" in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_stepwise_reasoning_verdict_raises_on_invalid_json():
+    class _LLM:
+        async def complete(self, *_args, **_kwargs):
+            return LLMResponse(
+                text="not json",
+                parsed=None,
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_LLM())
+
+    with pytest.raises(RuntimeError, match="stepwise reasoning judge returned invalid JSON"):
+        await executor._stepwise_reasoning_verdict(
+            "Weak explanation without explicit tool evidence.",
+            [{"tool": "sentiment"}, {"tool": "llm_reasoning_classification"}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_stepwise_reasoning_verdict_raises_on_empty_response():
+    class _LLM:
+        async def complete(self, *_args, **_kwargs):
+            return LLMResponse(
+                text=None,
+                parsed=None,
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_LLM())
+
+    with pytest.raises(RuntimeError, match="stepwise reasoning judge returned empty response"):
+        await executor._stepwise_reasoning_verdict(
+            "Weak explanation without explicit tool evidence.",
+            [{"tool": "sentiment"}, {"tool": "llm_reasoning_classification"}],
+        )
+
+
+@pytest.mark.asyncio
+async def test_execution_context_verdict_exposes_candidate_labels_and_tools():
+    seen_messages = []
+
+    class _LLM:
+        async def complete(self, messages, **_kwargs):
+            nonlocal seen_messages
+            seen_messages = messages
+            return LLMResponse(
+                text="",
+                parsed={
+                    "passed": False,
+                    "missing": ["tool_chain_alignment", "execution_only_language"],
+                    "explanation": "payload still contains control-flow evidence",
+                },
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_LLM())
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "chronos2_forecast"},
+                            {"tool": "llm_reasoning_forecast"},
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "timesfm2_forecast"},
+                            {"tool": "llm_reasoning_forecast"},
+                        ],
+                    },
+                },
+            ],
+        },
+        {"tool": "evaluate_against_gt"},
+    ]
+
+    verdict = await executor._execution_context_verdict(
+        {
+            "tool_chain": ["chronos2_forecast", "evaluate_against_gt"],
+            "public_reasoning": ["The forecast-oriented path remained less decisive than the direct path."],
+            "evidence_summary": "The winner description was still too vague about concrete tools.",
+        },
+        execution_log,
+    )
+
+    assert verdict["passed"] is False
+    assert verdict["missing"] == ["tool_chain_alignment", "execution_only_language"]
+    prompt_text = seen_messages[1]["content"]
+    assert "chronos2_forecast -> llm_reasoning_forecast" in prompt_text
+    assert "timesfm2_forecast -> llm_reasoning_forecast" in prompt_text
+    substantive_tools_section = prompt_text.split(
+        "Exact executed substantive tools:\n",
+        1,
+    )[1].split("\n\nExecution context to judge:\n", 1)[0]
+    assert "- chronos2_forecast" in substantive_tools_section
+    assert "- llm_reasoning_forecast" in substantive_tools_section
+    assert "evaluate_against_gt" not in substantive_tools_section
+
+
+@pytest.mark.asyncio
+async def test_execution_context_verdict_retries_once_after_empty_json_response():
+    calls = 0
+
+    class _LLM:
+        async def complete(self, _messages, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return LLMResponse(
+                    text="",
+                    parsed=None,
+                    model="mock",
+                )
+            return LLMResponse(
+                text="",
+                parsed={
+                    "passed": True,
+                    "missing": [],
+                    "explanation": "ok",
+                },
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_LLM())
+    verdict = await executor._execution_context_verdict(
+        {
+            "tool_chain": ["llm_reasoning_classification"],
+            "public_reasoning": ["`llm_reasoning_classification` returned `stable`."],
+            "evidence_summary": "The classification result stayed stable.",
+        },
+        [{"tool": "llm_reasoning_classification"}],
+    )
+
+    assert verdict["passed"] is True
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_execution_context_verdict_retries_after_malformed_nonempty_json_response():
+    calls = 0
+
+    class _LLM:
+        async def complete(self, _messages, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return LLMResponse(
+                    text="not json",
+                    parsed=None,
+                    model="mock",
+                )
+            return LLMResponse(
+                text="",
+                parsed={
+                    "passed": True,
+                    "missing": [],
+                    "explanation": "ok",
+                },
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_LLM())
+    verdict = await executor._execution_context_verdict(
+        {
+            "tool_chain": ["llm_reasoning_classification"],
+            "public_reasoning": ["`llm_reasoning_classification` returned `stable`."],
+            "evidence_summary": "The classification result stayed stable.",
+        },
+        [{"tool": "llm_reasoning_classification"}],
+    )
+
+    assert verdict["passed"] is True
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_execution_context_verdict_accepts_nested_verdict_dict():
+    class _LLM:
+        async def complete(self, _messages, **_kwargs):
+            return LLMResponse(
+                text="",
+                parsed={
+                    "verdict": {
+                        "passed": True,
+                        "missing": [],
+                        "explanation": "ok",
+                    }
+                },
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_LLM())
+    verdict = await executor._execution_context_verdict(
+        {
+            "tool_chain": ["llm_reasoning_classification"],
+            "public_reasoning": ["`llm_reasoning_classification` produced `stable`."],
+            "evidence_summary": "The classification result stayed stable.",
+        },
+        [{"tool": "llm_reasoning_classification"}],
+    )
+
+    assert verdict["passed"] is True
+
+
+def test_attach_partial_result_to_exception_preserves_terminal_payload():
+    exc = RuntimeError("execution_context judge returned invalid JSON")
+
+    ExecutorAgent._attach_partial_result_to_exception(
+        exc,
+        answer={"insight": "x", "recommendation": "y"},
+        answer_type="learning_summary",
+        confidence=0.91,
+        reasoning="1. chronos2_forecast stayed near the recent band.",
+        execution_context={
+            "tool_chain": ["chronos2_forecast", "llm_reasoning_forecast"],
+            "public_reasoning": ["chronos2_forecast stayed near the recent band."],
+            "evidence_summary": "forecast stayed near the recent band",
+        },
+        control_context={"completion_notes": "repair-only"},
+        execution_log=[{"tool": "chronos2_forecast", "success": True}],
+    )
+
+    assert exc.partial_result["answer_type"] == "learning_summary"  # type: ignore[attr-defined]
+    assert exc.partial_result["execution_context"]["tool_chain"] == [  # type: ignore[attr-defined]
+        "chronos2_forecast",
+        "llm_reasoning_forecast",
+    ]
+    assert exc.raw_answer == {"insight": "x", "recommendation": "y"}  # type: ignore[attr-defined]
+    assert exc.execution_log == [{"tool": "chronos2_forecast", "success": True}]  # type: ignore[attr-defined]
+
+
+def test_normalize_execution_context_filters_orchestration_only_tools():
+    execution_log = [
+        {"tool": "llm_reasoning_classification"},
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "prophet_forecast"},
+                            {"tool": "llm_reasoning_classification"},
+                        ],
+                    },
+                }
+            ],
+        },
+        {"tool": "evaluate_against_gt"},
+    ]
+
+    normalized = ExecutorAgent._normalize_execution_context(
+        {
+            "tool_chain": [
+                "llm_reasoning_classification",
+                "evaluate_against_gt",
+                "prophet_forecast",
+                "nonexistent_tool",
+            ],
+            "public_reasoning": ["forecast evidence"],
+            "evidence_summary": "summary",
+        },
+        execution_log=execution_log,
+    )
+
+    assert normalized["tool_chain"] == [
+        "llm_reasoning_classification",
+        "prophet_forecast",
+    ]
+
+
+def test_normalize_execution_context_preserves_observed_candidate_path_labels():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "text_to_event"},
+                            {"tool": "llm_reasoning_qa"},
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "llm_reasoning_qa"},
+                            {"tool": "summarize"},
+                        ],
+                    },
+                },
+            ],
+        },
+        {"tool": "evaluate_against_gt"},
+    ]
+
+    normalized = ExecutorAgent._normalize_execution_context(
+        {
+            "tool_chain": [
+                "text_to_event -> llm_reasoning_qa",
+                "llm_reasoning_qa -> summarize",
+            ],
+            "public_reasoning": ["evidence"],
+            "evidence_summary": "summary",
+        },
+        execution_log=execution_log,
+    )
+
+    assert normalized["tool_chain"] == [
+        "text_to_event -> llm_reasoning_qa",
+        "llm_reasoning_qa -> summarize",
+    ]
+
+
+def test_normalize_execution_context_rejects_path_labels_with_orchestration_tools():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "text_to_event"},
+                            {"tool": "llm_reasoning_qa"},
+                        ],
+                    },
+                }
+            ],
+        },
+        {"tool": "evaluate_against_gt"},
+    ]
+
+    normalized = ExecutorAgent._normalize_execution_context(
+        {
+            "tool_chain": [
+                "spawn_subagent -> llm_reasoning_qa",
+                "text_to_event -> evaluate_against_gt",
+                "text_to_event -> llm_reasoning_qa",
+            ],
+            "public_reasoning": ["evidence"],
+            "evidence_summary": "summary",
+        },
+        execution_log=execution_log,
+    )
+
+    assert normalized["tool_chain"] == ["text_to_event -> llm_reasoning_qa"]
+
+
+def test_normalize_execution_context_sanitizes_packaging_language_and_backfills_summary():
+    execution_log = [
+        {"tool": "llm_reasoning_indicator"},
+    ]
+
+    normalized = ExecutorAgent._normalize_execution_context(
+        {
+            "tool_chain": ["llm_reasoning_indicator"],
+            "public_reasoning": [
+                "llm_reasoning_indicator returned a task-valid macd array in the exact task-valid format.",
+                "The user requested a finish-only repair of the final JSON delivery.",
+            ],
+            "evidence_summary": "Use the accepted result unchanged as the final answer.",
+        },
+        execution_log=execution_log,
+    )
+
+    assert normalized["tool_chain"] == ["llm_reasoning_indicator"]
+    assert normalized["public_reasoning"] == [
+        "llm_reasoning_indicator returned a macd array in the exact format"
+    ]
+    assert normalized["evidence_summary"] == (
+        "llm_reasoning_indicator returned a macd array in the exact format"
+    )
+
+
+def test_normalize_execution_context_prefers_primary_chain_over_mixed_extra_tools():
+    execution_log = [
+        {"tool": "chronos2_forecast"},
+        {"tool": "llm_reasoning_forecast"},
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "aurora_forecast"},
+                        ],
+                    },
+                }
+            ],
+        },
+        {"tool": "evaluate_batch_against_gt"},
+    ]
+
+    normalized = ExecutorAgent._normalize_execution_context(
+        {
+            "tool_chain": [
+                "chronos2_forecast",
+                "llm_reasoning_forecast",
+                "aurora_forecast",
+            ],
+            "public_reasoning": ["chronos2_forecast stayed near the latest level."],
+            "evidence_summary": "chronos2_forecast matched the realized decline best.",
+        },
+        execution_log=execution_log,
+    )
+
+    assert normalized["tool_chain"] == [
+        "chronos2_forecast",
+        "llm_reasoning_forecast",
+    ]
+
+
+def test_normalize_execution_context_prefers_explicitly_mentioned_candidate_path_label():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "chronos2_forecast"},
+                            {"tool": "llm_reasoning_forecast"},
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "aurora_forecast"},
+                            {"tool": "llm_reasoning_forecast"},
+                        ],
+                    },
+                },
+            ],
+        },
+        {"tool": "evaluate_batch_against_gt"},
+    ]
+
+    normalized = ExecutorAgent._normalize_execution_context(
+        {
+            "tool_chain": [
+                "chronos2_forecast",
+                "llm_reasoning_forecast",
+                "aurora_forecast",
+            ],
+            "public_reasoning": [
+                "chronos2_forecast -> llm_reasoning_forecast stayed close to the latest level and captured the realized decline.",
+                "The user requested a finish-only repair of the final answer.",
+            ],
+            "evidence_summary": "chronos2_forecast -> llm_reasoning_forecast matched the realized decline best.",
+        },
+        execution_log=execution_log,
+    )
+
+    assert normalized["tool_chain"] == ["chronos2_forecast -> llm_reasoning_forecast"]
+    assert normalized["public_reasoning"] == [
+        "chronos2_forecast -> llm_reasoning_forecast stayed close to the latest level and captured the realized decline"
+    ]
+
+
+def test_normalize_execution_context_infers_candidate_path_from_separately_mentioned_tools():
+    execution_log = [
+        {"tool": "window_stats"},
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "llm_reasoning_classification"},
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "chronos2_forecast"},
+                            {"tool": "llm_reasoning_classification"},
+                        ],
+                    },
+                },
+            ],
+        },
+        {"tool": "evaluate_batch_against_gt"},
+    ]
+
+    normalized = ExecutorAgent._normalize_execution_context(
+        {
+            "tool_chain": ["llm_reasoning_classification"],
+            "public_reasoning": [
+                "window_stats reported the last 24-hour observed mean as 18.996.",
+                "chronos2_forecast generated a full 24-hour next-day forecast.",
+                "llm_reasoning_classification applied the task rule using that forecast and produced stable.",
+            ],
+            "evidence_summary": (
+                "The best-supported explored path used a full 24-hour next-day forecast "
+                "and then applied the specified daily-mean comparison."
+            ),
+        },
+        execution_log=execution_log,
+    )
+
+    assert normalized["tool_chain"] == ["chronos2_forecast -> llm_reasoning_classification"]
+    assert normalized["evidence_summary"] == (
+        "The best-supported explored path used a full 24-hour next-day forecast and then applied the specified daily-mean comparison"
+    )
+
+
+def test_normalize_reasoning_for_reuse_appends_selected_winner_step():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "chronos2_forecast"},
+                            {"tool": "llm_reasoning_forecast"},
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "execution_log": [
+                            {"tool": "aurora_forecast"},
+                            {"tool": "llm_reasoning_forecast"},
+                        ],
+                    },
+                },
+            ],
+        },
+        {"tool": "evaluate_batch_against_gt"},
+    ]
+
+    reasoning = (
+        "1. chronos2_forecast -> llm_reasoning_forecast produced a conservative 26-step path near the latest level.\n"
+        "2. aurora_forecast -> llm_reasoning_forecast rebounded too much relative to the realized decline."
+    )
+    execution_context = {
+        "tool_chain": ["chronos2_forecast -> llm_reasoning_forecast"],
+        "public_reasoning": [
+            "chronos2_forecast -> llm_reasoning_forecast stayed close to the latest level."
+        ],
+        "evidence_summary": "chronos2_forecast -> llm_reasoning_forecast had the lowest MAE and RMSE.",
+    }
+
+    normalized = ExecutorAgent._normalize_reasoning_for_reuse(
+        reasoning,
+        execution_log,
+        execution_context,
+    )
+
+    assert "3. chronos2_forecast -> llm_reasoning_forecast was selected because" in normalized
+    assert "lowest MAE and RMSE" in normalized
+
+
+@pytest.mark.asyncio
+async def test_terminal_path_review_reuses_answer_but_rebuilds_context_fields():
+    seen_messages = []
+
+    class _LLM:
+        async def complete(self, messages, **_kwargs):
+            nonlocal seen_messages
+            seen_messages = [dict(message) for message in messages]
+            return LLMResponse(
+                text='{"thought":"Reason: done. Action: return.","done":false}',
+                parsed={"thought": "Reason: done. Action: return.", "done": False},
+                model="mock",
+            )
+
+    executor = ExecutorAgent(llm=_LLM())
+
+    await executor._request_terminal_path_review(
+        conversation=[{"role": "assistant", "content": "prior"}],
+        expected_type="learning_summary",
+        trace_phase="test_terminal_review",
+        recoverable_final={
+            "answer": {"insight": "x", "recommendation": "y"},
+            "answer_type": "learning_summary",
+            "confidence": 0.8,
+        },
+    )
+
+    terminal_prompt = seen_messages[-1]["content"]
+    assert "Keep this exact answer payload unchanged" in terminal_prompt
+    assert "must not change the answer content itself" in terminal_prompt
+    assert "`confidence`, `reasoning`, `execution_context`, and `control_context`" in terminal_prompt
+    assert "Return exactly one final JSON object" in terminal_prompt
+    assert "Never copy repair instructions, validator wording, GT/evaluation notes, or control-flow language into `execution_context`." in terminal_prompt
+    assert "## Reuse Answer" in terminal_prompt
+
+
+def test_count_training_candidates_reads_spawn_result_list():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "No Correlation",
+                        "execution_log": [{"tool": "llm_reasoning_correlation"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "Moderate Positive Correlation",
+                        "execution_log": [{"tool": "window_stats"}],
+                    },
+                },
+            ],
+        }
+    ]
+    assert ExecutorAgent._count_training_candidates(execution_log, task_type="correlation") == 2
+
+
+def test_count_training_candidates_reads_spawn_result_dict_wrapper():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": {
+                "n_tasks": 2,
+                "results": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "No Correlation",
+                            "execution_log": [{"tool": "llm_reasoning_correlation"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "Moderate Positive Correlation",
+                            "execution_log": [{"tool": "window_stats"}],
+                        },
+                    },
+                ],
+            },
+        }
+    ]
+    assert ExecutorAgent._count_training_candidates(execution_log, task_type="correlation") == 2
+
+
+def test_count_training_candidates_keeps_distinct_branches_even_if_tool_names_match():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 0,
+                        "tools_hint": "llm_reasoning_classification",
+                        "sub_task_description": "branch a",
+                        "answer": "<-4%",
+                        "execution_log": [],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 1,
+                        "tools_hint": "sentiment, llm_reasoning_classification",
+                        "sub_task_description": "branch b",
+                        "answer": "<-4%",
+                        "execution_log": [{"tool": "llm_reasoning_classification"}],
+                    },
+                },
+            ],
+        }
+    ]
+
+    assert ExecutorAgent._count_training_candidates(
+        execution_log,
+        task_type="classification",
+    ) == 2
+
+
+def test_count_training_candidates_includes_top_level_task_valid_tools():
+    qa_execution_log = [
+        {
+            "tool": "llm_reasoning_qa",
+            "success": True,
+            "observation": {"answer": "A"},
+        },
+        {
+            "tool": "window_stats",
+            "success": True,
+            "observation": {"min": 1.0, "max": 2.0},
+        },
+    ]
+
+    assert ExecutorAgent._count_training_candidates(
+        qa_execution_log,
+        task_type="qa",
+    ) == 1
+
+    correlation_execution_log = [
+        {
+            "tool": "llm_reasoning_correlation",
+            "success": True,
+            "observation": {"answer": "No Correlation"},
+        },
+        {
+            "tool": "window_stats",
+            "success": True,
+            "observation": {"min": 1.0, "max": 2.0},
+        },
+    ]
+    assert ExecutorAgent._count_training_candidates(
+        correlation_execution_log,
+        task_type="correlation",
+    ) == 1
+
+
+def test_count_training_candidates_includes_top_level_indicator_payloads():
+    execution_log = [
+        {
+            "tool": "timesfm2_forecast",
+            "success": True,
+            "observation": {
+                "upper_bb": [140.097, 140.161, 140.28],
+            },
+        },
+        {
+            "tool": "window_stats",
+            "success": True,
+            "observation": {"min": 1.0, "max": 2.0},
+        },
+    ]
+
+    assert ExecutorAgent._count_training_candidates(
+        execution_log,
+        task_type="indicator",
+        horizon=3,
+        indicator_output_keys=["upper_bb"],
+    ) == 1
+
+
+def test_count_training_candidates_keeps_distinct_top_level_paths_even_if_answers_match():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_indicator",
+            "success": True,
+            "observation": {"upper_bb": [1.0, 2.0, 3.0]},
+        },
+        {
+            "tool": "prophet_forecast",
+            "success": True,
+            "observation": {"upper_bb": [1.0, 2.0, 3.0]},
+        },
+        {
+            "tool": "arima_forecast",
+            "success": True,
+            "observation": {"upper_bb": [0.8, 1.8, 2.8]},
+        },
+    ]
+
+    assert ExecutorAgent._count_training_candidates(
+        execution_log,
+        task_type="indicator",
+        horizon=3,
+        indicator_output_keys=["upper_bb"],
+    ) == 3
+
+
+def test_count_training_candidates_pending_eval_adds_only_new_answer_signatures():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_indicator",
+            "success": True,
+            "observation": {"upper_bb": [1.0, 2.0, 3.0]},
+        },
+        {
+            "tool": "prophet_forecast",
+            "success": True,
+            "observation": {"upper_bb": [1.0, 2.0, 3.0]},
+        },
+    ]
+
+    assert ExecutorAgent._count_training_candidates(
+        execution_log,
+        task_type="indicator",
+        horizon=3,
+        indicator_output_keys=["upper_bb"],
+        pending_predictions=[
+            {"upper_bb": [1.0, 2.0, 3.0]},
+            {"upper_bb": [0.9, 1.9, 2.9]},
+        ],
+    ) == 3
+
+
+def test_count_training_spawn_candidates_ignores_top_level_only_candidates():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_qa",
+            "success": True,
+            "observation": {"answer": "A"},
+        },
+        {
+            "tool": "window_stats",
+            "success": True,
+            "observation": {"min": 1.0, "max": 2.0},
+        },
+    ]
+
+    assert ExecutorAgent._count_training_spawn_candidates(
+        execution_log,
+        "qa",
+    ) == 0
+
+
+def test_count_training_spawn_candidates_reads_only_valid_spawned_branches():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": {
+                "results": [
+                    {
+                        "success": True,
+                        "result": {
+                            "slot_id": 0,
+                            "answer": "No Correlation",
+                            "execution_log": [{"tool": "llm_reasoning_correlation"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "slot_id": 1,
+                            "answer": "Moderate Positive Correlation",
+                            "execution_log": [{"tool": "window_stats"}],
+                        },
+                    },
+                    {
+                        "success": False,
+                        "result": {
+                            "slot_id": 2,
+                            "execution_log": [{"tool": "basic_stats"}],
+                        },
+                    },
+                ],
+            },
+        },
+        {
+            "tool": "llm_reasoning_correlation",
+            "success": True,
+            "observation": {"answer": "Weak Positive Correlation"},
+        },
+    ]
+
+    assert ExecutorAgent._count_training_spawn_candidates(
+        execution_log,
+        "correlation",
+    ) == 2
+
+
+def test_collect_batch_eval_predictions_includes_top_level_indicator_payloads():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 1,
+                        "answer": {"upper_bb": [140.132, 140.133, 140.133]},
+                        "execution_log": [{"tool": "arima_forecast"}],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 9,
+                        "answer": {"upper_bb": [139.917, 140.431, 141.46]},
+                        "execution_log": [{"tool": "chronos2_forecast"}],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "timesfm2_forecast",
+            "success": True,
+            "observation": {
+                "upper_bb": [140.097, 140.161, 140.28],
+            },
+        },
+    ]
+
+    preds = ExecutorAgent._collect_batch_eval_predictions(
+        execution_log,
+        task_type="indicator",
+        horizon=3,
+        indicator_output_keys=["upper_bb"],
+    )
+
+    assert preds == [
+        {"name": "slot_1", "prediction": {"upper_bb": [140.132, 140.133, 140.133]}},
+        {"name": "slot_9", "prediction": {"upper_bb": [139.917, 140.431, 141.46]}},
+        {"name": "top_level::timesfm2_forecast", "prediction": {"upper_bb": [140.097, 140.161, 140.28]}},
+    ]
+
+
+def test_collect_batch_eval_predictions_canonicalizes_indicator_alias_keys():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 1,
+                        "answer": {"indicator_name": [0.11, 0.22]},
+                        "execution_log": [{"tool": "llm_reasoning_indicator"}],
+                    },
+                }
+            ],
+        },
+        {
+            "tool": "llm_reasoning_indicator",
+            "success": True,
+            "observation": {
+                "upper_bollinger_band": [140.097, 140.161, 140.28],
+            },
+        },
+    ]
+
+    preds = ExecutorAgent._collect_batch_eval_predictions(
+        execution_log,
+        task_type="indicator",
+        horizon=2,
+        indicator_output_keys=["macd"],
+    )
+
+    assert preds == [
+        {"name": "slot_1", "prediction": {"macd": [0.11, 0.22]}},
+    ]
+
+
+def test_normalize_batch_eval_predictions_arg_unwraps_wrapped_branch_envelopes():
+    predictions = ExecutorAgent._normalize_batch_eval_predictions_arg(
+        [
+            {
+                "name": "slot_3",
+                "prediction": {
+                    "thought": "wrapped envelope",
+                    "answer_type": "indicator",
+                    "answer": {"upper_bb": [1.0, 2.0, 3.0]},
+                },
+            },
+            {
+                "name": "top_level::llm_reasoning_indicator",
+                "prediction": {"upper_bb": [1.1, 2.1, 3.1]},
+            },
+        ],
+        task_type="indicator",
+        horizon=3,
+        indicator_output_keys=["upper_bb"],
+    )
+
+    assert predictions == [
+        {
+            "name": "slot_3",
+            "prediction": {"upper_bb": [1.0, 2.0, 3.0]},
+        },
+        {
+            "name": "top_level::llm_reasoning_indicator",
+            "prediction": {"upper_bb": [1.1, 2.1, 3.1]},
+        }
+    ]
+
+
+def test_normalize_batch_eval_predictions_arg_replaces_generic_approach_names_with_stable_branch_names():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_classification",
+            "observation": {"answer": "+2% ~ +4%"},
+        },
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 0,
+                        "answer": "-2% ~ +2%",
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "observation": {"answer": "-2% ~ +2%"},
+                            }
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 1,
+                        "answer": "+2% ~ +4%",
+                        "execution_log": [
+                            {"tool": "segment", "observation": {"segments": [[1.0], [2.0]]}},
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "observation": {"answer": "+2% ~ +4%"},
+                            },
+                        ],
+                    },
+                },
+            ],
+        },
+    ]
+
+    predictions = ExecutorAgent._normalize_batch_eval_predictions_arg(
+        [
+            {"name": "approach_0", "prediction": "+2% ~ +4%"},
+            {"name": "approach_1", "prediction": "-2% ~ +2%"},
+            {"name": "approach_2", "prediction": "+2% ~ +4%"},
+        ],
+        task_type="classification",
+        execution_log=execution_log,
+    )
+
+    assert predictions == [
+        {"name": "top_level::llm_reasoning_classification", "prediction": "+2% ~ +4%"},
+        {"name": "slot_0", "prediction": "-2% ~ +2%"},
+        {"name": "slot_1", "prediction": "+2% ~ +4%"},
+    ]
+
+
+def test_answers_match_semantically_returns_false_for_indicator_length_mismatch():
+    assert ExecutorAgent._answers_match_semantically(
+        "indicator",
+        {"macd": list(range(78))},
+        {"macd": list(range(77))},
+        indicator_output_keys=["macd"],
+    ) is False
+
+
+def test_training_completion_contract_satisfied_requires_eval_and_two_spawned_candidates():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": {
+                "results": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "No Correlation",
+                            "execution_log": [{"tool": "llm_reasoning_correlation"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "Moderate Positive Correlation",
+                            "execution_log": [{"tool": "window_stats"}],
+                        },
+                    },
+                ],
+            },
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "success": True,
+            "observation": {
+                "results": [
+                    {"metrics": {"accuracy": 1.0}},
+                    {"metrics": {"accuracy": 0.0}},
+                ],
+            },
+        },
+    ]
+    assert ExecutorAgent._training_completion_contract_satisfied(
+        execution_log,
+        task_type="correlation",
+    ) is True
+
+
+def test_training_completion_contract_satisfied_rejects_top_level_only_candidates_without_spawn():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_indicator",
+            "success": True,
+            "observation": {"upper_bb": [1.0, 2.0, 3.0]},
+        },
+        {
+            "tool": "prophet_forecast",
+            "success": True,
+            "observation": {"upper_bb": [0.8, 1.8, 2.8]},
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "success": True,
+            "observation": {
+                "results": [
+                    {"metrics": {"avg_mae": 0.1}},
+                    {"metrics": {"avg_mae": 0.2}},
+                ],
+            },
+        },
+    ]
+
+    assert ExecutorAgent._training_completion_contract_satisfied(
+        execution_log,
+        task_type="indicator",
+        horizon=3,
+        indicator_output_keys=["upper_bb"],
+    ) is False
+
+
+def test_build_main_budget_message_warns_when_training_contract_satisfied():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": {
+                "results": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "No Correlation",
+                            "execution_log": [{"tool": "llm_reasoning_correlation"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "Moderate Positive Correlation",
+                            "execution_log": [{"tool": "window_stats"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "Weak Positive Correlation",
+                            "execution_log": [{"tool": "basic_stats"}],
+                        },
+                    },
+                ],
+            },
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "success": True,
+            "observation": {
+                "results": [
+                    {"metrics": {"accuracy": 1.0}},
+                    {"metrics": {"accuracy": 0.0}},
+                    {"metrics": {"accuracy": 0.0}},
+                ],
+            },
+        },
+    ]
+    msg = ExecutorAgent._build_main_budget_message(
+        step=9,
+        execution_log=execution_log,
+        plan={
+            "_mode": "train",
+            "task_type": "correlation",
+            "horizon": None,
+            "indicator_output_keys": [],
+        },
+    )
+    assert "training completion contract is already satisfied" in msg
+
+
+def test_build_main_budget_message_prioritizes_missing_training_actions_before_finish():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": {
+                "results": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "C",
+                            "execution_log": [{"tool": "llm_reasoning_qa"}],
+                        },
+                    },
+                ],
+            },
+        },
+    ]
+    msg = ExecutorAgent._build_main_budget_message(
+        step=9,
+        execution_log=execution_log,
+        plan={
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "task_type": "qa",
+            "horizon": None,
+            "indicator_output_keys": [],
+        },
+    )
+
+    assert "not satisfied yet" in msg
+    assert "need at least 2" in msg
+    assert "no GT evaluation" in msg
+    assert "Do not reserve the next turn for `done=true` yet" in msg
+
+
+def test_build_main_budget_message_final_turn_uses_missing_eval_not_finish():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": {
+                "results": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "C",
+                            "execution_log": [{"tool": "llm_reasoning_qa"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "D",
+                            "execution_log": [{"tool": "window_stats"}],
+                        },
+                    },
+                ],
+            },
+        },
+    ]
+    msg = ExecutorAgent._build_main_budget_message(
+        step=10,
+        execution_log=execution_log,
+        plan={
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "task_type": "qa",
+            "horizon": None,
+            "indicator_output_keys": [],
+        },
+    )
+
+    assert "still unmet" in msg
+    assert "no GT evaluation" in msg
+    assert "run GT evaluation" in msg
+    assert "Do not return `done=true` yet" in msg
+
+
+def test_main_requires_eval_only_turn_as_soon_as_candidates_exist_but_no_eval():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": {
+                "results": [
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "C",
+                            "execution_log": [{"tool": "llm_reasoning_qa"}],
+                        },
+                    },
+                    {
+                        "success": True,
+                        "result": {
+                            "answer": "D",
+                            "execution_log": [{"tool": "window_stats"}],
+                        },
+                    },
+                ],
+            },
+        },
+    ]
+
+    assert ExecutorAgent._main_requires_eval_only_turn(
+        step=3,
+        execution_log=execution_log,
+        plan={
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "task_type": "qa",
+            "horizon": None,
+            "indicator_output_keys": [],
+        },
+    ) is True
+
+
+def test_main_requires_eval_only_turn_is_false_without_enough_spawned_candidates():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_qa",
+            "success": True,
+            "output": {"answer": "C"},
+        },
+    ]
+
+    assert ExecutorAgent._main_requires_eval_only_turn(
+        step=executor_module.MAX_REACT_STEPS,
+        execution_log=execution_log,
+        plan={
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "task_type": "qa",
+            "horizon": None,
+            "indicator_output_keys": [],
+        },
+    ) is False
+
+
+def test_main_requires_spawn_only_turn_when_two_turns_left_and_spawn_is_only_viable_path():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_classification",
+            "success": True,
+            "observation": {"answer": "stable"},
+        },
+    ]
+
+    assert ExecutorAgent._main_requires_spawn_only_turn(
+        step=executor_module.MAX_REACT_STEPS - 1,
+        execution_log=execution_log,
+        plan={
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "task_type": "classification",
+            "horizon": None,
+            "indicator_output_keys": [],
+        },
+        spawn_candidate_available=True,
+    ) is True
+
+
+def test_main_requires_spawn_only_turn_when_three_turns_left_and_spawn_is_only_viable_path():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_classification",
+            "success": True,
+            "observation": {"answer": "stable"},
+        },
+    ]
+
+    assert ExecutorAgent._main_requires_spawn_only_turn(
+        step=executor_module.MAX_REACT_STEPS - 2,
+        execution_log=execution_log,
+        plan={
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "task_type": "classification",
+            "horizon": None,
+            "indicator_output_keys": [],
+        },
+        spawn_candidate_available=True,
+    ) is True
+
+
+def test_main_requires_spawn_only_turn_is_true_as_soon_as_unspawned_candidate_exists():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_classification",
+            "success": True,
+            "observation": {"answer": "stable"},
+        },
+    ]
+
+    assert ExecutorAgent._main_requires_spawn_only_turn(
+        step=2,
+        execution_log=execution_log,
+        plan={
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "task_type": "classification",
+            "horizon": None,
+            "indicator_output_keys": [],
+        },
+        spawn_candidate_available=True,
+    ) is True
+
+
+def test_main_requires_spawn_only_turn_is_false_without_spawn_candidate():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_classification",
+            "success": True,
+            "observation": {"answer": "stable"},
+        },
+    ]
+
+    assert ExecutorAgent._main_requires_spawn_only_turn(
+        step=executor_module.MAX_REACT_STEPS - 1,
+        execution_log=execution_log,
+        plan={
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "task_type": "classification",
+            "horizon": None,
+            "indicator_output_keys": [],
+        },
+        spawn_candidate_available=False,
+    ) is False
+
+
+def test_latest_task_valid_tool_answer_returns_latest_valid_branch_payload():
+    execution_log = [
+        {
+            "tool": "chronos2_forecast",
+            "success": True,
+            "output": {"point_forecast": [1.0, 2.0]},
+        },
+        {
+            "tool": "llm_reasoning_indicator",
+            "success": True,
+            "output": {"answer": {"indicator_name": [0.1, 0.2]}},
+        },
+        {
+            "tool": "llm_reasoning_indicator",
+            "success": True,
+            "output": {"answer": {"macd": [0.3, 0.4]}},
+        },
+    ]
+
+    latest = ExecutorAgent._latest_task_valid_tool_answer(
+        task_type="indicator",
+        execution_log=execution_log,
+        indicator_output_keys=["macd"],
+    )
+
+    assert latest == {
+        "tool": "llm_reasoning_indicator",
+        "answer": {"macd": [0.3, 0.4]},
+    }
+
+
+def test_latest_task_valid_tool_answer_normalizes_requested_indicator_key():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_indicator",
+            "success": True,
+            "output": {"answer": {"requested_indicator_key": [0.3, 0.4]}},
+        },
+    ]
+
+    latest = ExecutorAgent._latest_task_valid_tool_answer(
+        task_type="indicator",
+        execution_log=execution_log,
+        indicator_output_keys=["macd"],
+    )
+
+    assert latest == {
+        "tool": "llm_reasoning_indicator",
+        "answer": {"macd": [0.3, 0.4]},
+    }
+
+
+def test_latest_task_valid_tool_answer_ignores_explanatory_text_for_classification():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_qa",
+            "success": True,
+            "output": {
+                "answer": (
+                    "Step 1: The series is bearish. Step 2: Mixed news softens the move. "
+                    "Final label: -2% ~ -4%"
+                )
+            },
+        },
+    ]
+
+    latest = ExecutorAgent._latest_task_valid_tool_answer(
+        task_type="classification",
+        execution_log=execution_log,
+    )
+
+    assert latest is None
+
+
+def test_latest_task_valid_tool_answer_ignores_raw_non_answer_dict_for_qa():
+    execution_log = [
+        {
+            "tool": "value_at",
+            "success": True,
+            "output": {"index": -1, "resolved_index": 389, "length": 390, "value": 91.5},
+        },
+    ]
+
+    latest = ExecutorAgent._latest_task_valid_tool_answer(
+        task_type="qa",
+        execution_log=execution_log,
+    )
+
+    assert latest is None
+
+
+def test_is_task_answer_backed_by_tool_output_accepts_requested_indicator_key_alias():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_indicator",
+            "success": True,
+            "output": {"answer": {"requested_indicator_key": [0.3, 0.4]}},
+        },
+    ]
+
+    assert ExecutorAgent._is_task_answer_backed_by_tool_output(
+        "indicator",
+        {"macd": [0.3, 0.4]},
+        execution_log,
+        indicator_output_keys=["macd"],
+    ) is True
+
+
+def test_is_task_answer_backed_by_tool_output_accepts_weather_indicator_triplet_alias():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_indicator",
+            "success": True,
+            "output": {"answer": {"indicator_name": [21.083, 11.427, 9.656]}},
+        },
+    ]
+
+    assert ExecutorAgent._is_task_answer_backed_by_tool_output(
+        "indicator",
+        {"max": [21.083], "min": [11.427], "diff": [9.656]},
+        execution_log,
+        indicator_output_keys=["max", "min", "diff"],
+    ) is True
+
+
+def test_count_training_candidates_dedupes_repeated_top_level_tool_path():
+    execution_log = [
+        {
+            "tool": "llm_reasoning_qa",
+            "success": True,
+            "observation": {"answer": "C"},
+        },
+        {
+            "tool": "llm_reasoning_qa",
+            "success": True,
+            "observation": {"answer": "C"},
+        },
+        {
+            "tool": "llm_reasoning_qa",
+            "success": True,
+            "observation": {"answer": "D"},
+        },
+        {
+            "tool": "entropy",
+            "success": True,
+            "observation": {"sample_entropy": 0.4},
+        },
+    ]
+
+    assert ExecutorAgent._count_training_candidates(
+        execution_log,
+        task_type="qa",
+    ) == 1
+
+
+def test_count_training_candidates_distinguishes_top_level_paths_with_same_terminal_tool():
+    execution_log = [
+        {
+            "tool": "value_at",
+            "success": True,
+            "observation": {"value": 12.0},
+        },
+        {
+            "tool": "llm_reasoning_classification",
+            "success": True,
+            "observation": {"answer": "stable"},
+        },
+        {
+            "tool": "segment",
+            "success": True,
+            "observation": {"segments": [[1.0], [2.0]]},
+        },
+        {
+            "tool": "llm_reasoning_classification",
+            "success": True,
+            "observation": {"answer": "up"},
+        },
+    ]
+
+    assert ExecutorAgent._count_training_candidates(
+        execution_log,
+        task_type="classification",
+    ) == 2
+
+
+def test_collect_batch_eval_predictions_uses_full_top_level_path_names():
+    execution_log = [
+        {
+            "tool": "value_at",
+            "success": True,
+            "observation": {"value": 12.0},
+        },
+        {
+            "tool": "llm_reasoning_classification",
+            "success": True,
+            "observation": {"answer": "stable"},
+        },
+        {
+            "tool": "segment",
+            "success": True,
+            "observation": {"segments": [[1.0], [2.0]]},
+        },
+        {
+            "tool": "llm_reasoning_classification",
+            "success": True,
+            "observation": {"answer": "up"},
+        },
+    ]
+
+    predictions = ExecutorAgent._collect_batch_eval_predictions(
+        execution_log,
+        task_type="classification",
+    )
+
+    assert predictions == [
+        {
+            "name": "top_level::value_at -> llm_reasoning_classification",
+            "prediction": "stable",
+        },
+        {
+            "name": "top_level::segment -> llm_reasoning_classification",
+            "prediction": "up",
+        },
+    ]
+
+
+def test_collect_batch_eval_predictions_uses_branch_identity_names():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 0,
+                        "sub_task_description": "branch a",
+                        "answer": "<-4%",
+                        "execution_log": [],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 1,
+                        "sub_task_description": "branch b",
+                        "answer": "<-4%",
+                        "execution_log": [{"tool": "llm_reasoning_classification"}],
+                    },
+                },
+            ],
+        }
+    ]
+
+    predictions = ExecutorAgent._collect_batch_eval_predictions(
+        execution_log,
+        task_type="classification",
+    )
+
+    assert predictions == [
+        {"name": "slot_0", "prediction": "<-4%"},
+        {"name": "slot_1", "prediction": "<-4%"},
+    ]
+
+
+def test_collect_batch_eval_predictions_prefers_tool_backed_subagent_answer_when_wrapped_answer_conflicts():
+    predictions = ExecutorAgent._collect_batch_eval_predictions(
+        [
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "slot_id": 7,
+                            "answer": "Moderate Negative Correlation",
+                            "execution_log": [
+                                {
+                                    "tool": "value_at",
+                                    "success": True,
+                                    "output": {"value": 76.065},
+                                },
+                                {
+                                    "tool": "llm_reasoning_correlation",
+                                    "success": True,
+                                    "output": {"answer": "No Correlation"},
+                                },
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+        task_type="correlation",
+    )
+
+    assert predictions == [
+        {"name": "slot_7", "prediction": "No Correlation"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_executor_raises_if_max_steps_end_without_finalized_answer(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(
+                    {
+                        "done": True,
+                        "thought": "Reason: I want to finish early. Action: return a learning summary.",
+                        "answer": {
+                            "insight": "premature",
+                            "recommendation": "needs evaluation first",
+                        },
+                        "answer_type": "learning_summary",
+                        "confidence": 0.5,
+                        "reasoning": "1. I tried to finish before any evaluation.",
+                    }
+                )
+            return _Resp(
+                {
+                    "done": False,
+                    "thought": "Reason: I still need to act. Action: run evaluation.",
+                    "tool": "evaluate_against_gt",
+                    "args": {
+                        "task_type": "correlation",
+                        "prediction": "No Correlation",
+                    },
+                }
+            )
+    async def _fake_execute_tool(*_args, **_kwargs):
+        return ToolResult(
+            success=True,
+            data={
+                "metrics": {
+                    "accuracy": 1.0,
+                    "correct": True,
+                    "predicted_label": "No Correlation",
+                    "ground_truth_label": "No Correlation",
+                },
+                "ground_truth": "No Correlation",
+            },
+            error=None,
+            metadata={},
+        )
+
+    executor = ExecutorAgent(llm=_LLM())
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+
+    plan = {
+        "candidates": ["evaluate_against_gt"],
+        "task_type": "correlation",
+        "task_description": "test correlation task",
+        "tool_names": "evaluate_against_gt",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "modality_hint": "",
+        "profiling_section": "",
+        "fingerprint": {},
+        "horizon": None,
+        "domain": "finance",
+        "reanalysis_section": "",
+        "_mode": "train",
+        "_defer_learning_record": False,
+        "_ground_truth": "No Correlation",
+        "indicator_output_keys": [],
+        "modality": "multimodal",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="correlation", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries", "text"]),
+    )
+
+    with pytest.raises(DecisionOutputExhaustedError) as exc_info:
+        await executor.act(plan, envelope)
+    assert exc_info.value.failure_reason == "training_contract_unsatisfied"
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_last_step_learning_summary_when_training_contract_unsatisfied(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        async def complete(self, *_args, **_kwargs):
+            return _Resp(
+                {
+                    "done": True,
+                    "thought": "Reason: finish now. Action: return a learning summary.",
+                    "answer": {
+                        "insight": "premature summary",
+                        "recommendation": "should not pass",
+                    },
+                    "answer_type": "learning_summary",
+                    "confidence": 0.4,
+                    "reasoning": "1. I tried to finish without satisfying the training contract.",
+                }
+            )
+    executor = ExecutorAgent(llm=_LLM())
+    monkeypatch.setattr(executor, "_count_training_candidates", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(executor, "_count_training_spawn_candidates", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(executor, "_has_training_evaluation", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+
+    plan = {
+        "candidates": ["spawn_subagent", "evaluate_against_gt"],
+        "task_type": "qa",
+        "task_description": "test qa task",
+        "tool_names": "spawn_subagent, evaluate_against_gt",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [{"slot_id": 0}, {"slot_id": 1}],
+        "fingerprint": {},
+        "horizon": None,
+        "domain": "finance",
+        "reanalysis_section": "",
+        "_mode": "train",
+        "_defer_learning_record": False,
+        "_ground_truth": "A",
+        "indicator_output_keys": [],
+        "modality": "multimodal",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="qa", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries", "text"]),
+    )
+
+    with pytest.raises(DecisionOutputExhaustedError) as exc_info:
+        await executor.act(plan, envelope)
+    assert exc_info.value.failure_reason == "training_contract_unsatisfied"
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_terminal_learning_summary_when_budget_exhaustion_still_violates_training_contract(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls <= 10:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: continue exploring. Action: run a tool.",
+                        "tool": "basic_stats",
+                        "args": {},
+                    }
+                )
+            return _Resp(
+                {
+                    "done": True,
+                    "thought": "Reason: budget exhausted. Action: summarize the failure pattern.",
+                    "answer": {
+                        "insight": "The run repeated the same top-level path and never completed GT evaluation.",
+                        "recommendation": "Create distinct candidate paths earlier and evaluate before spending the remaining budget on redundant tool calls.",
+                    },
+                    "answer_type": "learning_summary",
+                    "confidence": 0.82,
+                    "reasoning": "1. The training contract remained unsatisfied at the step limit.",
+                }
+            )
+    async def _fake_execute_tool(_name, _args, *_rest, **_kwargs):
+        return ToolResult(
+            ok=True,
+            data={"mean": 1.0},
+            error=None,
+            metadata={},
+        )
+
+    executor = ExecutorAgent(llm=_LLM())
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+
+    plan = {
+        "candidates": ["basic_stats"],
+        "task_type": "forecast",
+        "task_description": "test forecast task",
+        "tool_names": "basic_stats",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "modality_hint": "",
+        "profiling_section": "",
+        "fingerprint": {},
+        "horizon": 2,
+        "domain": "finance",
+        "reanalysis_section": "",
+        "_mode": "train",
+        "_defer_learning_record": False,
+        "_ground_truth": [1.0, 2.0],
+        "indicator_output_keys": [],
+        "modality": "timeseries",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="forecast", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries"]),
+    )
+
+    with pytest.raises(DecisionOutputExhaustedError) as exc_info:
+        await executor.act(plan, envelope)
+    assert exc_info.value.failure_reason == "training_contract_unsatisfied"
+
+
+@pytest.mark.asyncio
+async def test_executor_blocks_training_eval_until_two_candidates_exist(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: I want immediate feedback. Action: evaluate a direct candidate first.",
+                        "tool": "evaluate_against_gt",
+                        "args": {
+                            "task_type": "correlation",
+                            "prediction": "No Correlation",
+                        },
+                    }
+                )
+            if self.calls == 2:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: evaluation was premature. Action: explore three branches first.",
+                        "tool": "spawn_subagent",
+                        "args": {
+                            "tasks": [
+                                {"slot_id": 0, "task": "branch a"},
+                                {"slot_id": 1, "task": "branch b"},
+                                {"slot_id": 2, "task": "branch c"},
+                            ]
+                        },
+                    }
+                )
+            if self.calls == 3:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: I now have enough candidates. Action: batch-evaluate them.",
+                        "tool": "evaluate_batch_against_gt",
+                        "args": {"task_type": "correlation"},
+                    }
+                )
+            return _Resp(
+                {
+                    "done": True,
+                    "thought": "Reason: exploration and evaluation are complete. Action: return the learning summary.",
+                    "answer": {
+                        "insight": "Comparing two concrete branches before GT evaluation produces a cleaner training trace.",
+                        "recommendation": "Spawn first, then run GT evaluation once two valid candidates exist.",
+                    },
+                    "answer_type": "learning_summary",
+                    "confidence": 0.9,
+                    "reasoning": (
+                        "1. I first explored two distinct candidate branches.\n"
+                        "2. I then evaluated the candidate set against ground truth.\n"
+                        "3. I summarized the reusable lesson after the comparison was complete."
+                    ),
+                }
+            )
+    async def _fake_spawn_subagents(*_args, **_kwargs):
+        return {
+            "n_tasks": 3,
+            "n_success": 3,
+            "results": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 0,
+                        "answer": "No Correlation",
+                        "answer_type": "correlation",
+                        "execution_log": [{"tool": "window_stats"}],
+                        "tool_chain": ["window_stats"],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 1,
+                        "answer": "Moderate Positive Correlation",
+                        "answer_type": "correlation",
+                        "execution_log": [{"tool": "llm_reasoning_correlation"}],
+                        "tool_chain": ["llm_reasoning_correlation"],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 2,
+                        "answer": "Weak Positive Correlation",
+                        "answer_type": "correlation",
+                        "execution_log": [{"tool": "basic_stats"}],
+                        "tool_chain": ["basic_stats"],
+                    },
+                },
+            ],
+            "observation": "spawn complete",
+        }
+
+    executed_tools = []
+
+    async def _fake_execute_tool(tool_name, *_args, **_kwargs):
+        executed_tools.append(tool_name)
+        return ToolResult(
+            success=True,
+            data={
+                "results": [
+                    {"name": "slot_0", "metrics": {"accuracy": 1.0}},
+                    {"name": "slot_1", "metrics": {"accuracy": 0.0}},
+                    {"name": "slot_2", "metrics": {"accuracy": 0.0}},
+                ]
+            },
+            error=None,
+            metadata={},
+        )
+
+    executor = ExecutorAgent(llm=_LLM())
+    monkeypatch.setattr(executor, "_spawn_subagents", _fake_spawn_subagents)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+
+    plan = {
+        "candidates": ["spawn_subagent", "evaluate_against_gt", "evaluate_batch_against_gt"],
+        "task_type": "correlation",
+        "task_description": "test correlation task",
+        "tool_names": "spawn_subagent, evaluate_against_gt, evaluate_batch_against_gt",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [{"slot_id": 0}, {"slot_id": 1}, {"slot_id": 2}],
+        "fingerprint": {},
+        "horizon": None,
+        "domain": "finance",
+        "reanalysis_section": "",
+        "_mode": "train",
+        "_defer_learning_record": False,
+        "_ground_truth": "No Correlation",
+        "indicator_output_keys": [],
+        "modality": "multimodal",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="correlation", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries", "text"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "learning_summary"
+    assert [entry["tool"] for entry in result["execution_log"]] == [
+        "spawn_subagent",
+        "evaluate_batch_against_gt",
+    ]
+    assert executed_tools == ["evaluate_batch_against_gt"]
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_top_level_task_mismatched_reasoning_tool(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: try a direct multimodal answer. Action: call llm_reasoning_qa.",
+                        "tool": "llm_reasoning_qa",
+                        "args": {"question": "bad tool"},
+                    }
+                )
+            if self.calls == 2:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: use the task-compatible forecast reasoner. Action: call llm_reasoning_forecast.",
+                        "tool": "llm_reasoning_forecast",
+                        "args": {"question": "forecast"},
+                    }
+                )
+            return _Resp(
+                {
+                    "done": True,
+                    "thought": "Reason: a real tool already produced the forecast. Action: finish.",
+                    "answer": [1.0, 2.0],
+                    "answer_type": "forecast",
+                    "confidence": 0.9,
+                    "reasoning": "1. llm_reasoning_forecast produced the final forecast candidate.",
+                }
+            )
+    executed_tools: list[str] = []
+
+    async def _fake_execute_tool(tool_name, *_args, **_kwargs):
+        executed_tools.append(tool_name)
+        return ToolResult(
+            success=True,
+            data=[1.0, 2.0],
+            error=None,
+            metadata={},
+        )
+
+    executor = ExecutorAgent(llm=_LLM())
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+
+    plan = {
+        "candidates": ["llm_reasoning_qa", "llm_reasoning_forecast"],
+        "task_type": "forecast",
+        "task_description": "test forecast task",
+        "tool_names": "llm_reasoning_qa, llm_reasoning_forecast",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [],
+        "fingerprint": {"missing_ratio": 0.0},
+        "horizon": 2,
+        "domain": "weather",
+        "reanalysis_section": "",
+        "_mode": "test",
+        "_defer_learning_record": False,
+        "_ground_truth": None,
+        "indicator_output_keys": [],
+        "modality": "multimodal",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="forecast", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries", "text"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "forecast"
+    assert executed_tools == ["llm_reasoning_forecast"]
+
+
+@pytest.mark.asyncio
+async def test_executor_reserves_final_step_once_training_contract_is_satisfied(monkeypatch):
+    decision_calls = 0
+
+    async def _fake_request_structured_decision(*_args, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            decision = {
+                "done": False,
+                "thought": _structured_thought(
+                    "continue exploring.",
+                    "run a tool.",
+                ),
+                "tool": "basic_stats",
+                "args": {},
+            }
+            return _decision_response(decision), decision
+        decision = {
+            "done": True,
+            "thought": _structured_thought(
+                "the contract is already satisfied.",
+                "finish with a learning summary.",
+            ),
+            "answer": {
+                "insight": "enough evidence collected",
+                "recommendation": "stop exploring near the step limit",
+            },
+            "answer_type": "learning_summary",
+            "confidence": 0.9,
+            "reasoning": "1. I compared the explored candidates and stopped before wasting the last step.",
+        }
+        return _decision_response(decision), decision
+
+    execute_counts = {"count": 0}
+
+    async def _fake_execute_tool(*_args, **_kwargs):
+        execute_counts["count"] += 1
+        return ToolResult(
+            success=True,
+            data={"mean": 1.0},
+            error=None,
+            metadata={},
+        )
+
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 3)
+    monkeypatch.setattr(
+        executor,
+        "_training_completion_contract_satisfied",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: False)
+    monkeypatch.setattr(executor, "_count_training_candidates", lambda *_args, **_kwargs: 3)
+    monkeypatch.setattr(executor, "_count_training_spawn_candidates", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(executor, "_has_training_evaluation", lambda *_args, **_kwargs: True)
+
+    plan = {
+        "candidates": ["basic_stats"],
+        "task_type": "correlation",
+        "task_description": "test correlation task",
+        "tool_names": "basic_stats",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "modality_hint": "",
+        "profiling_section": "",
+        "fingerprint": {},
+        "horizon": None,
+        "domain": "finance",
+        "reanalysis_section": "",
+        "_mode": "train",
+        "_defer_learning_record": False,
+        "_ground_truth": "No Correlation",
+        "indicator_output_keys": [],
+        "modality": "multimodal",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="correlation", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries", "text"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "learning_summary"
+    assert execute_counts["count"] == 1
+    assert decision_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_executor_allows_second_spawn_round_only_when_candidates_are_insufficient(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: first exploration round. Action: spawn two branches.",
+                        "tool": "spawn_subagent",
+                        "args": {
+                            "tasks": [
+                                {"slot_id": 0, "task": "branch a"},
+                                {"slot_id": 1, "task": "branch b"},
+                            ]
+                        },
+                    }
+                )
+            if self.calls == 2:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: one branch failed, so I still need another exploration round with at least two branches. Action: spawn two more branches.",
+                        "tool": "spawn_subagent",
+                        "args": {
+                            "tasks": [
+                                    {"slot_id": 2, "task": "branch d"},
+                                    {"slot_id": 3, "task": "branch e"},
+                                ]
+                            },
+                        }
+                    )
+            if self.calls == 3:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: I now have two valid candidates. Action: batch-evaluate them.",
+                        "tool": "evaluate_batch_against_gt",
+                        "args": {"task_type": "correlation"},
+                    }
+                )
+            return _Resp(
+                {
+                    "done": True,
+                    "thought": "Reason: exploration and evaluation are complete. Action: return the learning summary.",
+                    "answer": {
+                        "insight": "A second spawn round is only justified when the first round leaves too few valid candidates.",
+                        "recommendation": "Use a second spawn round with fresh slots, then evaluate immediately once enough candidates exist.",
+                    },
+                    "answer_type": "learning_summary",
+                    "confidence": 0.9,
+                    "reasoning": (
+                        "1. The first spawn round produced only one valid candidate because one branch failed.\n"
+                        "2. A second spawn round used fresh slots to add another valid candidate.\n"
+                        "3. After reaching two valid candidates, I evaluated them and summarized the lesson."
+                    ),
+                }
+            )
+    spawn_calls: list[dict[str, Any]] = []
+
+    async def _fake_spawn_subagents(tool_args, *_args, **_kwargs):
+        spawn_calls.append(tool_args)
+        if len(spawn_calls) == 1:
+            return {
+                "n_tasks": 2,
+                "n_success": 1,
+                "results": [
+                    {
+                        "success": True,
+                        "result": {
+                            "slot_id": 0,
+                            "answer": "No Correlation",
+                            "answer_type": "correlation",
+                            "execution_log": [{"tool": "window_stats"}],
+                        },
+                    },
+                    {
+                        "success": False,
+                        "result": {
+                            "slot_id": 1,
+                            "execution_log": [{"tool": "llm_reasoning_correlation"}],
+                        },
+                    },
+                ],
+                "observation": "first spawn complete",
+            }
+        return {
+            "n_tasks": 2,
+            "n_success": 1,
+            "results": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 2,
+                        "answer": "Moderate Positive Correlation",
+                        "answer_type": "correlation",
+                        "execution_log": [{"tool": "llm_reasoning_correlation"}],
+                    },
+                },
+                {
+                    "success": False,
+                    "result": {
+                        "slot_id": 3,
+                        "execution_log": [{"tool": "window_stats"}],
+                    },
+                },
+            ],
+            "observation": "second spawn complete",
+        }
+
+    executed_tools = []
+
+    async def _fake_execute_tool(tool_name, *_args, **_kwargs):
+        executed_tools.append(tool_name)
+        return ToolResult(
+            success=True,
+            data={
+                "results": [
+                    {"name": "slot_0", "metrics": {"accuracy": 1.0}},
+                    {"name": "slot_2", "metrics": {"accuracy": 0.0}},
+                ]
+            },
+            error=None,
+            metadata={},
+        )
+
+    executor = ExecutorAgent(llm=_LLM())
+    monkeypatch.setattr(executor, "_spawn_subagents", _fake_spawn_subagents)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+
+    plan = {
+        "candidates": ["spawn_subagent", "evaluate_batch_against_gt"],
+        "task_type": "correlation",
+        "task_description": "test correlation task",
+        "tool_names": "spawn_subagent, evaluate_batch_against_gt",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [
+            {"slot_id": 0},
+            {"slot_id": 1},
+            {"slot_id": 2},
+            {"slot_id": 3},
+        ],
+        "fingerprint": {},
+        "horizon": None,
+        "domain": "finance",
+        "reanalysis_section": "",
+        "_mode": "train",
+        "_defer_learning_record": False,
+        "_ground_truth": "No Correlation",
+        "indicator_output_keys": [],
+        "modality": "multimodal",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="correlation", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries", "text"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "learning_summary"
+    assert [entry["tool"] for entry in result["execution_log"]] == [
+        "spawn_subagent",
+        "spawn_subagent",
+        "evaluate_batch_against_gt",
+    ]
+    assert executed_tools == ["evaluate_batch_against_gt"]
+    assert [
+        [task["slot_id"] for task in call["tasks"]]
+        for call in spawn_calls
+    ] == [[0, 1], [2, 3]]
+
+
+def test_precompute_subagent_slots_builds_fixed_slot_pool():
+    slots = ExecutorAgent._precompute_subagent_slots(
+        trace_id="trace-1",
+        candidates=[
+            "chronos2_forecast",
+            "timesfm2_forecast",
+            "llm_reasoning_forecast",
+            "spawn_subagent",
+            "evaluate_batch_against_gt",
+        ],
+        task_type="forecast",
+        run_mode="train",
+        scope="finance/forecast",
+        scope_counts={
+            "chronos2_forecast": 10,
+            "timesfm2_forecast": 20,
+            "llm_reasoning_forecast": 999,
+        },
+    )
+
+    assert len(slots) == 10
+    for idx, slot in enumerate(slots):
+        assert slot["slot_id"] == idx
+        assert "spawn_subagent" not in slot["visible_candidates"]
+        assert "evaluate_batch_against_gt" not in slot["visible_candidates"]
+        assert slot["keep_probabilities"]["llm_reasoning_forecast"] < 1.0
+        assert slot["never_drop"] == []
+    assert any(
+        "llm_reasoning_forecast" not in slot["visible_candidates"]
+        for slot in slots
+    )
+
+
+def test_validate_spawn_subagent_tasks_requires_valid_distinct_slot_ids():
+    slots = [
+        {"slot_id": 0},
+        {"slot_id": 1},
+    ]
+
+    duplicate_error = ExecutorAgent._validate_spawn_subagent_tasks(
+        [
+            {"slot_id": 0, "task": "path a"},
+            {"slot_id": 0, "task": "path b"},
+        ],
+        slots,
+    )
+    invalid_error = ExecutorAgent._validate_spawn_subagent_tasks(
+        [{"slot_id": 3, "task": "path a"}],
+        slots,
+    )
+    ok = ExecutorAgent._validate_spawn_subagent_tasks(
+        [
+            {"slot_id": 0, "task": "path a"},
+            {"slot_id": 1, "task": "path b"},
+        ],
+        slots,
+    )
+
+    assert "different `slot_id`" in duplicate_error
+    assert "slot_id=3 is invalid" in invalid_error
+    assert ok is None
+
+
+def test_validate_spawn_subagent_tasks_enforces_training_minimum_when_requested():
+    slots = [
+        {"slot_id": 0},
+        {"slot_id": 1},
+    ]
+
+    error = ExecutorAgent._validate_spawn_subagent_tasks(
+        [{"slot_id": 0, "task": "path a"}],
+        slots,
+        min_tasks=2,
+    )
+
+    assert "at least 2 distinct branches" in error
+
+
+def test_validate_spawn_subagent_tasks_still_requires_two_branches_on_later_rounds():
+    slots = [
+        {"slot_id": 0},
+        {"slot_id": 1},
+        {"slot_id": 2},
+    ]
+
+    error = ExecutorAgent._validate_spawn_subagent_tasks(
+        [{"slot_id": 2, "task": "path c"}],
+        slots,
+        min_tasks=2,
+        disallowed_slot_ids={0, 1},
+    )
+
+    assert "at least 2 distinct branches" in error
+
+
+@pytest.mark.asyncio
+async def test_executor_allows_additional_spawn_rounds_in_training(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    spawn_calls = []
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            decision = {
+                "thought": _structured_thought(
+                    "create the first two branches.",
+                    "spawn now.",
+                ),
+                "done": False,
+                "tool": "spawn_subagent",
+                "args": {
+                    "tasks": [
+                        {"slot_id": 0, "task": "path a"},
+                        {"slot_id": 1, "task": "path b"},
+                    ],
+                },
+            }
+            return _decision_response(decision), decision
+        if decision_calls == 2:
+            decision = {
+                "thought": _structured_thought(
+                    "add another two distinct branches.",
+                    "spawn again.",
+                ),
+                "done": False,
+                "tool": "spawn_subagent",
+                "args": {
+                    "tasks": [
+                        {"slot_id": 2, "task": "path c"},
+                        {"slot_id": 3, "task": "path d"},
+                    ],
+                },
+            }
+            return _decision_response(decision), decision
+        decision = {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+        return _decision_response(decision), decision
+
+    async def _fake_spawn_subagents(tool_args, *_args, **_kwargs):
+        spawn_calls.append(tool_args)
+        tasks = tool_args["tasks"]
+        results = []
+        for task in tasks:
+            results.append({
+                "success": True,
+                "result": {
+                    "slot_id": task["slot_id"],
+                    "answer": "stable",
+                    "answer_type": "classification",
+                    "execution_log": [{"tool": "llm_reasoning_classification"}],
+                },
+            })
+        return {
+            "n_tasks": len(tasks),
+            "n_success": len(tasks),
+            "results": results,
+            "observation": "spawned",
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        return {
+            "thought": _structured_thought(
+                "no valid finish was produced.",
+                "stop.",
+            ),
+            "done": True,
+            "answer": None,
+            "answer_type": "learning_summary",
+            "reasoning": "1. invalid",
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_spawn_subagents", _fake_spawn_subagents)
+    monkeypatch.setattr(executor, "_normalize_spawn_tasks", lambda tasks, **_kwargs: (tasks, None))
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: False)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 3)
+
+    with pytest.raises((MaxStepsExhaustedError, DecisionOutputExhaustedError)):
+        await executor.act(
+            {
+                "candidates": ["spawn_subagent"],
+                "task_type": "classification",
+                "task_description": "Explore multiple classification branches.",
+                "tool_names": "spawn_subagent",
+                "tool_notes_section": "",
+                "skills_section": "",
+                "system_memory": "",
+                "modality_hint": "",
+                "profiling_section": "",
+                "subagent_slot_section": "",
+                "subagent_slots": [
+                    {"slot_id": 0},
+                    {"slot_id": 1},
+                    {"slot_id": 2},
+                    {"slot_id": 3},
+                ],
+                "fingerprint": {"missing_ratio": 0.0},
+                "horizon": None,
+                "domain": "weather",
+                "reanalysis_section": "",
+                "_mode": "train",
+                "_defer_learning_record": False,
+                "_ground_truth": None,
+                "indicator_output_keys": [],
+                "modality": "timeseries",
+                "train_spawn_prior_path": [],
+            },
+            TaskEnvelope(
+                task=TaskSpec(
+                    task_id="allow-additional-spawn-rounds",
+                    task_type="classification",
+                    description="dummy",
+                ),
+                environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+            ),
+        )
+
+    assert len(spawn_calls) == 2
+
+
+def test_build_subagent_candidates_prefers_precomputed_slot_visibility():
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    visible = executor._build_subagent_candidates(
+        idx=0,
+        task_description="forecast with slot",
+        tools_hint="timesfm2_forecast",
+        plan={
+            "_mode": "train",
+            "_tool_dropout_scope": "finance/forecast",
+            "_tool_dropout_counts": {
+                "chronos2_forecast": 10,
+                "timesfm2_forecast": 20,
+                "llm_reasoning_forecast": 30,
+            },
+            "task_type": "forecast",
+            "candidates": [
+                "chronos2_forecast",
+                "timesfm2_forecast",
+                "llm_reasoning_forecast",
+                "spawn_subagent",
+                "evaluate_batch_against_gt",
+            ],
+        },
+        envelope=SimpleNamespace(trace_id="trace-1"),
+        slot_id=2,
+        slot_spec={
+            "slot_id": 2,
+            "visible_candidates": ["timesfm2_forecast", "llm_reasoning_forecast"],
+            "keep_probabilities": {
+                "chronos2_forecast": 0.1,
+                "timesfm2_forecast": 0.2,
+                "llm_reasoning_forecast": 1.0,
+            },
+            "never_drop": ["llm_reasoning_forecast"],
+        },
+    )
+
+    assert visible == ["timesfm2_forecast", "llm_reasoning_forecast"]
+
+
+def test_build_visible_tool_guidance_includes_spawn_dropout_and_evaluate_rules():
+    guidance = executor_prompt.build_visible_tool_guidance(
+        [
+            "chronos2_forecast",
+            "spawn_subagent",
+            "evaluate_batch_against_gt",
+        ],
+        defer_learning_record=False,
+    )
+
+    assert "prefer using `spawn_subagent`" in guidance
+    assert "post-dropout visible tool subsets" in guidance
+    assert "do not adjust, rewrite, or refine the candidate output" in guidance
+    assert '`answer_type` must be `"learning_summary"`' in guidance
+
+
+def test_build_visible_tool_guidance_is_empty_without_spawn_or_evaluate():
+    guidance = executor_prompt.build_visible_tool_guidance(
+        ["chronos2_forecast", "llm_reasoning_forecast"],
+        defer_learning_record=False,
+    )
+
+    assert guidance == ""
+
+
+def test_react_system_prompt_admits_learning_summary_finish_shape_for_training():
+    text = executor_prompt.REACT_SYSTEM_PROMPT
+
+    assert "learning_summary (training main-agent only)" in text
+    assert "In training main-agent mode, the only valid final `answer_type` is `learning_summary`." in text
+
+
+def test_derive_tools_hint_from_slot_projects_onto_visible_candidates():
+    derived = ExecutorAgent._derive_tools_hint_from_slot(
+        "chronos2_forecast, timesfm2_forecast",
+        slot_spec={
+            "slot_id": 2,
+            "visible_candidates": ["timesfm2_forecast", "llm_reasoning_forecast"],
+        },
+        task_type="forecast",
+    )
+
+    assert derived == ["timesfm2_forecast"]
+
+
+def test_build_subagent_slot_section_keeps_each_slot_separate():
+    text = ExecutorAgent._build_subagent_slot_section(
+        [
+            {
+                "slot_id": 0,
+                "visible_candidates": ["timesfm2_forecast", "llm_reasoning_forecast"],
+            },
+            {
+                "slot_id": 1,
+                "visible_candidates": ["timesfm2_forecast", "llm_reasoning_forecast"],
+            },
+            {
+                "slot_id": 2,
+                "visible_candidates": ["window_stats"],
+            },
+        ],
+        task_type="forecast",
+    )
+
+    assert "slot_id=0: visible_tools=timesfm2_forecast, llm_reasoning_forecast" in text
+    assert "slot_id=1: visible_tools=timesfm2_forecast, llm_reasoning_forecast" in text
+    assert "slot_id=2: visible_tools=window_stats" in text
+    assert text.count("timesfm2_forecast, llm_reasoning_forecast") == 2
+    assert "recommended_slot_local_path_tools=timesfm2_forecast -> llm_reasoning_forecast" in text
+
+
+def test_build_subagent_slot_section_surfaces_slot_local_classification_paths():
+    text = ExecutorAgent._build_subagent_slot_section(
+        [
+            {
+                "slot_id": 7,
+                "visible_candidates": ["detect_trend", "llm_reasoning_classification"],
+            },
+            {
+                "slot_id": 1,
+                "visible_candidates": ["llm_reasoning_classification"],
+            },
+        ],
+        task_type="classification",
+    )
+
+    assert (
+        "slot_id=7: visible_tools=detect_trend, llm_reasoning_classification | "
+        "recommended_slot_local_path_tools=detect_trend -> llm_reasoning_classification; "
+        "llm_reasoning_classification"
+    ) in text
+    assert (
+        "slot_id=1: visible_tools=llm_reasoning_classification | "
+        "recommended_slot_local_path_tools=llm_reasoning_classification"
+    ) in text
+
+
+def test_extract_train_path_priors_reads_only_explicit_path_fields():
+    raw = (
+        "## MEMORY — Learned Insights\n\n"
+        "### weather_aligned_long_trend_past Specific\n"
+        "- Rule: Treat each 24 hourly readings as one day. | When: hourly weather trend classification | Prefer Path: segment -> llm_reasoning_classification || resample -> llm_reasoning_classification | Prefer: segment | Avoid: detect_trend | Why: day-level aggregation matters. | Evidence: 7 note(s)\n"
+        "- Rule: Single-tool warning should stay a normal memory rule. | When: noisy trend input | Prefer: detect_trend | Evidence: 4 note(s)\n"
+    )
+
+    priors = ExecutorAgent._extract_train_path_priors(raw)
+
+    assert priors == [
+        {
+            "path": ["segment", "llm_reasoning_classification"],
+            "support": 7,
+            "summary": "Treat each 24 hourly readings as one day.",
+        },
+        {
+            "path": ["resample", "llm_reasoning_classification"],
+            "support": 7,
+            "summary": "Treat each 24 hourly readings as one day.",
+        },
+    ]
+
+
+def test_strip_train_path_priors_from_memory_keeps_single_tool_rules():
+    raw = (
+        "## MEMORY — Learned Insights\n\n"
+        "### weather_aligned_long_trend_past Specific\n"
+        "- Rule: Treat each 24 hourly readings as one day. | When: hourly weather trend classification | Prefer Path: segment -> llm_reasoning_classification | Avoid Path: detect_trend -> llm_reasoning_classification | Prefer: segment | Avoid: resample | Why: day-level aggregation matters. | Evidence: 7 note(s)\n"
+        "- Rule: Return exactly one label from increasing, decreasing, or stable. | When: trend classification prompt | Why: output contract is strict. | Evidence: 10 note(s)\n"
+    )
+
+    stripped = ExecutorAgent._strip_train_path_priors_from_memory(raw)
+
+    assert "Prefer Path:" not in stripped
+    assert "Avoid Path:" not in stripped
+    assert "Prefer: segment" in stripped
+    assert "Avoid: resample" in stripped
+    assert "Rule: Treat each 24 hourly readings as one day." in stripped
+    assert "Why: day-level aggregation matters." in stripped
+    assert "Return exactly one label from increasing, decreasing, or stable." in stripped
+
+
+def test_select_train_spawn_prior_picks_compatible_supported_path():
+    selected = ExecutorAgent._select_train_spawn_prior(
+        path_priors=[
+            {"path": ["segment", "llm_reasoning_classification"], "support": 7},
+            {"path": ["detect_trend"], "support": 9},
+            {"path": ["resample", "llm_reasoning_classification"], "support": 3},
+        ],
+        subagent_slots=[
+            {"slot_id": 0, "visible_candidates": ["detect_trend", "llm_reasoning_classification"]},
+            {"slot_id": 1, "visible_candidates": ["segment", "llm_reasoning_classification"]},
+        ],
+        task_type="classification",
+    )
+
+    assert selected == ["detect_trend"]
+
+
+def test_validate_first_spawn_prior_mix_requires_guided_and_alternative():
+    prior = ["segment", "llm_reasoning_classification"]
+
+    missing_guided = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["detect_trend"]},
+            {"tools_hint": ["ets_forecast"]},
+        ],
+        prior_path=prior,
+    )
+    missing_alternative = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["segment", "llm_reasoning_classification"]},
+            {"tools_hint": ["segment", "window_stats"]},
+        ],
+        prior_path=prior,
+    )
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["segment", "llm_reasoning_classification"]},
+            {"tools_hint": ["detect_trend"]},
+        ],
+        prior_path=prior,
+    )
+
+    assert "guided by the historical preferred branch family" in missing_guided
+    assert "distinct alternative branch" in missing_alternative
+    assert ok is None
+
+
+def test_validate_first_spawn_prior_mix_accepts_matching_prior_family_anchor():
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["segment", "llm_reasoning_classification"]},
+            {"tools_hint": ["prophet_forecast", "llm_reasoning_classification"]},
+        ],
+        prior_path=["segment", "llm_reasoning_classification"],
+    )
+
+    assert ok is None
+
+
+def test_validate_first_spawn_prior_mix_accepts_anchor_only_hint_for_anchored_workflow():
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["chronos2_forecast"]},
+            {"tools_hint": ["llm_reasoning_indicator"]},
+        ],
+        prior_path=["arima_forecast", "chronos2_forecast", "llm_reasoning_indicator"],
+    )
+
+    assert ok is None
+
+
+def test_validate_first_spawn_prior_mix_accepts_preferred_tool_family_anchor():
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["chronos2_forecast"]},
+            {"tools_hint": ["llm_reasoning_forecast"]},
+        ],
+        prior_path=["timesfm2_forecast", "chronos2_forecast"],
+    )
+
+    assert ok is None
+
+
+def test_validate_first_spawn_prior_mix_treats_helper_tool_as_non_guided_alternative():
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["chronos2_forecast"]},
+            {"tools_hint": ["window_stats"]},
+        ],
+        prior_path=["chronos2_forecast", "ets_forecast", "window_stats"],
+    )
+
+    assert ok is None
+
+
+def test_validate_first_spawn_prior_mix_accepts_validation_family_anywhere_in_branch():
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["llm_reasoning_indicator", "bound_check"]},
+            {"tools_hint": ["arima_forecast", "llm_reasoning_indicator"]},
+        ],
+        prior_path=["consistency_check", "bound_check"],
+    )
+
+    assert ok is None
+
+
+def test_validate_first_spawn_prior_mix_accepts_guided_superset_branch():
+    prior = ["consistency_check"]
+
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["chronos2_forecast", "consistency_check", "llm_reasoning_classification"]},
+            {"tools_hint": ["llm_reasoning_classification"]},
+        ],
+        prior_path=prior,
+    )
+
+    assert ok is None
+
+
+def test_validate_first_spawn_prior_mix_treats_shared_anchor_as_guided_not_alternative():
+    msg = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {"tools_hint": ["slice", "llm_reasoning_qa"]},
+            {"tools_hint": ["slice", "value_at", "window_stats"]},
+        ],
+        prior_path=["slice", "llm_reasoning_qa"],
+    )
+
+    assert "distinct alternative branch" in msg
+
+
+def test_validate_first_spawn_prior_mix_accepts_string_tools_hint_and_alternative():
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {
+                "tools_hint": "llm_reasoning_classification",
+                "branch_metadata": {
+                    "uses_prior": True,
+                    "anchor_tool": "llm_reasoning_classification",
+                },
+            },
+            {
+                "tools_hint": "ets_forecast, window_stats, llm_reasoning_classification",
+                "branch_metadata": {
+                    "uses_prior": False,
+                    "anchor_tool": "ets_forecast",
+                },
+            },
+        ],
+        prior_path=["llm_reasoning_classification"],
+    )
+
+    assert ok is None
+
+
+def test_validate_first_spawn_prior_mix_prefers_branch_metadata_tools_hint_for_direct_prior_family():
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {
+                "tools_hint": ["slice", "llm_reasoning_correlation"],
+                "branch_metadata": {
+                    "tools_hint": ["llm_reasoning_correlation"],
+                },
+            },
+            {
+                "tools_hint": ["summarize", "llm_reasoning_correlation"],
+                "branch_metadata": {
+                    "tools_hint": ["summarize", "llm_reasoning_correlation"],
+                },
+            },
+        ],
+        prior_path=["llm_reasoning_correlation"],
+    )
+
+    assert ok is None
+
+
+def test_validate_first_spawn_prior_mix_accepts_branch_metadata_anchor_for_slot_local_path():
+    ok = ExecutorAgent._validate_first_spawn_prior_mix(
+        [
+            {
+                "tools_hint": ["segment", "llm_reasoning_classification"],
+                "branch_metadata": {
+                    "anchor": "chronos2_forecast",
+                },
+            },
+            {
+                "tools_hint": ["detect_trend", "llm_reasoning_classification"],
+            },
+        ],
+        prior_path=["chronos2_forecast", "aurora_forecast"],
+    )
+
+    assert ok is None
+
+
+def test_task_uses_prior_path_parses_string_tools_hint():
+    assert ExecutorAgent._task_uses_prior_path(
+        {"tools_hint": "segment, llm_reasoning_classification"},
+        ["segment", "llm_reasoning_classification"],
+    ) is True
+    assert ExecutorAgent._task_uses_prior_path(
+        {"tools_hint": "chronos2_forecast"},
+        ["timesfm2_forecast", "chronos2_forecast"],
+    ) is True
+    assert ExecutorAgent._task_uses_prior_path(
+        {"tools_hint": "llm_reasoning_indicator, bound_check"},
+        ["consistency_check", "bound_check"],
+    ) is True
+    assert ExecutorAgent._task_uses_prior_path(
+        {"tools_hint": "llm_reasoning_indicator"},
+        ["llm_reasoning_indicator"],
+    ) is True
+    assert ExecutorAgent._task_uses_prior_path(
+        {"tools_hint": "arima_forecast, llm_reasoning_indicator"},
+        ["llm_reasoning_indicator"],
+    ) is False
+    assert ExecutorAgent._task_uses_prior_path(
+        {"tools_hint": "slice, value_at, window_stats"},
+        ["slice", "llm_reasoning_qa"],
+    ) is False
+    assert ExecutorAgent._task_uses_prior_path(
+        {"tools_hint": "basic_stats, llm_reasoning_classification"},
+        ["segment", "llm_reasoning_classification"],
+    ) is False
+
+
+def test_prior_anchor_tool_prefers_non_llm_tool():
+    assert ExecutorAgent._prior_anchor_tool(
+        ["llm_reasoning_indicator", "consistency_check"]
+    ) == "consistency_check"
+    assert ExecutorAgent._prior_anchor_tool(
+        ["segment", "llm_reasoning_classification"]
+    ) == "segment"
+    assert ExecutorAgent._prior_anchor_tool(
+        ["timesfm2_forecast", "chronos2_forecast"]
+    ) == "timesfm2_forecast"
+
+
+def test_derive_tools_hint_from_slot_rejects_incompatible_explicit_hint():
+    derived = ExecutorAgent._derive_tools_hint_from_slot(
+        "chronos2_forecast",
+        slot_spec={
+            "slot_id": 2,
+            "visible_candidates": ["timesfm2_forecast", "llm_reasoning_forecast"],
+        },
+        task_type="forecast",
+    )
+
+    assert derived == []
+
+
+def test_derive_tools_hint_from_slot_generates_distinct_paths_for_same_visible_tools():
+    slot_spec = {
+        "slot_id": 2,
+        "visible_candidates": ["timesfm2_forecast", "llm_reasoning_forecast"],
+    }
+
+    first = ExecutorAgent._derive_tools_hint_from_slot(
+        "",
+        slot_spec=slot_spec,
+        task_type="forecast",
+        used_signatures=set(),
+    )
+    second = ExecutorAgent._derive_tools_hint_from_slot(
+        "",
+        slot_spec=slot_spec,
+        task_type="forecast",
+        used_signatures={tuple(first)},
+    )
+
+    assert first == ["timesfm2_forecast"]
+    assert second == ["llm_reasoning_forecast"]
+
+
+def test_normalize_spawn_tasks_rejects_task_mismatched_reasoning_hint():
+    normalized, error = ExecutorAgent._normalize_spawn_tasks(
+        [
+            {
+                "slot_id": 0,
+                "task": "classify with qa",
+                "tools_hint": "llm_reasoning_qa",
+            }
+        ],
+        plan={
+            "task_type": "classification",
+            "subagent_slots": [
+                {
+                    "slot_id": 0,
+                    "visible_candidates": ["llm_reasoning_qa", "llm_reasoning_classification"],
+                }
+            ],
+        },
+    )
+
+    assert normalized == []
+    assert "task-mismatched reasoning tool" in error
+    assert "llm_reasoning_classification" in error
+
+
+def test_normalize_spawn_tasks_rejects_classification_reasoning_for_qa_branch():
+    normalized, error = ExecutorAgent._normalize_spawn_tasks(
+        [
+            {
+                "slot_id": 0,
+                "task": "answer the mcqa",
+                "tools_hint": "llm_reasoning_classification",
+            }
+        ],
+        plan={
+            "task_type": "qa",
+            "subagent_slots": [
+                {
+                    "slot_id": 0,
+                    "visible_candidates": ["llm_reasoning_classification", "llm_reasoning_qa"],
+                }
+            ],
+        },
+    )
+
+    assert normalized == []
+    assert "task-mismatched reasoning tool" in error
+    assert "llm_reasoning_qa" in error
+
+
+def test_derive_tools_hint_from_slot_avoids_fragile_singleton_tools():
+    slot_spec = {
+        "slot_id": 2,
+        "visible_candidates": ["window_stats", "slice", "llm_reasoning_forecast"],
+    }
+
+    first = ExecutorAgent._derive_tools_hint_from_slot(
+        "",
+        slot_spec=slot_spec,
+        task_type="forecast",
+        used_signatures=set(),
+    )
+    second = ExecutorAgent._derive_tools_hint_from_slot(
+        "",
+        slot_spec=slot_spec,
+        task_type="forecast",
+        used_signatures={tuple(first)},
+    )
+
+    assert first == ["slice"]
+    assert second == ["llm_reasoning_forecast"]
+
+
+@pytest.mark.asyncio
+async def test_executor_terminal_path_review_can_wrap_earlier_bare_payload(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        async def complete(self, *_args, **_kwargs):
+            return _Resp(
+                {
+                    "done": True,
+                    "thought": "Reason: an earlier reply already contained the valid MACD payload. Action: resend that same payload inside the final envelope.",
+                    "answer": {"macd": [0.1, 0.2, 0.3]},
+                    "answer_type": "indicator",
+                    "confidence": 0.9,
+                    "reasoning": "1. An earlier reply already contained the valid MACD payload.\n2. After budget exhaustion, I reviewed the prior path and wrapped that same payload in the required final envelope.",
+                }
+            )
+
+    executor = ExecutorAgent(llm=_LLM())
+    decision = await executor._request_terminal_path_review(
+        conversation=[
+            {"role": "assistant", "content": '{"macd": [0.1, 0.2, 0.3]}'},
+            {"role": "user", "content": "tool observation"},
+        ],
+        expected_type="indicator",
+        trace_phase="test_terminal_review",
+    )
+
+    assert decision["done"] is True
+    assert decision["answer"] == {"macd": [0.1, 0.2, 0.3]}
+    assert decision["answer_type"] == "indicator"
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_does_not_fallback_from_raw_tool_output_without_finish_attempt(monkeypatch):
+    class _DummyLLM:
+        async def complete(self, *_args, **_kwargs):
+            raise AssertionError("LLM.complete should not be called directly in this test")
+
+    executor = ExecutorAgent(llm=_DummyLLM())
+    decision_calls = 0
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(*_args, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return (
+                _decision_response(
+                    {
+                        "thought": "Reason: call the classification tool. Action: run it now.",
+                        "done": False,
+                        "tool": "llm_reasoning_classification",
+                        "args": {},
+                    }
+                ),
+                {
+                    "thought": "Reason: call the classification tool. Action: run it now.",
+                    "done": False,
+                    "tool": "llm_reasoning_classification",
+                    "args": {},
+                },
+            )
+        return (
+            _decision_response(
+                {
+                    "thought": "Reason: do not finish yet. Action: malformed non-terminal reply.",
+                    "done": False,
+                }
+            ),
+            {
+                "thought": "Reason: do not finish yet. Action: malformed non-terminal reply.",
+                "done": False,
+                "_parse_failed": True,
+            },
+        )
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": "Reason: terminal review still failed. Action: invalid finish.",
+            "done": True,
+            "answer": None,
+            "answer_type": "classification",
+            "confidence": 0.1,
+            "reasoning": "1. invalid",
+        }
+
+    async def _fake_execute_tool(tool_name, tool_args, data, text_data, images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor_module, "MAX_SUB_REACT_STEPS", 2)
+
+    with pytest.raises((MaxStepsExhaustedError, DecisionOutputExhaustedError)):
+        await executor._run_sub_executor(
+            idx=0,
+            task_description="Return the trend label.",
+            tools_hint="llm_reasoning_classification",
+            branch_metadata={"path": "direct_classification"},
+            plan={
+                "task_type": "classification",
+                "task_description": "Classify the next trend.",
+                "fingerprint": {},
+                "profiling_section": "",
+                "system_memory": "",
+                "modality_hint": "",
+                "skills_section": "",
+                "tool_notes": {},
+                "domain": "weather",
+                "candidates": ["llm_reasoning_classification"],
+                "_mode": "train",
+            },
+            envelope=TaskEnvelope(
+                task=TaskSpec(
+                    task_id="subexecutor-auto-finish",
+                    task_type="classification",
+                    description="dummy",
+                ),
+                environment=EnvironmentSnapshot(
+                    data=[1.0, 2.0, 3.0],
+                    text_data=[],
+                    images=[],
+                ),
+                trace_id="test-subexecutor-auto-finish",
+            ),
+            slot_id=0,
+            slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+        )
+
+    assert decision_calls > executor_module.MAX_SUB_REACT_STEPS
+    assert terminal_review_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_same_step_parse_retry_does_not_consume_budget(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+
+    async def _fake_request_structured_decision(*_args, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            decision = {
+                "thought": _structured_thought(
+                    "call the classification tool.",
+                    "run it now.",
+                ),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+            return _decision_response(decision), decision
+        if decision_calls == 2:
+            decision = {
+                "thought": "bad",
+                "done": False,
+                "_parse_failed": True,
+            }
+            return _decision_response(decision), decision
+        decision = {
+            "thought": _structured_thought(
+                "reuse the existing label.",
+                "finish now.",
+            ),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.84,
+            "reasoning": "1. `llm_reasoning_classification` produced `stable`, so the branch keeps that label.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` produced `stable`."],
+                "evidence_summary": "The only branch answer was `stable`.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+        return _decision_response(decision), decision
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor_module, "MAX_SUB_REACT_STEPS", 2)
+
+    result = await executor._run_sub_executor(
+        idx=0,
+        task_description="Return the trend label.",
+        tools_hint="llm_reasoning_classification",
+        branch_metadata={"path": "direct_classification"},
+        plan={
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "fingerprint": {},
+            "profiling_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "skills_section": "",
+            "tool_notes": {},
+            "domain": "weather",
+            "candidates": ["llm_reasoning_classification"],
+            "_mode": "test",
+        },
+        envelope=TaskEnvelope(
+            task=TaskSpec(
+                task_id="subexecutor-same-step-parse-retry",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(
+                data=[1.0, 2.0, 3.0],
+                text_data=[],
+                images=[],
+            ),
+            trace_id="test-subexecutor-same-step-parse-retry",
+        ),
+        slot_id=0,
+        slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+    )
+
+    assert result["answer"] == "stable"
+    assert decision_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_repair_delivery_turn_disables_tools_and_falls_back(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+    allow_tool_call_flags = []
+    finish_only_prompts = []
+    execute_calls = 0
+
+    async def _fake_request_structured_decision(conversation, **kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        allow_tool_call_flags.append(bool(kwargs.get("allow_tool_call")))
+        if not kwargs.get("allow_tool_call"):
+            finish_only_prompts.append(
+                "\n".join(msg["content"] for msg in conversation if msg["role"] == "user")
+            )
+        if decision_calls == 1:
+            decision = {
+                "thought": _structured_thought(
+                    "need one real classification result.",
+                    "call the classification tool.",
+                ),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+            return _decision_response(decision), decision
+        if decision_calls == 2:
+            decision = {
+                "thought": _structured_thought(
+                    "the branch already has a supported label.",
+                    "finish with that label.",
+                ),
+                "done": True,
+                "answer": "stable",
+                "answer_type": "classification",
+                "confidence": 0.91,
+                "reasoning": "1. Stable was selected from the branch evidence.",
+            }
+            return _decision_response(decision), decision
+        decision = {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+        return _decision_response(decision), decision
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": _structured_thought(
+                "terminal review still failed.",
+                "invalid finish.",
+            ),
+            "done": True,
+            "answer": None,
+            "answer_type": "classification",
+            "confidence": 0.1,
+            "reasoning": "1. invalid",
+        }
+
+    async def _fake_execute_tool(tool_name, tool_args, data, text_data, images):
+        nonlocal execute_calls
+        execute_calls += 1
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    
+    async def _verdict(reasoning, _log):
+        return {
+            "passed": "llm_reasoning_classification" in str(reasoning),
+            "missing": [] if "llm_reasoning_classification" in str(reasoning) else ["explicit_names"],
+            "explanation": "mock verdict",
+        }
+
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_SUB_REACT_STEPS", 3)
+
+    result = await executor._run_sub_executor(
+        idx=0,
+        task_description="Return the trend label.",
+        tools_hint="llm_reasoning_classification",
+        branch_metadata={"path": "direct_classification"},
+        plan={
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "fingerprint": {},
+            "profiling_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "skills_section": "",
+            "tool_notes": {},
+            "domain": "weather",
+            "candidates": ["llm_reasoning_classification"],
+            "_mode": "train",
+        },
+        envelope=TaskEnvelope(
+            task=TaskSpec(
+                task_id="subexecutor-repair-delivery",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(
+                data=[1.0, 2.0, 3.0],
+                text_data=[],
+                images=[],
+            ),
+            trace_id="test-subexecutor-repair-delivery",
+        ),
+        slot_id=0,
+        slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+    )
+
+    assert result["answer"] == "stable"
+    assert result["answer_type"] == "classification"
+    assert execute_calls == 1
+    assert terminal_review_calls == 0
+    assert allow_tool_call_flags[:2] == [True, True]
+    assert all(flag is False for flag in allow_tool_call_flags[2:])
+    assert len(finish_only_prompts) >= 1
+    assert "Repair mode only: do not gather new evidence and do not introduce any new tool result." in finish_only_prompts[0]
+    assert "Return exactly one finish-action JSON object" in finish_only_prompts[0]
+    assert "normal decision parser" in finish_only_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_executor_terminal_repair_can_fallback_to_current_recoverable_payload(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(*_args, **_kwargs):
+        decision = {
+            "thought": _structured_thought(
+                "training already has enough branch evidence.",
+                "run GT evaluation now.",
+            ),
+            "done": False,
+            "tool": "evaluate_against_gt",
+            "args": {
+                "task_type": "correlation",
+                "prediction": "No Correlation",
+            },
+        }
+        return _decision_response(decision), decision
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": _structured_thought(
+                "terminal repair should reuse the evaluated path.",
+                "emit the final learning summary.",
+            ),
+            "done": True,
+            "answer": {
+                "insight": "The compared paths converged and the evaluated label was correct.",
+                "recommendation": "Keep the evaluated correlation path as the reusable default.",
+            },
+            "answer_type": "learning_summary",
+            "confidence": 0.91,
+            "reasoning": "1. evaluate_against_gt confirmed the predicted label matched the ground truth.\n2. The reusable summary should preserve that execution-side result.",
+            "execution_context": {
+                "tool_chain": ["evaluate_against_gt"],
+                "public_reasoning": [
+                    "evaluate_against_gt confirmed the predicted label matched the ground truth.",
+                ],
+                "evidence_summary": "The GT evaluation step confirmed the predicted correlation label was correct.",
+            },
+            "control_context": {"completion_notes": "repair payload"},
+        }
+
+    async def _fake_execute_tool(*_args, **_kwargs):
+        return ToolResult(
+            success=True,
+            data={
+                "metrics": {
+                    "accuracy": 1.0,
+                    "correct": True,
+                    "predicted_label": "No Correlation",
+                    "ground_truth_label": "No Correlation",
+                },
+                "ground_truth": "No Correlation",
+            },
+            error=None,
+            metadata={},
+        )
+
+    async def _failing_reusability_verdict(*_args, **_kwargs):
+        return {
+            "passed": False,
+            "execution_context_verdict": {
+                "passed": False,
+                "missing": ["decisive_evidence"],
+                "explanation": "mock execution-context rejection",
+            },
+            "reasoning_verdict": {
+                "passed": True,
+                "missing": [],
+                "explanation": "ok",
+            },
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_final_payload_reusability_verdict", _failing_reusability_verdict)
+    monkeypatch.setattr(executor, "_training_completion_contract_satisfied", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(executor, "_count_training_candidates", lambda *_args, **_kwargs: 3)
+    monkeypatch.setattr(executor, "_count_training_spawn_candidates", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(executor, "_has_training_evaluation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 1)
+
+    result = await executor.act(
+        {
+            "candidates": ["evaluate_against_gt"],
+            "task_type": "correlation",
+            "task_description": "test correlation task",
+            "tool_names": "evaluate_against_gt",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "fingerprint": {},
+            "horizon": None,
+            "domain": "finance",
+            "reanalysis_section": "",
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "_ground_truth": "No Correlation",
+            "indicator_output_keys": [],
+            "modality": "multimodal",
+        },
+        TaskEnvelope(
+            task=TaskSpec(task_id="test", task_type="correlation", description="test"),
+            environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries", "text"]),
+        ),
+    )
+
+    assert result["answer_type"] == "learning_summary"
+    assert result["answer"]["insight"].startswith("The compared paths converged")
+    assert result["control_context"]["completion_notes"] == "repair payload"
+    assert terminal_review_calls == executor_module.MAX_TERMINAL_REPAIR_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_dirty_execution_context_never_becomes_recoverable_final(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+    allow_tool_call_flags = []
+
+    async def _fake_request_structured_decision(_conversation, **kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        allow_tool_call_flags.append(bool(kwargs.get("allow_tool_call")))
+        if decision_calls == 1:
+            decision = {
+                "thought": _structured_thought(
+                    "need one real classification result.",
+                    "call the classification tool.",
+                ),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+            return _decision_response(decision), decision
+        if decision_calls == 2:
+            decision = {
+                "thought": _structured_thought(
+                    "the branch already has a supported label.",
+                    "finish with that label.",
+                ),
+                "done": True,
+                "answer": "stable",
+                "answer_type": "classification",
+                "confidence": 0.91,
+                "reasoning": "1. `llm_reasoning_classification` produced stable, so I finish with that label.",
+                "execution_context": {
+                    "tool_chain": ["llm_reasoning_classification"],
+                    "public_reasoning": ["The branch already contains a task-valid stable label."],
+                    "evidence_summary": "task-valid classification output already exists.",
+                },
+            }
+            return _decision_response(decision), decision
+        decision = {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+        return _decision_response(decision), decision
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": _structured_thought(
+                "terminal review still failed.",
+                "invalid finish.",
+            ),
+            "done": True,
+            "answer": None,
+            "answer_type": "classification",
+            "confidence": 0.1,
+            "reasoning": "1. invalid",
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    async def _failing_execution_context_verdict(execution_context, _log):
+        blob = json.dumps(execution_context, ensure_ascii=False)
+        passed = "task-valid" not in blob
+        return {
+            "passed": passed,
+            "missing": [] if passed else ["execution_only_language"],
+            "explanation": "mock execution-context verdict",
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _failing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_SUB_REACT_STEPS", 3)
+
+    result = await executor._run_sub_executor(
+        idx=0,
+        task_description="Return the trend label.",
+        tools_hint="llm_reasoning_classification",
+        branch_metadata={"path": "direct_classification"},
+        plan={
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "fingerprint": {},
+            "profiling_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "skills_section": "",
+            "tool_notes": {},
+            "domain": "weather",
+            "candidates": ["llm_reasoning_classification"],
+            "_mode": "train",
+        },
+        envelope=TaskEnvelope(
+            task=TaskSpec(
+                task_id="subexecutor-dirty-execution-context",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(
+                data=[1.0, 2.0, 3.0],
+                text_data=[],
+                images=[],
+            ),
+            trace_id="test-subexecutor-dirty-execution-context",
+        ),
+        slot_id=0,
+        slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+    )
+
+    assert result["answer"] == "stable"
+    assert terminal_review_calls == 0
+    assert allow_tool_call_flags == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_terminal_repair_can_fallback_to_current_recoverable_payload(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(*_args, **_kwargs):
+        decision = {
+            "thought": _structured_thought('get one real classification label first.', 'call the classification tool.'),
+            "done": False,
+            "tool": "llm_reasoning_classification",
+            "args": {},
+        }
+        return _decision_response(decision), decision
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": _structured_thought('terminal repair should preserve the branch label.', 'emit the final classification.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.87,
+            "reasoning": "1. llm_reasoning_classification produced the stable label.\n2. The final answer should reuse that branch result.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": [
+                    "llm_reasoning_classification produced the stable label from the branch evidence.",
+                ],
+                "evidence_summary": "The branch classification tool returned the final stable label.",
+            },
+            "control_context": {"completion_notes": "repair payload"},
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    async def _failing_reusability_verdict(*_args, **_kwargs):
+        return {
+            "passed": False,
+            "execution_context_verdict": {
+                "passed": False,
+                "missing": ["decisive_evidence"],
+                "explanation": "mock execution-context rejection",
+            },
+            "reasoning_verdict": {
+                "passed": True,
+                "missing": [],
+                "explanation": "ok",
+            },
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_final_payload_reusability_verdict", _failing_reusability_verdict)
+    monkeypatch.setattr(executor_module, "MAX_SUB_REACT_STEPS", 1)
+
+    result = await executor._run_sub_executor(
+        idx=0,
+        task_description="Return the trend label.",
+        tools_hint="llm_reasoning_classification",
+        branch_metadata={"path": "direct_classification"},
+        plan={
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "fingerprint": {},
+            "profiling_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "skills_section": "",
+            "tool_notes": {},
+            "domain": "weather",
+            "candidates": ["llm_reasoning_classification"],
+            "_mode": "train",
+        },
+        envelope=TaskEnvelope(
+            task=TaskSpec(
+                task_id="subexecutor-terminal-recoverable",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(
+                data=[1.0, 2.0, 3.0],
+                text_data=[],
+                images=[],
+            ),
+            trace_id="test-subexecutor-terminal-recoverable",
+        ),
+        slot_id=0,
+        slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+    )
+
+    assert result["answer"] == "stable"
+    assert result["answer_type"] == "classification"
+    assert result["execution_context"]["tool_chain"] == ["llm_reasoning_classification"]
+    assert terminal_review_calls == executor_module.MAX_TERMINAL_REPAIR_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_final_step_dirty_execution_context_is_rejected(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('need one real classification result.', 'call the classification tool.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": _structured_thought('the branch already has a supported label.', 'finish with that label.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.91,
+            "reasoning": "1. `llm_reasoning_classification` produced stable, so I finish with that label.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` returned the task-valid label `stable`."],
+                "evidence_summary": "The branch already contains a task-valid tool-produced label.",
+            },
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": _structured_thought('terminal review still failed.', 'invalid finish.'),
+            "done": True,
+            "answer": None,
+            "answer_type": "classification",
+            "confidence": 0.1,
+            "reasoning": "1. invalid",
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    async def _failing_execution_context_verdict(execution_context, _log):
+        blob = json.dumps(execution_context, ensure_ascii=False)
+        passed = "task-valid" not in blob
+        return {
+            "passed": passed,
+            "missing": [] if passed else ["execution_only_language"],
+            "explanation": "mock execution-context verdict",
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _failing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_SUB_REACT_STEPS", 2)
+
+    result = await executor._run_sub_executor(
+        idx=0,
+        task_description="Return the trend label.",
+        tools_hint="llm_reasoning_classification",
+        branch_metadata={"path": "direct_classification"},
+        plan={
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "fingerprint": {},
+            "profiling_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "skills_section": "",
+            "tool_notes": {},
+            "domain": "weather",
+            "candidates": ["llm_reasoning_classification"],
+            "_mode": "train",
+        },
+        envelope=TaskEnvelope(
+            task=TaskSpec(
+                task_id="subexecutor-final-step-dirty-execution-context",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(
+                data=[1.0, 2.0, 3.0],
+                text_data=[],
+                images=[],
+            ),
+            trace_id="test-subexecutor-final-step-dirty-execution-context",
+        ),
+        slot_id=0,
+        slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+    )
+
+    assert result["answer"] == "stable"
+    assert terminal_review_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_executor_repair_delivery_turn_disables_tools_and_falls_back(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+    allow_tool_call_flags = []
+    finish_only_prompts = []
+    execute_calls = 0
+
+    async def _fake_request_structured_decision(conversation, **kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        allow_tool_call_flags.append(bool(kwargs.get("allow_tool_call")))
+        if not kwargs.get("allow_tool_call"):
+            finish_only_prompts.append(
+                "\n".join(msg["content"] for msg in conversation if msg["role"] == "user")
+            )
+        if decision_calls == 1:
+            decision = {
+                "thought": _structured_thought(
+                    "a real classification output is needed.",
+                    "call the classification tool.",
+                ),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+            return _decision_response(decision), decision
+        if decision_calls == 2:
+            decision = {
+                "thought": _structured_thought(
+                    "the branch already has a supported label.",
+                    "finish with that label.",
+                ),
+                "done": True,
+                "answer": "stable",
+                "answer_type": "classification",
+                "confidence": 0.88,
+                "reasoning": "1. Stable was selected from the branch evidence.",
+            }
+            return _decision_response(decision), decision
+        decision = {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+        return _decision_response(decision), decision
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": _structured_thought(
+                "terminal review still failed.",
+                "invalid finish.",
+            ),
+            "done": True,
+            "answer": None,
+            "answer_type": "classification",
+            "confidence": 0.1,
+            "reasoning": "1. invalid",
+        }
+
+    async def _fake_execute_tool(tool_name, tool_args, data, text_data, images):
+        nonlocal execute_calls
+        execute_calls += 1
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    
+    async def _verdict(reasoning, _log):
+        return {
+            "passed": "llm_reasoning_classification" in str(reasoning),
+            "missing": [] if "llm_reasoning_classification" in str(reasoning) else ["explicit_names"],
+            "explanation": "mock verdict",
+        }
+
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 3)
+
+    result = await executor.act(
+        {
+            "candidates": ["llm_reasoning_classification"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "llm_reasoning_classification",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "test",
+            "_defer_learning_record": False,
+            "_ground_truth": None,
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(task_id="main-repair-delivery", task_type="classification", description="dummy"),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert result["answer"] == "stable"
+    assert result["answer_type"] == "classification"
+    assert execute_calls == 1
+    assert terminal_review_calls == 0
+    assert allow_tool_call_flags[:2] == [True, True]
+    assert all(flag is False for flag in allow_tool_call_flags[2:])
+    assert len(finish_only_prompts) >= 1
+    assert "Repair mode only: do not gather new evidence and do not introduce any new tool result." in finish_only_prompts[0]
+    assert "Return exactly one finish-action JSON object" in finish_only_prompts[0]
+    assert "normal decision parser" in finish_only_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_executor_dirty_execution_context_never_becomes_recoverable_final(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+    allow_tool_call_flags = []
+
+    async def _fake_request_structured_decision(_conversation, **kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        allow_tool_call_flags.append(bool(kwargs.get("allow_tool_call")))
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('a real classification output is needed.', 'call the classification tool.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        if decision_calls == 2:
+            return None, {
+                "thought": _structured_thought('the branch already has a supported label.', 'finish with that label.'),
+                "done": True,
+                "answer": "stable",
+                "answer_type": "classification",
+                "confidence": 0.88,
+                "reasoning": "1. `llm_reasoning_classification` produced stable, so I finish with that label.",
+                "execution_context": {
+                    "tool_chain": ["llm_reasoning_classification"],
+                    "public_reasoning": ["The branch already contains a task-valid stable label."],
+                    "evidence_summary": "task-valid classification output already exists.",
+                },
+            }
+        return None, {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": _structured_thought('terminal review still failed.', 'invalid finish.'),
+            "done": True,
+            "answer": None,
+            "answer_type": "classification",
+            "confidence": 0.1,
+            "reasoning": "1. invalid",
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    async def _failing_execution_context_verdict(execution_context, _log):
+        blob = json.dumps(execution_context, ensure_ascii=False)
+        passed = "task-valid" not in blob
+        return {
+            "passed": passed,
+            "missing": [] if passed else ["execution_only_language"],
+            "explanation": "mock execution-context verdict",
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _failing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 3)
+
+    result = await executor.act(
+        {
+            "candidates": ["llm_reasoning_classification"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "llm_reasoning_classification",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "test",
+            "_defer_learning_record": False,
+            "_ground_truth": None,
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(
+                task_id="main-dirty-execution-context",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert result["answer"] == "stable"
+    assert terminal_review_calls == 0
+    assert allow_tool_call_flags == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_executor_final_step_dirty_execution_context_is_rejected(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('a real classification output is needed.', 'call the classification tool.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": _structured_thought('the branch already has a supported label.', 'finish with that label.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.88,
+            "reasoning": "1. `llm_reasoning_classification` produced stable, so I finish with that label.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` returned the task-valid label `stable`."],
+                "evidence_summary": "The branch already contains a task-valid tool-produced label.",
+            },
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": _structured_thought('terminal review still failed.', 'invalid finish.'),
+            "done": True,
+            "answer": None,
+            "answer_type": "classification",
+            "confidence": 0.1,
+            "reasoning": "1. invalid",
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    async def _failing_execution_context_verdict(execution_context, _log):
+        blob = json.dumps(execution_context, ensure_ascii=False)
+        passed = "task-valid" not in blob
+        return {
+            "passed": passed,
+            "missing": [] if passed else ["execution_only_language"],
+            "explanation": "mock execution-context verdict",
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _failing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 2)
+
+    result = await executor.act(
+        {
+            "candidates": ["llm_reasoning_classification"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "llm_reasoning_classification",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "test",
+            "_defer_learning_record": False,
+            "_ground_truth": None,
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(
+                task_id="main-final-step-dirty-execution-context",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert result["answer"] == "stable"
+    assert terminal_review_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_executor_terminal_path_review_dirty_execution_context_is_rejected(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('need a real tool answer first.', 'call the classification tool.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        return {
+            "thought": "Reason: terminal review tries to finish with the existing label.",
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.88,
+            "reasoning": "1. `llm_reasoning_classification` returned the task-valid label `stable`.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` returned the task-valid label `stable`."],
+                "evidence_summary": "The only task-valid classification was `stable`.",
+            },
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    async def _failing_execution_context_verdict(execution_context, _log):
+        blob = json.dumps(execution_context, ensure_ascii=False)
+        passed = "task-valid" not in blob
+        return {
+            "passed": passed,
+            "missing": [] if passed else ["execution_only_language"],
+            "explanation": "mock execution-context verdict",
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _failing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 1)
+
+    result = await executor.act(
+        {
+            "candidates": ["llm_reasoning_classification"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "llm_reasoning_classification",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "test",
+            "_defer_learning_record": False,
+            "_ground_truth": None,
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(
+                task_id="main-terminal-dirty-execution-context",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert result["answer"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_executor_terminal_path_review_retries_after_reusability_rejection(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('get the label first.', 'call the classifier.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        if terminal_review_calls == 1:
+            return {
+                "thought": _structured_thought('return the existing label.', 'finish now.'),
+                "done": True,
+                "answer": "stable",
+                "answer_type": "classification",
+                "confidence": 0.88,
+                "reasoning": "1. `llm_reasoning_classification` returned the task-valid label `stable`.",
+                "execution_context": {
+                    "tool_chain": ["llm_reasoning_classification"],
+                    "public_reasoning": ["FORBIDDEN_MARKER: reuse controller wording instead of clean execution evidence."],
+                    "evidence_summary": "FORBIDDEN_MARKER should force one terminal-review retry.",
+                },
+                "control_context": {"completion_notes": ""},
+            }
+        return {
+            "thought": _structured_thought('return the existing label with clean evidence.', 'finish now.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.88,
+            "reasoning": "1. `llm_reasoning_classification` produced the label `stable`, so the branch keeps that exact tool answer.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` produced the label `stable` for the observed series."],
+                "evidence_summary": "The branch reuses the exact `llm_reasoning_classification` label `stable`.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    async def _execution_context_verdict(execution_context, _log):
+        blob = json.dumps(execution_context, ensure_ascii=False)
+        passed = "FORBIDDEN_MARKER" not in blob
+        return {
+            "passed": passed,
+            "missing": [] if passed else ["execution_only_language"],
+            "explanation": "mock execution-context verdict",
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 1)
+
+    result = await executor.act(
+        {
+            "candidates": ["llm_reasoning_classification"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "llm_reasoning_classification",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "test",
+            "_defer_learning_record": False,
+            "_ground_truth": None,
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(
+                task_id="main-terminal-repair-retry",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert result["answer"] == "stable"
+    assert terminal_review_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_executor_same_step_parse_retry_does_not_consume_main_budget(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            decision = {
+                "thought": _structured_thought('get the label first.', 'call the classifier.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+            return _decision_response(decision), decision
+        if decision_calls == 2:
+            decision = {
+                "thought": "bad",
+                "done": False,
+                "_parse_failed": True,
+            }
+            return _decision_response(decision), decision
+        decision = {
+            "thought": _structured_thought('the label is already available.', 'finish now.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.88,
+            "reasoning": "1. `llm_reasoning_classification` produced `stable`, so I reuse that label.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` produced `stable`."],
+                "evidence_summary": "The only classification result was `stable`.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+        return _decision_response(decision), decision
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 2)
+
+    result = await executor.act(
+        {
+            "candidates": ["llm_reasoning_classification"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "llm_reasoning_classification",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "test",
+            "_defer_learning_record": False,
+            "_ground_truth": None,
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(
+                task_id="main-parse-retry-same-step",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert result["answer"] == "stable"
+    assert decision_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_executor_same_step_invalid_spawn_retry_does_not_consume_main_budget(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    prepare_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            decision = {
+                "thought": _structured_thought('training needs spawned alternatives.', 'spawn one branch.'),
+                "done": False,
+                "tool": "spawn_subagent",
+                "args": {
+                    "tasks": [
+                        {"slot_id": 1, "task": "first branch"},
+                    ]
+                },
+            }
+            return _decision_response(decision), decision
+        if decision_calls == 2:
+            decision = {
+                "thought": _structured_thought('training still needs two distinct spawned branches.', 'spawn two branches now.'),
+                "done": False,
+                "tool": "spawn_subagent",
+                "args": {
+                    "tasks": [
+                        {"slot_id": 1, "task": "first branch"},
+                        {"slot_id": 2, "task": "second branch"},
+                    ]
+                },
+            }
+            return _decision_response(decision), decision
+        decision = {
+            "thought": _structured_thought('the training contract is now satisfied.', 'finish now.'),
+            "done": True,
+            "answer": {
+                "insight": "Two spawned candidates were explored and evaluated.",
+                "recommendation": "Finish once the spawned branches are in place.",
+            },
+            "answer_type": "learning_summary",
+            "confidence": 0.9,
+            "reasoning": "1. Two spawned branches are now available.\n2. The training summary can be finalized.",
+            "execution_context": {
+                "tool_chain": ["spawn_subagent"],
+                "public_reasoning": ["Two spawned candidates were explored."],
+                "evidence_summary": "The run explored two spawned candidates before finishing.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+        return _decision_response(decision), decision
+
+    async def _fake_spawn_subagents(_tool_args, _plan, _envelope):
+        return {
+            "n_tasks": 2,
+            "n_success": 2,
+            "results": [
+                {
+                    "sub_task": 0,
+                    "slot_id": 1,
+                    "success": True,
+                    "result": {
+                        "answer": "stable",
+                        "answer_type": "classification",
+                        "tool_chain": ["llm_reasoning_classification"],
+                        "execution_log": [
+                            {"tool": "llm_reasoning_classification", "success": True, "output": {"answer": "stable"}},
+                        ],
+                    },
+                },
+                {
+                    "sub_task": 1,
+                    "slot_id": 2,
+                    "success": True,
+                    "result": {
+                        "answer": "increasing",
+                        "answer_type": "classification",
+                        "tool_chain": ["segment", "llm_reasoning_classification"],
+                        "execution_log": [
+                            {"tool": "segment", "success": True, "output": {}},
+                            {"tool": "llm_reasoning_classification", "success": True, "output": {"answer": "increasing"}},
+                        ],
+                    },
+                },
+            ],
+            "observation": "spawn ok",
+        }
+
+    def _fake_prepare_main_spawn_subagent_tasks(**_kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if prepare_calls == 1:
+            return None, "invalid_subagent_slots", "Self-correction: choose two distinct slot_id values."
+        return [
+            {"slot_id": 1, "task": "first branch", "tools_hint": ["llm_reasoning_classification"]},
+            {"slot_id": 2, "task": "second branch", "tools_hint": ["segment", "llm_reasoning_classification"]},
+        ], "", ""
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_spawn_subagents", _fake_spawn_subagents)
+    monkeypatch.setattr(executor, "_prepare_main_spawn_subagent_tasks", _fake_prepare_main_spawn_subagent_tasks)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(
+        executor,
+        "_count_training_candidates",
+        lambda execution_log, **_kwargs: 2 if any(e.get("tool") == "spawn_subagent" for e in execution_log) else 0,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_count_training_spawn_candidates",
+        lambda execution_log, *_args, **_kwargs: 2 if any(e.get("tool") == "spawn_subagent" for e in execution_log) else 0,
+    )
+    monkeypatch.setattr(
+        executor,
+        "_has_training_evaluation",
+        lambda execution_log: any(e.get("tool") == "spawn_subagent" for e in execution_log),
+    )
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 2)
+
+    result = await executor.act(
+        {
+            "candidates": ["spawn_subagent"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "spawn_subagent",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [
+                {"slot_id": 1, "visible_candidates": ["llm_reasoning_classification"]},
+                {"slot_id": 2, "visible_candidates": ["segment", "llm_reasoning_classification"]},
+            ],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "train",
+            "_defer_learning_record": False,
+            "_ground_truth": "stable",
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(
+                task_id="main-invalid-spawn-retry",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert decision_calls == 3
+    assert prepare_calls == 2
+    assert result["answer"]["insight"] == "Two spawned candidates were explored and evaluated."
+
+
+@pytest.mark.asyncio
+async def test_executor_terminal_path_review_retries_after_invalid_terminal_delivery(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('get the label first.', 'call the classifier.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        if terminal_review_calls == 1:
+            return {
+                "thought": "Reason: finish with the label.",
+                "done": True,
+                "answer": None,
+                "answer_type": "classification",
+                "confidence": 0.88,
+            }
+        return {
+            "thought": _structured_thought('return the existing label with the required fields.', 'finish now.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.88,
+            "reasoning": "1. `llm_reasoning_classification` produced the label `stable`, so the path keeps that exact tool answer.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` produced the label `stable` for the observed series."],
+                "evidence_summary": "The path reuses the exact `llm_reasoning_classification` label `stable`.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 1)
+
+    result = await executor.act(
+        {
+            "candidates": ["llm_reasoning_classification"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "llm_reasoning_classification",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "test",
+            "_defer_learning_record": False,
+            "_ground_truth": None,
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(
+                task_id="main-terminal-repair-invalid-delivery",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert result["answer"] == "stable"
+    assert terminal_review_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_executor_terminal_path_review_rejects_changed_recoverable_answer(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('get the label first.', 'call the classifier.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        if terminal_review_calls == 1:
+            return {
+                "thought": "Reason: rewrite the label.",
+                "done": True,
+                "answer": "up",
+                "answer_type": "classification",
+                "confidence": 0.88,
+                "reasoning": "1. rewrite answer.",
+                "execution_context": {
+                    "tool_chain": ["llm_reasoning_classification"],
+                    "public_reasoning": ["`llm_reasoning_classification` produced `stable`."],
+                    "evidence_summary": "The observed path answer was stable.",
+                },
+                "control_context": {"completion_notes": ""},
+            }
+        return {
+            "thought": _structured_thought('keep the existing label.', 'finish now.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.88,
+            "reasoning": "1. `llm_reasoning_classification` produced the label `stable`, so the path keeps that exact tool answer.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` produced the label `stable` for the observed series."],
+                "evidence_summary": "The path reuses the exact `llm_reasoning_classification` label `stable`.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 1)
+
+    result = await executor.act(
+        {
+            "candidates": ["llm_reasoning_classification"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "llm_reasoning_classification",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "test",
+            "_defer_learning_record": False,
+            "_ground_truth": None,
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(
+                task_id="main-terminal-repair-preserve-answer",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert result["answer"] == "stable"
+    assert terminal_review_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_executor_recovers_task_answer_from_execution_log_after_terminal_repair_failure(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        return None, {
+            "thought": _structured_thought('get the label first.', 'call the classifier.'),
+            "done": False,
+            "tool": "llm_reasoning_classification",
+            "args": {},
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        return {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor_module, "MAX_REACT_STEPS", 1)
+
+    result = await executor.act(
+        {
+            "candidates": ["llm_reasoning_classification"],
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "tool_names": "llm_reasoning_classification",
+            "tool_notes_section": "",
+            "skills_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "profiling_section": "",
+            "subagent_slot_section": "",
+            "subagent_slots": [],
+            "fingerprint": {"missing_ratio": 0.0},
+            "horizon": None,
+            "domain": "weather",
+            "reanalysis_section": "",
+            "_mode": "test",
+            "_defer_learning_record": False,
+            "_ground_truth": None,
+            "indicator_output_keys": [],
+            "modality": "timeseries",
+        },
+        TaskEnvelope(
+            task=TaskSpec(
+                task_id="main-terminal-recovery-from-execution-log",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(data=[1.0, 2.0, 3.0], modalities=["timeseries"]),
+        ),
+    )
+
+    assert result["answer"] == "stable"
+    assert result["answer_type"] == "classification"
+    assert terminal_review_calls == executor_module.MAX_TERMINAL_REPAIR_ATTEMPTS
+
+
+def test_recoverable_learning_summary_record_from_execution_log_uses_evaluated_candidates():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "success": True,
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 0,
+                        "answer": [1.0, 1.1, 1.2],
+                        "answer_type": "forecast",
+                        "confidence": 0.81,
+                        "reasoning": (
+                            "1. `chronos2_forecast` extended the cooling pattern.\n"
+                            "2. The forecast stayed smooth without abrupt reversals."
+                        ),
+                        "execution_context": {
+                            "tool_chain": ["chronos2_forecast"],
+                            "public_reasoning": [
+                                "`chronos2_forecast` extended the recent cooling pattern.",
+                            ],
+                            "evidence_summary": "The path projected a smooth continuation of the cooling trend.",
+                        },
+                        "execution_log": [
+                            {
+                                "tool": "chronos2_forecast",
+                                "success": True,
+                                "output": {"forecast": [1.0, 1.1, 1.2]},
+                                "observation": {"forecast": [1.0, 1.1, 1.2]},
+                            }
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 1,
+                        "answer": [2.0, 2.2, 2.4],
+                        "answer_type": "forecast",
+                        "confidence": 0.72,
+                        "reasoning": (
+                            "1. `sundial_base_128m_forecast` projected a warmer rebound.\n"
+                            "2. The rebound was stronger than the recent history suggested."
+                        ),
+                        "execution_context": {
+                            "tool_chain": ["sundial_base_128m_forecast"],
+                            "public_reasoning": [
+                                "`sundial_base_128m_forecast` projected a stronger rebound.",
+                            ],
+                            "evidence_summary": "The path leaned on a warmer rebound scenario.",
+                        },
+                        "execution_log": [
+                            {
+                                "tool": "sundial_base_128m_forecast",
+                                "success": True,
+                                "output": {"forecast": [2.0, 2.2, 2.4]},
+                                "observation": {"forecast": [2.0, 2.2, 2.4]},
+                            }
+                        ],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "success": True,
+            "observation": {
+                "results": [
+                    {
+                        "name": "slot_0",
+                        "prediction": [1.0, 1.1, 1.2],
+                        "metrics": {"mae": 0.4, "rmse": 0.5},
+                    },
+                    {
+                        "name": "slot_1",
+                        "prediction": [2.0, 2.2, 2.4],
+                        "metrics": {"mae": 1.4, "rmse": 1.7},
+                    },
+                ]
+            },
+        },
+    ]
+
+    record = ExecutorAgent._recoverable_learning_summary_record_from_execution_log(
+        execution_log=execution_log,
+        task_type="forecast",
+        horizon=None,
+        indicator_output_keys=[],
+    )
+
+    assert record is not None
+    assert record["answer_type"] == "learning_summary"
+    assert record["answer"]["winner_candidate"] == "chronos2_forecast"
+    assert record["answer"]["winner_tool_chain"] == ["chronos2_forecast"]
+    assert record["answer"]["winner_metrics"]["mae"] == 0.4
+    assert "chronos2_forecast" in record["answer"]["insight"]
+
+
+def test_recoverable_learning_summary_record_uses_branch_anchored_path_identity_for_same_path_candidates():
+    execution_log = [
+        {
+            "tool": "spawn_subagent",
+            "success": True,
+            "output": [
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 1,
+                        "answer": "stable",
+                        "answer_type": "classification",
+                        "confidence": 0.81,
+                        "reasoning": "1. `llm_reasoning_classification` produced `stable`.",
+                        "execution_context": {
+                            "tool_chain": ["llm_reasoning_classification"],
+                            "public_reasoning": [
+                                "`llm_reasoning_classification` produced `stable`."
+                            ],
+                            "evidence_summary": "The branch stayed flat.",
+                        },
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "success": True,
+                                "observation": {"answer": "stable"},
+                            }
+                        ],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "slot_id": 3,
+                        "answer": "increasing",
+                        "answer_type": "classification",
+                        "confidence": 0.72,
+                        "reasoning": "1. `llm_reasoning_classification` produced `increasing`.",
+                        "execution_context": {
+                            "tool_chain": ["llm_reasoning_classification"],
+                            "public_reasoning": [
+                                "`llm_reasoning_classification` produced `increasing`."
+                            ],
+                            "evidence_summary": "The branch leaned upward.",
+                        },
+                        "execution_log": [
+                            {
+                                "tool": "llm_reasoning_classification",
+                                "success": True,
+                                "observation": {"answer": "increasing"},
+                            }
+                        ],
+                    },
+                },
+            ],
+        },
+        {
+            "tool": "evaluate_batch_against_gt",
+            "success": True,
+            "observation": {
+                "results": [
+                    {
+                        "name": "slot_1",
+                        "prediction": "stable",
+                        "metrics": {"accuracy": 0.0, "correct": False},
+                    },
+                    {
+                        "name": "slot_3",
+                        "prediction": "increasing",
+                        "metrics": {"accuracy": 1.0, "correct": True},
+                    },
+                ]
+            },
+        },
+    ]
+
+    record = ExecutorAgent._recoverable_learning_summary_record_from_execution_log(
+        execution_log=execution_log,
+        task_type="classification",
+        horizon=None,
+        indicator_output_keys=[],
+    )
+
+    assert record is not None
+    assert record["answer"]["winner_candidate"] == "slot_3 :: llm_reasoning_classification"
+    assert {item["name"] for item in record["answer"]["compared_candidates"]} == {
+        "slot_1 :: llm_reasoning_classification",
+        "slot_3 :: llm_reasoning_classification",
+    }
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_rejected_redundant_tool_does_not_pollute_tool_chain(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+
+    async def _fake_request_structured_decision(*_args, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls in {1, 2}:
+            return None, {
+                "thought": _structured_thought('call the classification tool.', 'classify now.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": _structured_thought('the existing tool answer is enough.', 'finish now.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.8,
+            "reasoning": "1. `llm_reasoning_classification` produced stable, so I finish with that label.",
+        }
+
+    async def _fake_execute_tool(_tool_name, _tool_args, _data, _text_data, _images):
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    def _fake_redundancy_status(**kwargs):
+        execution_log = kwargs.get("execution_log") or []
+        if len(execution_log) >= 2:
+            return {"redundant": True, "repeat_count": 2, "answer_preview": "stable"}
+        return {"redundant": False, "repeat_count": 1, "answer_preview": "stable"}
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_latest_redundancy_status", _fake_redundancy_status)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: False)
+
+    result = await executor._run_sub_executor(
+        idx=0,
+        task_description="Return the trend label.",
+        tools_hint="llm_reasoning_classification",
+        branch_metadata={"path": "direct_classification"},
+        plan={
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "fingerprint": {},
+            "profiling_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "skills_section": "",
+            "tool_notes": {},
+            "domain": "weather",
+            "candidates": ["llm_reasoning_classification"],
+            "_mode": "train",
+        },
+        envelope=TaskEnvelope(
+            task=TaskSpec(
+                task_id="subexecutor-no-pollution",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(
+                data=[1.0, 2.0, 3.0],
+                text_data=[],
+                images=[],
+            ),
+            trace_id="test-subexecutor-no-pollution",
+        ),
+        slot_id=0,
+        slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+    )
+
+    assert result["answer"] == "stable"
+    assert result["tool_chain"] == ["llm_reasoning_classification"]
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_terminal_path_review_dirty_execution_context_is_rejected(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('need the classification label first.', 'call the classification tool.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        return {
+            "thought": "Reason: terminal review tries to finish with the existing label.",
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.88,
+            "reasoning": "1. `llm_reasoning_classification` returned the task-valid label `stable`.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` returned the task-valid label `stable`."],
+                "evidence_summary": "The only task-valid classification was `stable`.",
+            },
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    async def _failing_execution_context_verdict(execution_context, _log):
+        blob = json.dumps(execution_context, ensure_ascii=False)
+        passed = "task-valid" not in blob
+        return {
+            "passed": passed,
+            "missing": [] if passed else ["execution_only_language"],
+            "explanation": "mock execution-context verdict",
+        }
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _failing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_SUB_REACT_STEPS", 1)
+
+    result = await executor._run_sub_executor(
+        idx=0,
+        task_description="Return the trend label.",
+        tools_hint="llm_reasoning_classification",
+        branch_metadata={"path": "direct_classification"},
+        plan={
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "fingerprint": {},
+            "profiling_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "skills_section": "",
+            "tool_notes": {},
+            "domain": "weather",
+            "candidates": ["llm_reasoning_classification"],
+            "_mode": "train",
+        },
+        envelope=TaskEnvelope(
+            task=TaskSpec(
+                task_id="subexecutor-terminal-dirty-execution-context",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(
+                data=[1.0, 2.0, 3.0],
+                text_data=[],
+                images=[],
+            ),
+            trace_id="test-subexecutor-terminal-dirty-execution-context",
+        ),
+        slot_id=0,
+        slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+    )
+
+    assert result["answer"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_terminal_path_review_retries_after_invalid_terminal_delivery(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('need the classification label first.', 'call the classification tool.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        if terminal_review_calls == 1:
+            return {
+                "thought": "Reason: finish with the existing label.",
+                "done": True,
+                "answer": None,
+                "answer_type": "classification",
+                "confidence": 0.88,
+            }
+        return {
+            "thought": _structured_thought('return the existing label with the required fields.', 'finish now.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.88,
+            "reasoning": "1. `llm_reasoning_classification` produced the label `stable`, so this branch keeps that exact tool answer.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` produced the label `stable` for this branch."],
+                "evidence_summary": "The branch reuses the exact `llm_reasoning_classification` label `stable`.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_SUB_REACT_STEPS", 1)
+
+    result = await executor._run_sub_executor(
+        idx=0,
+        task_description="Return the trend label.",
+        tools_hint="llm_reasoning_classification",
+        branch_metadata={"path": "direct_classification"},
+        plan={
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "fingerprint": {},
+            "profiling_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "skills_section": "",
+            "tool_notes": {},
+            "domain": "weather",
+            "candidates": ["llm_reasoning_classification"],
+            "_mode": "train",
+        },
+        envelope=TaskEnvelope(
+            task=TaskSpec(
+                task_id="subexecutor-terminal-repair-invalid-delivery",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(
+                data=[1.0, 2.0, 3.0],
+                text_data=[],
+                images=[],
+            ),
+            trace_id="test-subexecutor-terminal-repair-invalid-delivery",
+        ),
+        slot_id=0,
+        slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+    )
+
+    assert result["answer"] == "stable"
+    assert terminal_review_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_subexecutor_terminal_path_review_rejects_changed_recoverable_answer(monkeypatch):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    terminal_review_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('need the classification label first.', 'call the classification tool.'),
+                "done": False,
+                "tool": "llm_reasoning_classification",
+                "args": {},
+            }
+        return None, {
+            "thought": "bad",
+            "done": False,
+            "_parse_failed": True,
+        }
+
+    async def _fake_request_terminal_path_review(*_args, **_kwargs):
+        nonlocal terminal_review_calls
+        terminal_review_calls += 1
+        if terminal_review_calls == 1:
+            return {
+                "thought": "Reason: rewrite the label.",
+                "done": True,
+                "answer": "up",
+                "answer_type": "classification",
+                "confidence": 0.88,
+                "reasoning": "1. rewrite answer.",
+                "execution_context": {
+                    "tool_chain": ["llm_reasoning_classification"],
+                    "public_reasoning": ["`llm_reasoning_classification` produced `stable`."],
+                    "evidence_summary": "The observed branch answer was stable.",
+                },
+                "control_context": {"completion_notes": ""},
+            }
+        return {
+            "thought": _structured_thought('keep the existing label.', 'finish now.'),
+            "done": True,
+            "answer": "stable",
+            "answer_type": "classification",
+            "confidence": 0.88,
+            "reasoning": "1. `llm_reasoning_classification` produced the label `stable`, so this branch keeps that exact tool answer.",
+            "execution_context": {
+                "tool_chain": ["llm_reasoning_classification"],
+                "public_reasoning": ["`llm_reasoning_classification` produced the label `stable` for this branch."],
+                "evidence_summary": "The branch reuses the exact `llm_reasoning_classification` label `stable`.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        assert tool_name == "llm_reasoning_classification"
+        return ToolResult(success=True, data={"answer": "stable"}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_request_terminal_path_review", _fake_request_terminal_path_review)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: True)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+    monkeypatch.setattr(executor_module, "MAX_SUB_REACT_STEPS", 1)
+
+    result = await executor._run_sub_executor(
+        idx=0,
+        task_description="Return the trend label.",
+        tools_hint="llm_reasoning_classification",
+        branch_metadata={"path": "direct_classification"},
+        plan={
+            "task_type": "classification",
+            "task_description": "Classify the next trend.",
+            "fingerprint": {},
+            "profiling_section": "",
+            "system_memory": "",
+            "modality_hint": "",
+            "skills_section": "",
+            "tool_notes": {},
+            "domain": "weather",
+            "candidates": ["llm_reasoning_classification"],
+            "_mode": "train",
+        },
+        envelope=TaskEnvelope(
+            task=TaskSpec(
+                task_id="subexecutor-terminal-repair-preserve-answer",
+                task_type="classification",
+                description="dummy",
+            ),
+            environment=EnvironmentSnapshot(
+                data=[1.0, 2.0, 3.0],
+                text_data=[],
+                images=[],
+            ),
+            trace_id="test-subexecutor-terminal-repair-preserve-answer",
+        ),
+        slot_id=0,
+        slot_spec={"slot_id": 0, "visible_candidates": ["llm_reasoning_classification"]},
+    )
+
+    assert result["answer"] == "stable"
+    assert terminal_review_calls == 2
+
+
+def test_build_main_output_contract_section_includes_learning_summary_contract_for_training():
+    text = ExecutorAgent._build_main_output_contract_section(
+        task_type="forecast",
+        horizon=24,
+        is_train=True,
+        defer_learning_record=False,
+        indicator_output_keys=[],
+        allow_finish_current_turn=True,
+    )
+
+    assert '`answer_type` exactly `"learning_summary"`' in text
+    assert "`insight`" in text
+    assert "`recommendation`" in text
+    assert "Do not write about framework/orchestration mechanics" in text
+    assert "Do not justify the summary with control-flow phrases" in text
+    assert "assigned path" in text
+
+
+def test_build_main_output_contract_section_omits_learning_summary_contract_outside_training():
+    text = ExecutorAgent._build_main_output_contract_section(
+        task_type="forecast",
+        horizon=24,
+        is_train=False,
+        defer_learning_record=False,
+        indicator_output_keys=["macd"],
+        allow_finish_current_turn=True,
+    )
+
+    assert "learning_summary" not in text
+    assert "Return ONLY a JSON numeric array" in text
+    assert "Do NOT return prose like `Predicted Temperatures: ...`." in text
+
+
+def test_normalize_control_context_keeps_audit_payload():
+    normalized = ExecutorAgent._normalize_control_context(
+        {
+            "completion_notes": "done",
+            "audit": {
+                "memory_injected": {
+                    "soul_text": "SOUL",
+                    "memory_text": "MEMORY",
+                    "system_memory_text": "SOUL\nMEMORY",
+                    "skills_text": "SKILL",
+                    "tool_notes_section": "Tool Notes:\n- prophet_forecast: note\n",
+                    "tool_note_keys": ["prophet_forecast"],
+                    "tool_note_count": 1,
+                },
+                "prompt_sections": [
+                    {"name": "system_prompt", "chars": 42, "nonempty": True},
+                    {"name": "support_section", "chars": 17, "nonempty": True},
+                ],
+            },
+        }
+    )
+
+    assert normalized["completion_notes"] == "done"
+    assert normalized["audit"]["memory_injected"]["memory_text"] == "MEMORY"
+    assert normalized["audit"]["memory_injected"]["tool_note_keys"] == ["prophet_forecast"]
+    assert normalized["audit"]["prompt_sections"][0]["name"] == "system_prompt"
+
+
+def test_merge_control_context_preserves_audit_and_overrides_completion_notes():
+    merged = ExecutorAgent._merge_control_context(
+        {
+            "completion_notes": "",
+            "audit": {
+                "memory_injected": {
+                    "memory_text": "MEMORY",
+                    "system_memory_text": "SOUL\nMEMORY",
+                    "tool_note_keys": ["ets_forecast"],
+                    "tool_note_count": 1,
+                }
+            },
+        },
+        {
+            "completion_notes": "repair-only",
+        },
+    )
+
+    assert merged["completion_notes"] == "repair-only"
+    assert merged["audit"]["memory_injected"]["memory_text"] == "MEMORY"
+    assert merged["audit"]["memory_injected"]["tool_note_keys"] == ["ets_forecast"]
+
+
+def test_is_valid_learning_summary_answer_requires_non_empty_insight_and_recommendation():
+    assert ExecutorAgent._is_valid_learning_summary_answer(
+        {"insight": "a", "recommendation": "b"}
+    ) is True
+    assert ExecutorAgent._is_valid_learning_summary_answer(
+        {"insight": "", "recommendation": "b"}
+    ) is False
+    assert ExecutorAgent._is_valid_learning_summary_answer("bad") is False
+
+
+def test_learning_summary_validation_message_explains_textual_recommendation_requirement():
+    text = ExecutorAgent._learning_summary_validation_message(
+        {"insight": "winner is slot_2", "recommendation": {"macd": [1, 2, 3]}}
+    )
+
+    assert "`recommendation` must be a non-empty string" in text
+    assert "not the task prediction object" in text
+    assert "do not mention framework wording" in text
+
+
+def test_learning_summary_validation_message_rejects_winner_bookkeeping_fields():
+    text = ExecutorAgent._learning_summary_validation_message(
+        {
+            "winning_candidate_name": "slot_0",
+            "winning_tool_chain": ["timesfm2_forecast"],
+            "selection_basis": "slot_0 won on every metric",
+        }
+    )
+
+    assert "`winning_candidate_name`" in text
+    assert "`winning_tool_chain`" in text
+    assert "`selection_basis`" in text
+
+
+def test_hinted_tools_accepts_plain_tool_names_without_underscores():
+    hinted = ExecutorAgent._hinted_tools(
+        "sentiment, detect_trend, llm_reasoning_qa"
+    )
+
+    assert hinted == ["sentiment", "detect_trend", "llm_reasoning_qa"]
+
+
+def test_hinted_tools_accepts_list_hint():
+    hinted = ExecutorAgent._hinted_tools(
+        ["window_stats", "value_at", "llm_reasoning_qa"]
+    )
+
+    assert hinted == ["window_stats", "value_at", "llm_reasoning_qa"]
+
+
+def test_shared_first_turn_template_uses_objective_observation_decision_structure():
+    text = executor_prompt.REACT_FIRST_TURN.format(
+        task_prompt="Task body",
+        task_boundary_section="## Task Boundary\nBoundary body\n\n",
+        execution_context_section="## Execution Context\nContext body\n\n",
+        control_context_section="## Control Context\nControl body\n\n",
+        output_contract_section="## Output Contract\nContract body\n\n",
+        fingerprint="{}",
+        profiling_section="## Profiling Results\n- x\n",
+        support_section="## Support\nSupport body\n\n",
+        decision_section="Choose exactly one action for this turn:\n1. Call exactly one tool.",
+        tool_names="- chronos2_forecast: ...",
+    )
+
+    assert "## Objective" in text
+    assert "### Task Prompt" in text
+    assert "## Task Boundary" in text
+    assert "## Execution Context" in text
+    assert "## Control Context" in text
+    assert "## Output Contract" in text
+    assert "## Observation" in text
+    assert "### Sample Fingerprint" in text
+    assert "## Support" in text
+    assert "## Decision" in text
+    assert "### Available Tools" in text
+
+
+def test_build_tool_observation_message_uses_structured_sections():
+    text = ExecutorAgent._build_tool_observation_message(
+        step=2,
+        tool_name="slice",
+        tool_args={"start": 10, "end": 20},
+        success=True,
+        observation_payload=[1, 2, 3],
+    )
+
+    assert "## New Observation" in text
+    assert "- Step: Step 2" in text
+    assert "- Tool: slice" in text
+    assert "- Status: success" in text
+    assert "### Tool Result" in text
+
+
+def test_build_tool_observation_message_marks_task_valid_answer_availability():
+    text = ExecutorAgent._build_tool_observation_message(
+        step=2,
+        tool_name="llm_reasoning_forecast",
+        tool_args={"question": "q"},
+        success=True,
+        observation_payload={"answer": [1.0, 2.0, 3.0]},
+        task_type="forecast",
+        horizon=3,
+    )
+
+    assert "## Answer Status" in text
+    assert "already contains a task-valid answer" in text
+    assert "may finish by returning this exact tool-produced answer unchanged" in text
+
+
+def test_build_state_update_message_uses_current_working_state_header():
+    text = ExecutorAgent._build_state_update_message(
+        current_series_state={"artifact_type": "series"},
+        latest_artifact_state={"producer_tool": "slice"},
+    )
+
+    assert text.startswith("## Current Working State\n")
+    assert '"current_series_state"' in text
+    assert '"latest_artifact_state"' in text
+
+
+def test_build_state_update_message_includes_accessible_series_sources():
+    text = ExecutorAgent._build_state_update_message(
+        current_series_state={"artifact_type": "series"},
+        latest_artifact_state={"producer_tool": "timesfm2_forecast"},
+        accessible_series_sources=[
+            {
+                "ref": "current",
+                "is_current": True,
+                "producer_tool": "timesfm2_forecast",
+                "artifact_type": "series",
+                "length": 24,
+                "current_space": [0, 24],
+                "relative_to": "forecast_output",
+            },
+            {
+                "ref": "original_input",
+                "is_current": False,
+                "producer_tool": "initial_input",
+                "artifact_type": "series",
+                "length": 336,
+                "current_space": [0, 336],
+                "relative_to": "original_input",
+            },
+        ],
+    )
+
+    assert '"accessible_series_sources"' in text
+    assert '"ref": "original_input"' in text
+    assert "If you pass `source_ref`" in text
+    assert 'Use `source_ref="original_input"`' in text
+
+
+def test_build_state_update_message_includes_task_answer_status_when_available():
+    text = ExecutorAgent._build_state_update_message(
+        current_series_state={"artifact_type": "series"},
+        latest_artifact_state={"producer_tool": "llm_reasoning_forecast"},
+        task_answer_status={
+            "available": True,
+            "task_type": "forecast",
+            "source_tool": "llm_reasoning_forecast",
+        },
+    )
+
+    assert '"task_answer_status"' in text
+    assert '"available": true' in text
+    assert '"source_tool": "llm_reasoning_forecast"' in text
+
+
+def test_build_state_update_message_includes_branch_task_answer_status_when_available():
+    text = ExecutorAgent._build_state_update_message(
+        current_series_state={"artifact_type": "forecast"},
+        latest_artifact_state={"producer_tool": "window_stats"},
+        task_answer_status={"available": False},
+        branch_task_answer_status={
+            "available": True,
+            "task_type": "forecast",
+            "source_tool": "chronos2_forecast",
+            "availability_scope": "branch",
+        },
+    )
+
+    assert '"branch_task_answer_status"' in text
+    assert '"availability_scope": "branch"' in text
+    assert '"source_tool": "chronos2_forecast"' in text
+
+
+def test_build_state_update_message_includes_latest_redundancy_status():
+    text = ExecutorAgent._build_state_update_message(
+        current_series_state={"artifact_type": "series"},
+        latest_artifact_state={"producer_tool": "llm_reasoning_classification"},
+        latest_redundancy_status={
+            "redundant": True,
+            "repeat_count": 3,
+            "source_tool": "llm_reasoning_classification",
+        },
+    )
+
+    assert '"latest_redundancy_status"' in text
+    assert '"redundant": true' in text
+    assert '"repeat_count": 3' in text
+
+
+def test_latest_branch_task_answer_status_survives_non_task_latest_artifact():
+    status = ExecutorAgent._latest_branch_task_answer_status(
+        task_type="forecast",
+        execution_log=[
+            {
+                "tool": "chronos2_forecast",
+                "success": True,
+                "output": {"point_forecast": [1.0, 2.0, 3.0], "horizon": 3},
+            },
+            {
+                "tool": "window_stats",
+                "success": True,
+                "output": {"mean": 2.0, "std": 0.8},
+            },
+        ],
+        horizon=3,
+        indicator_output_keys=[],
+    )
+
+    assert status["available"] is True
+    assert status["source_tool"] == "chronos2_forecast"
+    assert status["availability_scope"] == "branch"
+
+
+def test_inference_packet_answer_refresh_status_requires_refresh_after_new_lane_evidence():
+    status = ExecutorAgent._inference_packet_answer_refresh_status(
+        task_type="forecast",
+        execution_log=[
+            {
+                "tool": "timesfm2_forecast",
+                "success": True,
+                "output": {"point_forecast": [1.0, 2.0], "horizon": 2},
+            },
+            {
+                "tool": "window_stats",
+                "success": True,
+                "output": {"mean": 1.5, "std": 0.2},
+            },
+        ],
+        memory_audit={
+            "primary_path_tools": ["timesfm2_forecast"],
+            "challenger_path_tools": ["window_stats"],
+            "tool_prep_tools": [],
+        },
+        horizon=2,
+        indicator_output_keys=[],
+    )
+
+    assert status["needs_refresh_before_finish"] is True
+    assert status["latest_task_answer_tool"] == "timesfm2_forecast"
+    assert status["stale_packet_tools_after_answer"] == ["window_stats"]
+
+
+def test_latest_redundancy_status_detects_same_tool_same_answer_on_same_artifact():
+    previous_state = ExecutorAgent._initial_series_state([1.0, 2.0, 3.0])
+    current_state = ExecutorAgent._initial_series_state([1.0, 2.0, 3.0])
+    status = ExecutorAgent._latest_redundancy_status(
+        task_type="classification",
+        execution_log=[
+            {
+                "tool": "llm_reasoning_classification",
+                "success": True,
+                "output": {"answer": "stable"},
+            },
+            {
+                "tool": "llm_reasoning_classification",
+                "success": True,
+                "output": {"answer": "stable"},
+            },
+        ],
+        latest_tool_name="llm_reasoning_classification",
+        previous_series_state=previous_state,
+        current_series_state=current_state,
+    )
+
+    assert status["redundant"] is True
+    assert status["repeat_count"] == 2
+    assert status["source_tool"] == "llm_reasoning_classification"
+    assert status["answer_preview"] == '"stable"'
+
+
+def test_latest_redundancy_status_ignores_changed_working_artifact():
+    previous_state = ExecutorAgent._initial_series_state([1.0, 2.0, 3.0, 4.0])
+    current_state = ExecutorAgent._artifact_state_from_result(
+        tool_name="slice",
+        result_data={"slice": [3.0, 4.0]},
+        downstream_data=[3.0, 4.0],
+        previous_series_state=previous_state,
+        tool_args={"start": 2, "end": 4},
+    )
+    status = ExecutorAgent._latest_redundancy_status(
+        task_type="classification",
+        execution_log=[
+            {
+                "tool": "llm_reasoning_classification",
+                "success": True,
+                "output": {"answer": "stable"},
+            },
+            {
+                "tool": "llm_reasoning_classification",
+                "success": True,
+                "output": {"answer": "stable"},
+            },
+        ],
+        latest_tool_name="llm_reasoning_classification",
+        previous_series_state=previous_state,
+        current_series_state=current_state,
+    )
+
+    assert status == {"redundant": False}
+
+
+def test_build_task_boundary_section_forecast_is_task_specific():
+    text = ExecutorAgent._build_task_boundary_section("forecast", horizon=24)
+
+    assert "predict a future numeric time-series sequence" in text
+    assert "JSON numeric array" in text
+    assert "trend labels" in text
+
+
+def test_build_task_boundary_section_indicator_mentions_exact_keys():
+    text = ExecutorAgent._build_task_boundary_section(
+        "indicator",
+        indicator_output_keys=["macd", "upper_bb"],
+    )
+
+    assert "predict derived indicator values" in text
+    assert "exactly these indicator keys: macd, upper_bb" in text
+    assert "raw forecast arrays" in text
+
+
+def test_build_task_boundary_section_qa_mentions_answer_text_or_option():
+    text = ExecutorAgent._build_task_boundary_section("qa")
+
+    assert "answer the question" in text
+    assert "final answer text itself" in text
+    assert "final option label" in text
+
+
+def test_build_task_boundary_section_finance_trend_requires_official_five_buckets():
+    text = ExecutorAgent._build_task_boundary_section(
+        "classification",
+        scope_keys=["finance_aligned_long_trend"],
+    )
+
+    assert "Final delivery label must be exactly one of" in text
+    assert "`<-4%`" in text
+    assert "`up`, `down`, `flat`" in text
+
+
+def test_build_task_boundary_section_weather_trend_requires_official_three_labels():
+    text = ExecutorAgent._build_task_boundary_section(
+        "classification",
+        scope_keys=["weather_aligned_long_trend_past"],
+    )
+
+    assert "`increasing`, `decreasing`, `stable`" in text
+    assert "`up`, `down`, and `flat` are shorthand only" in text
+
+
+def test_build_task_semantic_guidance_section_future_trend_disallows_full_history_slope_shortcut():
+    text = ExecutorAgent._build_task_semantic_guidance_section(
+        task_type="classification",
+        scope_keys=["weather_aligned_short_trend"],
+    )
+
+    assert "target future window" in text
+    assert "like-for-like comparison" in text
+    assert "last observed 24 hours" in text
+    assert "first forecast-day 24 hours" in text
+
+
+def test_build_task_semantic_guidance_section_finance_trend_requires_direction_then_bucket():
+    text = ExecutorAgent._build_task_semantic_guidance_section(
+        task_type="classification",
+        scope_keys=["finance_aligned_long_trend"],
+    )
+
+    assert "Estimate the future move from the latest observed price" in text
+    assert "direction first, then the magnitude bucket" in text
+    assert "historical regime alone decide the final bucket" in text
+
+
+def test_build_task_semantic_guidance_section_correlation_requires_target_asset_signal():
+    text = ExecutorAgent._build_task_semantic_guidance_section(
+        task_type="correlation",
+        scope_keys=["finance_qa_long_correlation"],
+    )
+
+    assert "target asset" in text
+    assert "reaction after publication" in text
+    assert "industry, competitor, or macro commentary" in text
+
+
+def test_build_task_semantic_guidance_section_indicator_scopes_include_formula_definitions():
+    macd_text = ExecutorAgent._build_task_semantic_guidance_section(
+        task_type="indicator",
+        scope_keys=["finance_aligned_long_indicator_macd"],
+    )
+    bb_text = ExecutorAgent._build_task_semantic_guidance_section(
+        task_type="indicator",
+        scope_keys=["finance_aligned_long_indicator_upper_bb"],
+    )
+
+    assert "MACD = EMA(12) - EMA(26)" in macd_text
+    assert "future prediction window itself" in macd_text
+    assert "upper_bb = rolling_mean(window=20, min_periods=1) + 2 * rolling_std(window=20, min_periods=1)" in bb_text
+    assert "concatenated history+future series" in bb_text
+
+
+def test_build_parent_branch_metadata_section_renders_short_structured_lines():
+    text = ExecutorAgent._build_parent_branch_metadata_section(
+        {
+            "branch_id": "slot_3_alt",
+            "candidate_family": "chronos",
+            "comparison_target": "slot_1",
+        }
+    )
+
+    assert "Parent Branch Metadata:" in text
+    assert "- branch_id: slot_3_alt" in text
+    assert "- candidate_family: chronos" in text
+    assert "- comparison_target: slot_1" in text
+
+
+def test_build_subagent_tools_hint_section_renders_list_hint():
+    text = ExecutorAgent._build_subagent_tools_hint_section(
+        ["window_stats", "value_at", "llm_reasoning_qa"],
+        ["window_stats", "value_at", "llm_reasoning_qa", "sentiment"],
+    )
+
+    assert "Assigned Exploration Path:" in text
+    assert "window_stats, value_at, llm_reasoning_qa" in text
+
+
+def test_subagent_must_start_with_hinted_tool_when_hint_not_started():
+    assert ExecutorAgent._subagent_must_start_with_hinted_tool(
+        execution_log=[],
+        tools_hint=["detect_trend"],
+        next_tool_name="window_stats",
+    ) is True
+    assert ExecutorAgent._subagent_must_start_with_hinted_tool(
+        execution_log=[],
+        tools_hint=["detect_trend"],
+        next_tool_name="detect_trend",
+    ) is False
+    assert ExecutorAgent._subagent_must_start_with_hinted_tool(
+        execution_log=[{"tool": "detect_trend"}],
+        tools_hint=["detect_trend"],
+        next_tool_name="window_stats",
+    ) is False
+
+
+def test_tool_note_candidates_support_task_specific_llm_reasoning_aliases():
+    assert ExecutorAgent._tool_note_candidates(
+        "llm_reasoning_qa",
+        "qa",
+    ) == ["llm_reasoning_qa", "llm_reasoning", "llm_reasoning::qa"]
+
+
+def test_reasoning_candidate_names_accepts_list_hint_without_self_reference():
+    names = ExecutorAgent._reasoning_candidate_names(
+        [
+            {
+                "tool": "spawn_subagent",
+                "output": [
+                    {
+                        "success": True,
+                        "result": {
+                            "tools_hint": ["window_stats", "value_at", "llm_reasoning_qa"],
+                            "execution_log": [],
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert names == ["window_stats, value_at, llm_reasoning_qa"]
+
+
+def test_validate_spawn_subagent_tasks_rejects_non_dict_branch_metadata():
+    slots = [
+        {"slot_id": 0},
+        {"slot_id": 1},
+    ]
+
+    error = ExecutorAgent._validate_spawn_subagent_tasks(
+        [{"slot_id": 0, "task": "path a", "branch_metadata": "bad"}],
+        slots,
+    )
+
+    assert "branch_metadata" in error
+
+
+def test_validate_spawn_subagent_tasks_rejects_reused_slot_ids_across_rounds():
+    slots = [
+        {"slot_id": 0},
+        {"slot_id": 1},
+        {"slot_id": 2},
+    ]
+
+    error = ExecutorAgent._validate_spawn_subagent_tasks(
+        [{"slot_id": 1, "task": "path b"}],
+        slots,
+        min_tasks=1,
+        disallowed_slot_ids={0, 1},
+    )
+
+    assert "already used in a previous spawn round" in error
+
+
+def test_coerce_llm_decision_rejects_multiple_top_level_json_objects():
+    raw = (
+        '{"done": false, "thought": "Reason: first. Action: spawn.", '
+        '"tool": "spawn_subagent", "args": {"tasks": []}}'
+        '{"done": false, "thought": "Reason: second. Action: eval.", '
+        '"tool": "evaluate_batch_against_gt", "args": {"task_type": "classification"}}'
+    )
+
+    decision = ExecutorAgent._coerce_llm_decision(
+        parsed=None,
+        text=raw,
+        fallback_thought="parse failed",
+    )
+
+    assert decision["_parse_failed"] is True
+    assert decision["thought"] == "multiple_json_objects_in_one_reply"
+
+
+def test_coerce_llm_decision_prefers_parsed_dict_over_noisy_text():
+    parsed = {
+        "done": False,
+        "thought": "Reason: first. Action: spawn.",
+        "tool": "spawn_subagent",
+        "args": {"tasks": [{"slot_id": 0, "task": "path a"}]},
+    }
+    raw = (
+        '{"done": false, "thought": "Reason: first. Action: spawn.", '
+        '"tool": "spawn_subagent", "args": {"tasks": [{"slot_id": 0, "task": "path a"}]}}'
+        "\n选择工具: spawn_subagent"
+    )
+
+    decision = ExecutorAgent._coerce_llm_decision(
+        parsed=parsed,
+        text=raw,
+        fallback_thought="parse failed",
+    )
+
+    assert decision == parsed
+
+
+def test_coerce_llm_decision_rejects_multiple_top_level_json_objects_even_with_parsed_dict():
+    parsed = {
+        "done": False,
+        "thought": "Reason: first. Action: segment.",
+        "tool": "segment",
+        "args": {"window_size": 78, "step_size": 39},
+    }
+    raw = (
+        '{"done": false, "thought": "Reason: first. Action: segment.", '
+        '"tool": "segment", "args": {"window_size": 78, "step_size": 39}}'
+        '{"macd": [0.0]}'
+    )
+
+    decision = ExecutorAgent._coerce_llm_decision(
+        parsed=parsed,
+        text=raw,
+        fallback_thought="parse failed",
+    )
+
+    assert decision["_parse_failed"] is True
+    assert decision["thought"] == "multiple_json_objects_in_one_reply"
+
+
+def test_coerce_structured_decision_accepts_json_tool_decision_when_tool_is_allowed():
+    response = LLMResponse(
+        text='{"thought":"Reason: inspect segments. Action: run segment.","done":false,"tool":"segment","args":{"window_size":78,"step_size":39}}',
+        parsed={
+            "thought": "Reason: inspect segments. Action: run segment.",
+            "done": False,
+            "tool": "segment",
+            "args": {"window_size": 78, "step_size": 39},
+        },
+        model="mock",
+    )
+
+    decision = ExecutorAgent._coerce_structured_decision(
+        response,
+        allow_tool_call=True,
+        allow_finish=True,
+        ordinary_tool_names=["segment"],
+        evaluate_tool_names=[],
+        fallback_thought="parse failed",
+    )
+
+    assert decision == {
+        "thought": _structured_thought('inspect segments.', 'run segment.'),
+        "done": False,
+        "tool": "segment",
+        "args": {"window_size": 78, "step_size": 39},
+    }
+
+
+def test_coerce_structured_decision_prefers_valid_parsed_payload_over_duplicated_json_text():
+    parsed = {
+        "thought": "Reason: inspect segments. Action: run segment.",
+        "done": False,
+        "tool": "segment",
+        "args": {"window_size": 78, "step_size": 39},
+    }
+    response = LLMResponse(
+        text=(
+            '{"thought":"Reason: inspect segments. Action: run segment.","done":false,'
+            '"tool":"segment","args":{"window_size":78,"step_size":39}}'
+            '{"debug":"duplicated wrapper"}'
+        ),
+        parsed=parsed,
+        model="mock",
+    )
+
+    decision = ExecutorAgent._coerce_structured_decision(
+        response,
+        allow_tool_call=True,
+        allow_finish=True,
+        ordinary_tool_names=["segment"],
+        evaluate_tool_names=[],
+        fallback_thought="parse failed",
+    )
+
+    assert decision == {**parsed, "thought": _structured_thought("inspect segments.", "run segment.")}
+
+
+def test_coerce_structured_decision_rejects_json_tool_decision_outside_allowed_family():
+    response = LLMResponse(
+        text=(
+            '{"thought":"Reason: compare paths. Action: spawn.","done":false,'
+            '"tool":"spawn_subagent","args":{"tasks":[{"task":"x"}]}}'
+        ),
+        parsed={
+            "thought": "Reason: compare paths. Action: spawn.",
+            "done": False,
+            "tool": "spawn_subagent",
+            "args": {"tasks": [{"task": "x"}]},
+        },
+        model="mock",
+    )
+
+    decision = ExecutorAgent._coerce_structured_decision(
+        response,
+        allow_tool_call=True,
+        allow_finish=True,
+        ordinary_tool_names=["segment"],
+        evaluate_tool_names=[],
+        fallback_thought="parse failed",
+    )
+
+    assert decision["_parse_failed"] is True
+    assert decision["thought"] == "invalid_decision_wrong_tool_family"
+
+
+def test_coerce_structured_decision_preserves_legacy_task_finish_in_learning_summary_mode():
+    response = LLMResponse(
+        text=(
+            '{"thought":"Reason: task answer already exists. Action: finish.","done":true,'
+            '"answer":{"macd":[0.1,0.2]},"answer_type":"indicator","confidence":0.9,'
+            '"reasoning":"1. A tool already produced this indicator.\\n2. I am returning it unchanged."}'
+        ),
+        parsed={
+            "thought": "Reason: task answer already exists. Action: finish.",
+            "done": True,
+            "answer": {"macd": [0.1, 0.2]},
+            "answer_type": "indicator",
+            "confidence": 0.9,
+            "reasoning": (
+                "1. A tool already produced this indicator.\n"
+                "2. I am returning it unchanged."
+            ),
+        },
+        model="mock",
+    )
+
+    decision = ExecutorAgent._coerce_structured_decision(
+        response,
+        allow_tool_call=True,
+        allow_finish=True,
+        fallback_thought="parse failed",
+        finish_mode="learning_summary",
+    )
+
+    assert decision == {
+        "thought": _structured_thought('task answer already exists.', 'finish.'),
+        "done": True,
+        "answer": {"macd": [0.1, 0.2]},
+        "answer_type": "indicator",
+        "confidence": 0.9,
+        "reasoning": (
+            "1. A tool already produced this indicator.\n"
+            "2. I am returning it unchanged."
+        ),
+        "execution_context": {
+            "tool_chain": [],
+            "public_reasoning": [],
+            "evidence_summary": "",
+        },
+        "control_context": {
+            "completion_notes": "",
+        },
+    }
+
+
+def test_coerce_structured_decision_accepts_bare_learning_summary_repair_payload():
+    parsed = {
+        "answer": {
+            "insight": "continuation-style branch won on the evaluated sample",
+            "recommendation": "prefer slope-preserving paths when the recent regime is decisive",
+        },
+        "confidence": 0.79,
+        "reasoning": [
+            "winner path preserved the observed slope",
+            "the flatter branch missed the dominant regime",
+        ],
+        "execution_context": {
+            "tool_chain": ["ets_forecast -> llm_reasoning_forecast"],
+            "public_reasoning": [
+                "the ETS-informed continuation tracked the observed downtrend",
+            ],
+            "evidence_summary": "the continuation-style branch matched the data regime best",
+        },
+        "control_context": {"completion_notes": "repair-only"},
+    }
+    response = LLMResponse(
+        text=json.dumps(parsed, ensure_ascii=False),
+        parsed=parsed,
+        model="mock",
+    )
+
+    decision = ExecutorAgent._coerce_structured_decision(
+        response,
+        allow_tool_call=False,
+        allow_finish=True,
+        fallback_thought="parse failed",
+        finish_mode="learning_summary",
+    )
+
+    assert decision["done"] is True
+    assert decision["answer_type"] == "learning_summary"
+    assert decision["answer"] == parsed["answer"]
+    assert decision["control_context"]["completion_notes"] == "repair-only"
+
+
+def test_main_output_contract_uses_current_turn_contract_when_finish_not_allowed():
+    section = ExecutorAgent._build_main_output_contract_section(
+        task_type="forecast",
+        horizon=24,
+        is_train=True,
+        defer_learning_record=False,
+        indicator_output_keys=[],
+        allow_finish_current_turn=False,
+    )
+
+    assert "This is not a completion turn" in section
+    assert "Return only the current-turn tool-call JSON" in section
+    assert "Required keys inside `answer`: `insight`, `recommendation`." not in section
+
+
+def test_inference_challenger_finish_status_keeps_challenger_advisory():
+    status = ExecutorAgent._inference_challenger_finish_status(
+        execution_log=[
+            {"tool": "tool_prep", "success": True},
+            {"tool": "tool_primary", "success": True},
+        ],
+        memory_audit={
+            "primary_path_tools": ["tool_primary"],
+            "challenger_path_tools": ["tool_challenger"],
+            "tool_prep_tools": ["tool_prep"],
+        },
+    )
+
+    assert status["primary_hit"] is True
+    assert status["challenger_hit"] is False
+    assert status["prep_hit"] is True
+    assert status["needs_challenger_before_finish"] is False
+
+
+def test_inference_packet_lane_status_blocks_reasoning_until_prep_is_done():
+    status = ExecutorAgent._inference_packet_lane_status(
+        execution_log=[],
+        memory_audit={
+            "primary_path_tools": ["chronos2_forecast"],
+            "challenger_path_tools": [],
+            "tool_prep_tools": ["segment"],
+        },
+        task_type="classification",
+    )
+
+    assert status["reason"] == "must_complete_prep_before_leaving_lane"
+    assert status["allowed_now"] == ["segment", "chronos2_forecast"]
+    assert "llm_reasoning_classification" not in status["allowed_now"]
+
+
+def test_inference_packet_lane_status_blocks_reasoning_until_anchor_evidence_is_done():
+    status = ExecutorAgent._inference_packet_lane_status(
+        execution_log=[
+            {"tool": "llm_reasoning_qa", "success": True},
+        ],
+        memory_audit={
+            "primary_path_tools": ["llm_reasoning_qa"],
+            "challenger_path_tools": ["value_at"],
+            "tool_prep_tools": [],
+        },
+        task_type="qa",
+    )
+
+    assert status["reason"] == "must_materialize_anchor_evidence_before_reasoning"
+    assert status["remaining_anchor_tools"] == ["value_at"]
+    assert status["allowed_now"] == ["value_at"]
+    assert "llm_reasoning_qa" not in status["allowed_now"]
+
+
+def test_inference_challenger_finish_status_requires_remaining_anchor_evidence_before_finish():
+    status = ExecutorAgent._inference_challenger_finish_status(
+        execution_log=[
+            {"tool": "llm_reasoning_qa", "success": True},
+        ],
+        memory_audit={
+            "primary_path_tools": ["llm_reasoning_qa"],
+            "challenger_path_tools": ["value_at"],
+            "tool_prep_tools": [],
+        },
+    )
+
+    assert status["needs_challenger_before_finish"] is False
+    assert status["needs_anchor_evidence_before_finish"] is True
+    assert status["remaining_anchor_tools"] == ["value_at"]
+
+
+def test_has_challenger_skip_note_requires_prefixed_concrete_note():
+    assert ExecutorAgent._has_challenger_skip_note(
+        {"completion_notes": "challenger_skip: challenger path is irrelevant after the aligned tool output."}
+    ) is True
+    assert ExecutorAgent._has_challenger_skip_note(
+        {"completion_notes": "skip challenger"}
+    ) is False
+
+
+def test_reasoning_candidate_labels_include_top_level_task_valid_paths():
+    execution_log = [
+        {
+            "tool": "slice",
+            "success": True,
+            "observation": {"series": [1.0, 2.0]},
+        },
+        {
+            "tool": "llm_reasoning_forecast",
+            "success": True,
+            "observation": {"answer": [10.0, 11.0]},
+        },
+        {
+            "tool": "timesfm2_forecast",
+            "success": True,
+            "observation": {"answer": [9.5, 9.7]},
+        },
+    ]
+
+    labels = ExecutorAgent._reasoning_candidate_labels(
+        execution_log,
+        task_type="forecast",
+        horizon=2,
+        indicator_output_keys=[],
+    )
+
+    assert labels == [
+        "slice -> llm_reasoning_forecast",
+        "timesfm2_forecast",
+    ]
+
+
+def test_build_action_state_section_mentions_multiple_task_valid_candidates():
+    section = ExecutorAgent._build_action_state_section(
+        state="need_evidence",
+        required_final_type="forecast",
+        execution_log=[
+            {"tool": "slice", "success": True, "observation": {"series": [1.0, 2.0]}},
+            {"tool": "llm_reasoning_forecast", "success": True, "observation": {"answer": [10.0, 11.0]}},
+            {"tool": "timesfm2_forecast", "success": True, "observation": {"answer": [9.5, 9.7]}},
+        ],
+        task_type="forecast",
+        horizon=2,
+        indicator_output_keys=[],
+    )
+
+    assert "Task-valid candidate paths already available" in section
+    assert "slice -> llm_reasoning_forecast" in section
+    assert "timesfm2_forecast" in section
+
+
+@pytest.mark.asyncio
+async def test_executor_inference_does_not_block_finish_for_advisory_challenger(monkeypatch, registered_forecast_fixtures):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+
+    async def _fake_request_structured_decision(conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('start from the primary path.', 'call the primary tool.'),
+                "done": False,
+                "tool": "tool_primary",
+                "args": {},
+            }
+        if decision_calls == 2:
+            return None, {
+                "thought": _structured_thought('the primary tool already looks sufficient.', 'finish now.'),
+                "done": True,
+                "answer": [1.0, 2.0],
+                "answer_type": "forecast",
+                "confidence": 0.8,
+                "reasoning": "1. `tool_primary` produced the forecast candidate.",
+                "execution_context": {
+                    "tool_chain": ["tool_primary"],
+                    "public_reasoning": ["`tool_primary` produced the current forecast candidate."],
+                    "evidence_summary": "tool_primary forecasts a rise from 1.0 to 2.0 over the requested two time steps.",
+                },
+                "control_context": {"completion_notes": ""},
+            }
+        raise AssertionError("unexpected decision call")
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        return ToolResult(success=True, data={"point_forecast": [1.0, 2.0], "horizon": 2}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: False)
+
+    plan = {
+        "candidates": ["tool_primary", "tool_challenger"],
+        "task_type": "forecast",
+        "task_description": "test forecast task",
+        "tool_names": "tool_primary, tool_challenger",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "decision_skills_section": "",
+        "system_memory": "",
+        "memory_audit": {
+            "primary_path_tools": ["tool_primary"],
+            "challenger_path_tools": ["tool_challenger"],
+            "tool_prep_tools": [],
+        },
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [],
+        "fingerprint": {},
+        "horizon": 2,
+        "domain": "weather",
+        "reanalysis_section": "",
+        "_mode": "test",
+        "_defer_learning_record": False,
+        "indicator_output_keys": [],
+        "modality": "timeseries",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="forecast", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "forecast"
+    assert decision_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_executor_inference_blocks_finish_until_packet_answer_is_refreshed(monkeypatch, registered_forecast_fixtures):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    correction_messages: list[str] = []
+
+    async def _fake_request_structured_decision(conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        for message in reversed(conversation):
+            content = str(message.get("content") or "")
+            if "packet-selected evidence" in content:
+                correction_messages.append(content)
+                break
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('get the primary forecast candidate first.', 'call tool_primary.'),
+                "done": False,
+                "tool": "tool_primary",
+                "args": {},
+            }
+        if decision_calls == 2:
+            return None, {
+                "thought": _structured_thought('gather the challenger-side evidence.', 'call window_stats.'),
+                "done": False,
+                "tool": "window_stats",
+                "args": {},
+            }
+        if decision_calls == 3:
+            return None, {
+                "thought": _structured_thought('the earlier answer should already be enough.', 'finish now.'),
+                "done": True,
+                "answer": [1.0, 2.0],
+                "answer_type": "forecast",
+                "confidence": 0.7,
+                "reasoning": "1. `tool_primary` produced the current forecast candidate.",
+                "execution_context": {
+                    "tool_chain": ["tool_primary"],
+                    "public_reasoning": ["`tool_primary` produced the current forecast candidate."],
+                    "evidence_summary": "The current answer still points to the primary result.",
+                },
+                "control_context": {"completion_notes": "challenger_skip: not needed."},
+            }
+        if decision_calls == 4:
+            return None, {
+                "thought": _structured_thought('refresh the task answer after the new evidence.', 'call llm_reasoning_forecast.'),
+                "done": False,
+                "tool": "llm_reasoning_forecast",
+                "args": {},
+            }
+        return None, {
+            "thought": _structured_thought('the answer was refreshed after the new evidence.', 'finish now.'),
+            "done": True,
+            "answer": [1.0, 2.0],
+            "answer_type": "forecast",
+            "confidence": 0.83,
+            "reasoning": (
+                "1. `tool_primary` produced the initial forecast candidate.\n"
+                "2. `window_stats` added new packet-selected evidence.\n"
+                "3. `llm_reasoning_forecast` refreshed the final answer from the latest evidence."
+            ),
+            "execution_context": {
+                "tool_chain": ["tool_primary", "window_stats", "llm_reasoning_forecast"],
+                "public_reasoning": [
+                    "`tool_primary` produced the initial forecast candidate.",
+                    "`window_stats` added new packet-selected evidence.",
+                    "`llm_reasoning_forecast` refreshed the final answer from the latest evidence.",
+                ],
+                "evidence_summary": "The final answer was refreshed after the challenger-side evidence arrived.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        if tool_name == "tool_primary":
+            return ToolResult(success=True, data={"point_forecast": [1.0, 2.0], "horizon": 2}, error=None)
+        if tool_name == "window_stats":
+            return ToolResult(success=True, data={"mean": 1.5, "std": 0.2}, error=None)
+        if tool_name == "llm_reasoning_forecast":
+            return ToolResult(success=True, data={"point_forecast": [1.0, 2.0], "horizon": 2}, error=None)
+        raise AssertionError(f"unexpected tool {tool_name}")
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: False)
+
+    plan = {
+        "candidates": ["tool_primary", "window_stats", "llm_reasoning_forecast"],
+        "task_type": "forecast",
+        "task_description": "test forecast task",
+        "tool_names": "tool_primary, window_stats, llm_reasoning_forecast",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "decision_skills_section": "",
+        "system_memory": "",
+        "memory_audit": {
+            "primary_path_tools": ["tool_primary"],
+            "challenger_path_tools": ["window_stats"],
+            "tool_prep_tools": [],
+        },
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [],
+        "fingerprint": {},
+        "horizon": 2,
+        "domain": "weather",
+        "reanalysis_section": "",
+        "_mode": "test",
+        "_defer_learning_record": False,
+        "indicator_output_keys": [],
+        "modality": "timeseries",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="forecast", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "forecast"
+    assert decision_calls == 5
+    assert correction_messages
+    assert "packet-selected evidence" in correction_messages[-1]
+
+
+@pytest.mark.asyncio
+async def test_executor_inference_allows_finish_when_final_payload_adopts_late_packet_evidence(monkeypatch, registered_forecast_fixtures):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+
+    async def _fake_request_structured_decision(_conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        if decision_calls == 1:
+            return None, {
+                "thought": _structured_thought('start with the primary forecast candidate.', 'call tool_primary.'),
+                "done": False,
+                "tool": "tool_primary",
+                "args": {},
+            }
+        if decision_calls == 2:
+            return None, {
+                "thought": _structured_thought('gather challenger-side evidence before finishing.', 'call tool_challenger.'),
+                "done": False,
+                "tool": "tool_challenger",
+                "args": {},
+            }
+        return None, {
+            "thought": _structured_thought('the final payload now adopts the later packet-selected evidence.', 'finish now.'),
+            "done": True,
+            "answer": [1.0, 2.0],
+            "answer_type": "forecast",
+            "confidence": 0.88,
+            "reasoning": (
+                "1. `tool_primary` produced the initial forecast candidate.\n"
+                "2. `tool_challenger` measured mean 1.5 and standard deviation 0.2.\n"
+                "3. The forecast values 1.0 and 2.0 have mean 1.5, consistent with the observed window mean."
+            ),
+            "execution_context": {
+                "tool_chain": ["tool_primary", "tool_challenger"],
+                "public_reasoning": [
+                    "`tool_primary` produced the initial forecast candidate.",
+                    "`tool_challenger` measured mean 1.5 and standard deviation 0.2.",
+                ],
+                "evidence_summary": "tool_challenger measured mean 1.5 and standard deviation 0.2; the two-point forecast has the same mean 1.5.",
+            },
+            "control_context": {"completion_notes": ""},
+        }
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        if tool_name == "tool_primary":
+            return ToolResult(success=True, data={"point_forecast": [1.0, 2.0], "horizon": 2}, error=None)
+        if tool_name == "tool_challenger":
+            return ToolResult(success=True, data={"mean": 1.5, "std": 0.2}, error=None)
+        raise AssertionError(f"unexpected tool {tool_name}")
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: False)
+
+    plan = {
+        "candidates": ["tool_primary", "tool_challenger"],
+        "task_type": "forecast",
+        "task_description": "test forecast task",
+        "tool_names": "tool_primary, tool_challenger",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "decision_skills_section": "",
+        "system_memory": "",
+        "memory_audit": {
+            "primary_path_tools": ["tool_primary"],
+            "challenger_path_tools": ["tool_challenger"],
+            "tool_prep_tools": [],
+        },
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [],
+        "fingerprint": {},
+        "horizon": 2,
+        "domain": "weather",
+        "reanalysis_section": "",
+        "_mode": "test",
+        "_defer_learning_record": False,
+        "indicator_output_keys": [],
+        "modality": "timeseries",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="forecast", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "forecast"
+    assert result["execution_context"]["tool_chain"] == ["tool_primary", "tool_challenger"]
+    assert decision_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_executor_inference_blocks_out_of_lane_tool_before_primary_path(monkeypatch, registered_forecast_fixtures):
+    executor = ExecutorAgent(llm=SimpleNamespace())
+    decision_calls = 0
+    correction_messages: list[str] = []
+    executed_tools: list[str] = []
+    dummy_response = SimpleNamespace(parsed={}, text="")
+
+    async def _fake_request_structured_decision(conversation, **_kwargs):
+        nonlocal decision_calls
+        decision_calls += 1
+        for message in reversed(conversation):
+            content = str(message.get("content") or "")
+            if "selected explicit execution lanes" in content:
+                correction_messages.append(content)
+                break
+        if decision_calls == 1:
+            return dummy_response, {
+                "thought": _structured_thought('try an unrelated tool first.', 'call tool_outside.'),
+                "done": False,
+                "tool": "tool_outside",
+                "args": {},
+            }
+        if decision_calls == 2:
+            return dummy_response, {
+                "thought": _structured_thought('follow the packet primary path.', 'call tool_primary.'),
+                "done": False,
+                "tool": "tool_primary",
+                "args": {},
+            }
+        if decision_calls >= 3:
+            return dummy_response, {
+                "thought": _structured_thought('the packet correction path is satisfied and the primary answer is already execution-grounded.', 'finish now.'),
+                "done": True,
+                "answer": [1.0, 2.0],
+                "answer_type": "forecast",
+                "confidence": 0.82,
+                "reasoning": "1. `tool_primary` produced the current candidate.",
+                "execution_context": {
+                    "tool_chain": ["tool_primary"],
+                    "public_reasoning": ["`tool_primary` produced the current forecast candidate."],
+                    "evidence_summary": "The current answer comes from the primary path.",
+                },
+                "control_context": {"completion_notes": "challenger_skip: primary path already resolved the required judgment for this smoke test."},
+            }
+        raise AssertionError("unexpected decision call")
+
+    async def _fake_execute_tool(tool_name, _tool_args, _data, _text_data, _images):
+        executed_tools.append(tool_name)
+        return ToolResult(success=True, data={"answer": [1.0, 2.0]}, error=None)
+
+    monkeypatch.setattr(executor, "_request_structured_decision", _fake_request_structured_decision)
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(executor, "_should_enforce_stepwise_reasoning", lambda _mode: False)
+
+    plan = {
+        "candidates": ["tool_primary", "tool_outside", "tool_challenger"],
+        "task_type": "forecast",
+        "task_description": "test forecast task",
+        "tool_names": "tool_primary, tool_outside, tool_challenger",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "decision_skills_section": "",
+        "system_memory": "",
+        "memory_audit": {
+            "primary_path_tools": ["tool_primary"],
+            "challenger_path_tools": ["tool_challenger"],
+            "tool_prep_tools": [],
+        },
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [],
+        "fingerprint": {},
+        "horizon": 2,
+        "domain": "weather",
+        "reanalysis_section": "",
+        "_mode": "test",
+        "_defer_learning_record": False,
+        "indicator_output_keys": [],
+        "modality": "timeseries",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="forecast", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "forecast"
+    assert correction_messages
+    assert "next tool must be one of" in correction_messages[-1].lower()
+    assert executed_tools == ["tool_primary"]
+
+
+def test_main_output_contract_for_classification_requires_label_not_forecast_array():
+    section = ExecutorAgent._build_main_output_contract_section(
+        task_type="classification",
+        horizon=None,
+        is_train=False,
+        defer_learning_record=False,
+        indicator_output_keys=[],
+        allow_finish_current_turn=True,
+        scope_keys=["finance_aligned_long_trend"],
+    )
+
+    assert "Return a single label string" in section
+    assert "`<-4%`" in section
+    assert "`up`, `down`, `flat`" in section
+    assert "Predicted Temperatures" not in section
+
+
+@pytest.mark.asyncio
+async def test_executor_forbids_second_spawn_round_in_training(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: I need parallel candidates. Action: spawn the first round.",
+                        "tool": "spawn_subagent",
+                        "args": {
+                            "tasks": [
+                                {"slot_id": 0, "task": "path a", "tools_hint": "chronos2_forecast"},
+                                {"slot_id": 1, "task": "path b", "tools_hint": "timesfm2_forecast"},
+                                {"slot_id": 2, "task": "path c", "tools_hint": "llm_reasoning_forecast"},
+                            ]
+                        },
+                    }
+                )
+            if self.calls == 2:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: I want more branches. Action: spawn another round.",
+                        "tool": "spawn_subagent",
+                        "args": {
+                            "tasks": [
+                                {"slot_id": 3, "task": "path d", "tools_hint": "llm_reasoning_forecast"},
+                            ]
+                        },
+                    }
+                )
+            return _Resp(
+                {
+                    "done": True,
+                    "thought": "Reason: the first round is enough. Action: finish with the learning summary.",
+                    "answer": {
+                        "insight": "one spawn round was enough",
+                        "recommendation": "reuse existing candidates",
+                    },
+                    "answer_type": "learning_summary",
+                    "confidence": 0.8,
+                    "reasoning": (
+                        "1. I compared the chronos2_forecast and timesfm2_forecast branches.\n"
+                        "2. The first round already covered the useful alternatives, so I summarized instead of reopening exploration."
+                    ),
+                }
+            )
+    spawn_calls = {"count": 0}
+
+    async def _fake_spawn_subagents(*_args, **_kwargs):
+        spawn_calls["count"] += 1
+        return {
+            "n_tasks": 2,
+            "n_success": 2,
+            "results": [
+                {
+                    "success": True,
+                    "result": {
+                        "answer": [1.0, 2.0],
+                        "answer_type": "forecast",
+                        "execution_log": [{"tool": "chronos2_forecast"}],
+                        "tool_chain": ["chronos2_forecast"],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": [1.1, 2.1],
+                        "answer_type": "forecast",
+                        "execution_log": [{"tool": "timesfm2_forecast"}],
+                        "tool_chain": ["timesfm2_forecast"],
+                    },
+                },
+                {
+                    "success": True,
+                    "result": {
+                        "answer": [0.9, 2.2],
+                        "answer_type": "forecast",
+                        "execution_log": [{"tool": "llm_reasoning_forecast"}],
+                        "tool_chain": ["llm_reasoning_forecast"],
+                    },
+                },
+            ],
+            "observation": "first round complete",
+        }
+
+    executor = ExecutorAgent(llm=_LLM())
+    monkeypatch.setattr(executor, "_spawn_subagents", _fake_spawn_subagents)
+    monkeypatch.setattr(ExecutorAgent, "_has_training_evaluation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ExecutorAgent, "_count_training_candidates", lambda *_args, **_kwargs: 3)
+    monkeypatch.setattr(ExecutorAgent, "_count_training_spawn_candidates", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+
+    plan = {
+        "candidates": ["spawn_subagent"],
+        "task_type": "forecast",
+        "task_description": "test forecast task",
+        "tool_names": "spawn_subagent",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "memory_audit": {
+            "soul_text": "SOUL",
+            "memory_text": "MEMORY",
+            "system_memory_text": "SOUL\nMEMORY",
+            "skills_text": "SKILL",
+            "tool_notes_section": "Tool Notes:\n- chronos2_forecast: prefer for smooth series\n",
+            "tool_note_keys": ["chronos2_forecast"],
+            "tool_note_count": 1,
+        },
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [{"slot_id": i} for i in range(4)],
+        "fingerprint": {},
+        "horizon": 2,
+        "domain": "finance",
+        "reanalysis_section": "",
+        "_mode": "train",
+        "_defer_learning_record": False,
+        "_ground_truth": [1.0, 2.0],
+        "indicator_output_keys": [],
+        "modality": "timeseries",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="forecast", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "learning_summary"
+    assert spawn_calls["count"] == 1
+    assert result["control_context"]["audit"]["memory_injected"]["memory_text"] == "MEMORY"
+    assert result["control_context"]["audit"]["memory_injected"]["tool_note_keys"] == ["chronos2_forecast"]
+    assert any(
+        item["name"] == "first_user" and item["chars"] > 0
+        for item in result["control_context"]["audit"]["prompt_sections"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagents_rejects_partially_supported_explicit_hint(monkeypatch):
+    executor = ExecutorAgent(llm=None)
+    seen_hints: list[dict[str, object]] = []
+
+    async def _fake_run_sub_executor(
+        idx,
+        task_description,
+        tools_hint,
+        branch_metadata,
+        plan,
+        envelope,
+        *,
+        slot_id=None,
+        slot_spec=None,
+    ):
+        seen_hints.append(
+            {
+                "idx": idx,
+                "task_description": task_description,
+                "tools_hint": tools_hint,
+                "slot_id": slot_id,
+                "slot_spec": slot_spec,
+            }
+        )
+        return {
+            "answer": [1.0, 2.0],
+            "answer_type": "forecast",
+            "execution_log": [{"tool": "llm_reasoning_forecast"}],
+            "tool_chain": ["llm_reasoning_forecast"],
+            "tools_hint": tools_hint,
+            "slot_id": slot_id,
+        }
+
+    monkeypatch.setattr(executor, "_run_sub_executor", _fake_run_sub_executor)
+
+    plan = {
+        "task_type": "forecast",
+        "subagent_slots": [
+            {
+                "slot_id": 0,
+                "visible_candidates": ["timesfm2_forecast", "llm_reasoning_forecast"],
+            }
+        ],
+    }
+    envelope = SimpleNamespace(environment=SimpleNamespace())
+    result = await executor._spawn_subagents(
+        {
+            "tasks": [
+                {
+                    "slot_id": 0,
+                    "task": "path a",
+                    "tools_hint": "chronos2_forecast, timesfm2_forecast",
+                }
+            ]
+        },
+        plan,
+        envelope,
+    )
+
+    assert seen_hints == []
+    assert result["n_success"] == 0
+    assert result["results"] == []
+    assert "not fully supported by the chosen slot_id=0" in result["observation"]
+
+
+def test_normalize_spawn_tasks_rejects_incompatible_explicit_hint():
+    normalized, error = ExecutorAgent._normalize_spawn_tasks(
+        [
+            {"slot_id": 0, "task": "path a", "tools_hint": "chronos2_forecast"},
+            {"slot_id": 1, "task": "path b", "tools_hint": "chronos2_forecast"},
+        ],
+        plan={
+            "task_type": "forecast",
+            "subagent_slots": [
+                {
+                    "slot_id": 0,
+                    "visible_candidates": ["timesfm2_forecast", "llm_reasoning_forecast"],
+                },
+                {
+                    "slot_id": 1,
+                    "visible_candidates": ["timesfm2_forecast", "llm_reasoning_forecast"],
+                },
+            ],
+        },
+    )
+
+    assert normalized == []
+    assert error is not None
+    assert "not fully supported by the chosen slot_id=0" in error
+    assert "Recommended supported slot-local path(s) for slot_id=0" in error
+
+
+def test_normalize_spawn_tasks_rejects_partially_supported_explicit_hint():
+    normalized, error = ExecutorAgent._normalize_spawn_tasks(
+        [
+            {
+                "slot_id": 0,
+                "task": "forecast-first classification",
+                "tools_hint": "ets_forecast -> llm_reasoning_classification",
+            }
+        ],
+        plan={
+            "task_type": "classification",
+            "subagent_slots": [
+                {
+                    "slot_id": 0,
+                    "visible_candidates": ["llm_reasoning_classification", "text_to_event"],
+                }
+            ],
+        },
+    )
+
+    assert normalized == []
+    assert error is not None
+    assert "not fully supported" in error
+    assert "ets_forecast" in error
+
+
+def test_normalize_spawn_tasks_skips_non_distinct_singleton_paths():
+    normalized, error = ExecutorAgent._normalize_spawn_tasks(
+        [
+            {"slot_id": 0, "task": "path a"},
+            {"slot_id": 1, "task": "path b"},
+        ],
+        plan={
+            "task_type": "forecast",
+            "subagent_slots": [
+                {"slot_id": 0, "visible_candidates": ["llm_reasoning_forecast"]},
+                {"slot_id": 1, "visible_candidates": ["llm_reasoning_forecast"]},
+            ],
+        },
+    )
+
+    assert error is None
+    assert len(normalized) == 1
+    assert normalized[0]["slot_id"] == 0
+    assert normalized[0]["tools_hint"] == ["llm_reasoning_forecast"]
+
+
+def test_select_train_spawn_prior_skips_task_mismatched_reasoning_path():
+    prior = ExecutorAgent._select_train_spawn_prior(
+        path_priors=[
+            {"path": ["slice", "llm_reasoning_qa"], "support": 9},
+            {"path": ["detect_trend", "llm_reasoning_classification"], "support": 5},
+        ],
+        subagent_slots=[
+            {
+                "slot_id": 0,
+                "visible_candidates": [
+                    "slice",
+                    "detect_trend",
+                    "llm_reasoning_qa",
+                    "llm_reasoning_classification",
+                ],
+            }
+        ],
+        task_type="classification",
+    )
+
+    assert prior == ["detect_trend", "llm_reasoning_classification"]
+
+
+@pytest.mark.asyncio
+async def test_executor_training_main_agent_rejects_task_typed_final_answer(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(
+                    {
+                        "done": True,
+                        "thought": "Reason: I think the forecast itself is enough. Action: return the task-typed answer.",
+                        "answer": [1.0, 2.0],
+                        "answer_type": "forecast",
+                        "confidence": 0.6,
+                        "reasoning": "1. I compared the candidates and picked the best forecast.",
+                    }
+                )
+            return _Resp(
+                {
+                    "done": True,
+                    "thought": "Reason: training mode requires a summary. Action: finish with the learning summary.",
+                    "answer": {
+                        "insight": "Candidate comparison mattered more than any single raw forecast.",
+                        "recommendation": "Finish training runs with a learning summary after selecting the winner.",
+                    },
+                    "answer_type": "learning_summary",
+                    "confidence": 0.8,
+                    "reasoning": (
+                        "1. I compared the candidate approaches and identified the stronger one.\n"
+                        "2. I summarized the reusable lesson instead of returning another task-typed answer."
+                    ),
+                }
+            )
+    executor = ExecutorAgent(llm=_LLM())
+    monkeypatch.setattr(ExecutorAgent, "_has_training_evaluation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ExecutorAgent, "_count_training_candidates", lambda *_args, **_kwargs: 3)
+    monkeypatch.setattr(ExecutorAgent, "_count_training_spawn_candidates", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+
+    plan = {
+        "candidates": [],
+        "task_type": "forecast",
+        "task_description": "test forecast task",
+        "tool_names": "",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [],
+        "fingerprint": {},
+        "horizon": 2,
+        "domain": "weather",
+        "reanalysis_section": "",
+        "_mode": "train",
+        "_defer_learning_record": False,
+        "_ground_truth": [1.0, 2.0],
+        "indicator_output_keys": [],
+        "modality": "timeseries",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="forecast", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "learning_summary"
+    assert executor.llm.calls == 2
+
+
+def test_react_system_prompt_explicitly_forbids_multi_turn_plans_in_one_reply():
+    prompt = executor_prompt.REACT_SYSTEM_PROMPT.format(max_steps=10)
+
+    assert "This reply is ONLY for the current turn." in prompt
+    assert "Do not include a multi-step plan" in prompt
+    assert "The framework, not you, will ask for the next turn separately." in prompt
+    assert "Do not describe what you would do on the next turn." in prompt
+
+
+def test_build_decision_section_explicitly_forbids_later_turn_plans():
+    section = ExecutorAgent._build_decision_section(
+        allow_finish=True,
+        spawn_available=True,
+    )
+
+    assert "This reply is only for the current turn." in section
+    assert "Do not include a plan for later turns" in section
+    assert "then tool B, then finish" in section
+
+
+def test_build_decision_section_marks_eval_only_turns():
+    section = ExecutorAgent._build_decision_section(
+        allow_finish=False,
+        spawn_available=False,
+        eval_only=True,
+    )
+
+    assert "Call exactly one GT evaluation tool" in section
+    assert "evaluation-only turn" in section
+
+
+def test_build_decision_section_marks_spawn_only_turns():
+    section = ExecutorAgent._build_decision_section(
+        allow_finish=False,
+        spawn_available=True,
+        spawn_only=True,
+    )
+
+    assert "The only valid tool for this turn is `spawn_subagent`" in section
+    assert "spawn-only turn" in section
+
+
+def test_build_decision_section_marks_finish_only_turns():
+    section = ExecutorAgent._build_decision_section(
+        allow_finish=True,
+        spawn_available=False,
+        tool_call_allowed=False,
+    )
+
+    assert "Do not call any more tools in this turn" in section
+    assert "finish-only turn" in section
+    assert "do not seek new evidence" in section.lower()
+
+
+@pytest.mark.asyncio
+async def test_executor_overrides_llm_reasoning_domain_with_plan_domain(monkeypatch):
+    class _Resp:
+        def __init__(self, parsed):
+            self.parsed = parsed
+            self.text = json.dumps(parsed, ensure_ascii=False)
+
+    class _LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def complete(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return _Resp(
+                    {
+                        "done": False,
+                        "thought": "Reason: produce a candidate. Action: call indicator reasoning.",
+                        "tool": "llm_reasoning_indicator",
+                        "args": {
+                            "question": "Return exactly one JSON object with key 'macd'.",
+                            "context": "test",
+                            "domain": "finance_aligned_long_indicator_macd",
+                        },
+                    }
+                )
+            return _Resp(
+                {
+                    "done": True,
+                    "thought": "Reason: step limit reached. Action: summarize failure.",
+                    "answer": {
+                        "insight": "No valid training completion in this synthetic test.",
+                        "recommendation": "Stop after verifying canonical domain injection.",
+                    },
+                    "answer_type": "learning_summary",
+                    "confidence": 0.6,
+                    "reasoning": "1. Verified the outgoing tool args.",
+                }
+            )
+    captured_args: list[dict[str, Any]] = []
+
+    async def _fake_execute_tool(tool_name, tool_args, *_args, **_kwargs):
+        captured_args.append({"tool": tool_name, "args": dict(tool_args)})
+        return ToolResult(
+            success=True,
+            data={"answer": {"macd": [0.1, 0.2, 0.3]}},
+            error=None,
+            metadata={},
+        )
+
+    executor = ExecutorAgent(llm=_LLM())
+    monkeypatch.setattr(executor, "_execute_tool", _fake_execute_tool)
+    monkeypatch.setattr(
+        ExecutorAgent,
+        "_training_completion_contract_satisfied",
+        classmethod(lambda *_args, **_kwargs: True),
+    )
+    monkeypatch.setattr(executor, "_stepwise_reasoning_verdict", _passing_reasoning_verdict)
+    monkeypatch.setattr(executor, "_execution_context_verdict", _passing_execution_context_verdict)
+
+    plan = {
+        "candidates": ["llm_reasoning_indicator"],
+        "task_type": "indicator",
+        "task_description": "test indicator task",
+        "tool_names": "llm_reasoning_indicator",
+        "tool_notes_section": "",
+        "skills_section": "",
+        "system_memory": "",
+        "modality_hint": "",
+        "profiling_section": "",
+        "subagent_slot_section": "",
+        "subagent_slots": [],
+        "fingerprint": {},
+        "horizon": 3,
+        "domain": "finance",
+        "reanalysis_section": "",
+        "_mode": "train",
+        "_defer_learning_record": False,
+        "_ground_truth": {"macd": [0.1, 0.2, 0.3]},
+        "indicator_output_keys": ["macd"],
+        "modality": "multimodal",
+    }
+    envelope = TaskEnvelope(
+        task=TaskSpec(task_id="test", task_type="indicator", description="test"),
+        environment=EnvironmentSnapshot(data=[1.0], modalities=["timeseries", "text"]),
+    )
+
+    result = await executor.act(plan, envelope)
+
+    assert result["answer_type"] == "learning_summary"
+    assert captured_args[0]["tool"] == "llm_reasoning_indicator"
+    assert captured_args[0]["args"]["domain"] == "finance"

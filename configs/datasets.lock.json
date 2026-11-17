@@ -1,0 +1,58 @@
+{
+  "weather_aligned_short": {
+    "repo": "afeng/MTBench_weather_aligned_pairs_short",
+    "local": "data/processed/weather/aligned_in7days_out1days",
+    "revision": "953a48f27d3aefa754408a433ff7c4aa06667fbf",
+    "license": null,
+    "files": 1961
+  },
+  "weather_aligned_long": {
+    "repo": "afeng/MTBench_weather_aligned_pairs_long",
+    "local": "data/processed/weather/aligned_in14days_out3days",
+    "revision": "7c366de2ed7cbba531b407a976ed1f09ce8e8900",
+    "license": null,
+    "files": 1961
+  },
+  "weather_qa_short": {
+    "repo": "afeng/MTBench_weather_QA_short",
+    "local": "data/processed/weather/QAshort",
+    "revision": "cd5471e60a1ebc96e360cb6b3496b20b612120ce",
+    "license": null,
+    "files": 647
+  },
+  "weather_qa_long": {
+    "repo": "afeng/MTBench_weather_QA_long",
+    "local": "data/processed/weather/QAlong",
+    "revision": "fc8099ec82f90931f639ac101ec2a55b22806d9e",
+    "license": null,
+    "files": 730
+  },
+  "finance_aligned_short": {
+    "repo": "afeng/MTBench_finance_aligned_pairs_short",
+    "local": "data/processed/finance/aligned_in7days_out1days",
+    "revision": "5e30441d1c05f067cf5d44054b6673c175e58297",
+    "license": null,
+    "files": 3
+  },
+  "finance_aligned_long": {
+    "repo": "afeng/MTBench_finance_aligned_pairs_long",
+    "local": "data/processed/finance/aligned_in30days_out7days",
+    "revision": "a1bcb7eda5679a0d644ff0b9910be332e350cd8b",
+    "license": null,
+    "files": 3
+  },
+  "finance_qa_short": {
+    "repo": "afeng/MTBench_finance_QA_short",
+    "local": "data/processed/finance/QAshort",
+    "revision": "a0c6ce41005d4e4900e37f9f47fd27c4b80d347b",
+    "license": null,
+    "files": 493
+  },
+  "finance_qa_long": {
+    "repo": "afeng/MTBench_finance_QA_long",
+    "local": "data/processed/finance/QAlong",
+    "revision": "1e0cb724624e8f47b4241034511ac08815053c58",
+    "license": null,
+    "files": 518
+  }
+}

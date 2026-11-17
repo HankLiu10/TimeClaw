@@ -1,0 +1,39 @@
+# Public template. Credentials are read from OPENAI_API_KEY, never stored here.
+llm:
+  api_base: https://api.openai.com/v1
+  api_key: null
+  api_transport: chat_completions
+  models:
+    manager: openai/gpt-6.1-sol
+    analyzer: openai/gpt-6.1-sol
+    executor: openai/gpt-6.1-sol
+    reasoner: openai/gpt-6.1-sol
+    text_light: openai/gpt-6.1-sol
+    text_heavy: openai/gpt-6.1-sol
+  reasoning_effort: low
+  send_temperature: false
+  allow_fallback: false
+  max_tokens: null
+  timeout: 3600
+  network_retry_attempts: null
+  network_retry_delay_s: 30
+  max_inflight_requests: 5
+pipeline:
+  multi_agent_mode: true
+  disable_tool_dropout: false
+benchmark:
+  task_set: paper30_original
+  repo_root: .
+  training_root: data_preparation/independent
+  splits_dir: data/splits
+  evaluation_datasets: null  # All eight evaluation pools in either supported task set
+  # Explicit pinned raw-source time/identity evidence; never a prediction policy.
+  observation_time_evidence: configs/mtbench_observation_times.json
+workspace_dir: .timeclaw
+# The basic install does not include foundation-model weights/environments.
+# Enable services only after installing the required model extras, see docs.
+sbm:
+  managed_server_enabled: false
+  device: cpu
+mcp:
+  enabled: false

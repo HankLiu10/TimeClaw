@@ -1,0 +1,294 @@
+{
+  "status": "main_experiment_source_submission_ready",
+  "date": "2026-11-17",
+  "task_registry_sha256": "4f37fb76974ce4dbe7760e6cd8d11a922c668bf953f0daf705fd136d382213eb",
+  "offline_validation": {
+    "python": "3.10.9",
+    "system_site_packages": false,
+    "passed": 1223,
+    "skipped": 4,
+    "failed": 0,
+    "errors": 0,
+    "seconds": 54.251,
+    "scope": "Independently extracted 0.1.2 source distribution; final metadata-only sealing retains the exact validated runtime/test/script/config bytes",
+    "skips": "four optional signal packages"
+  },
+  "current_audit_paid_model_requests": 0,
+  "prior_real_api_validation": {
+    "model": "gpt-6.1-sol",
+    "effort": "low",
+    "endpoint": "https://api.openai.com/v1",
+    "data": "artificial engineering fixtures; not paper accuracy evidence",
+    "train_samples": 2,
+    "successful_branch_executions": 4,
+    "native_notes": 2,
+    "native_memory_rules": 2,
+    "distillation_done_seq": 2,
+    "standalone_distillation_completed": true,
+    "unique_test_samples": 1,
+    "completed_inference_executions": 2,
+    "retained_unsuccessful_run_count": 1,
+    "unsuccessful_run_reason": "miswired CLI guard and NameError during cleanup; fixed and covered by actual CLI regression",
+    "memory_and_lineage_unchanged_through_final_inference": true,
+    "transport_attempts": {
+      "training": 34,
+      "unsuccessful_first_lifecycle": 8,
+      "successful_retry": 6,
+      "final_validation": 6,
+      "total": 54
+    },
+    "actual_billing_usd": null,
+    "gpus_used": false,
+    "new_model_weights": false
+  },
+  "prior_live_validation_scope": "Historical artificial-fixture pilot predates the current task/evidence protocol; current changes are verified offline, not a new live benchmark or numerical paper reproduction.",
+  "real_evaluation_input_validation": {
+    "source": "read-only original local archive; not a new pinned-download verification",
+    "physical_records_loaded": 7573,
+    "datasets": {
+      "weather_aligned_short": 1959,
+      "weather_aligned_long": 1959,
+      "weather_qa_short": 645,
+      "weather_qa_long": 728,
+      "finance_aligned_short": 750,
+      "finance_aligned_long": 525,
+      "finance_qa_short": 491,
+      "finance_qa_long": 516
+    },
+    "representative_prompt_and_native_preparations": 18,
+    "model_predictions_run": 0
+  },
+  "native_core_unchanged_from_prior_live_check": {
+    "timeclaw/agents/executor.py": false,
+    "timeclaw/agents/tool_dropout.py": true,
+    "timeclaw/agents/prompts/executor_prompt.py": true,
+    "timeclaw/pipeline/runner.py": false,
+    "timeclaw/memory/hierarchical.py": false
+  },
+  "main_only_scope": {
+    "removed_files": 47,
+    "removed_or_renamed_test_cases": 87,
+    "added_or_renamed_test_cases": 55,
+    "removed_cases_had_failures": 0
+  },
+  "full_benchmark_or_neural_loading_verified": false,
+  "historical_paper_scores_reproduced": false,
+  "paper_alignment_open_items": [
+    "Confirmed merged/planned table columns and score-selected ancestry even in July replay",
+    "Uncertified historical training lineage and missing complete admissible paper learning state/cohort",
+    "Full model/weight environment not certified despite identified historical config fields",
+    "Weather-long prompt versus upstream evaluator target disagreement"
+  ],
+  "pushed": false,
+  "historical_arithmetic_replay": {
+    "means_matched": 30,
+    "effective_sample_counts_matched": 30,
+    "saved_rows": 22884,
+    "scientific_reproduction_accepted": false,
+    "reason": "Input inherits score-conditioned duplicate selection; historical arithmetic replay is not a new controlled experiment."
+  },
+  "historical_table_cell_trace": {
+    "local_manuscript30": {
+      "timeclaw_merged_matches": 30,
+      "baseline_planned_matches": 30,
+      "public_metadata_verified_not_numeric_tables": true,
+      "external_final_manuscript_verified": false
+    },
+    "local_table26_versions": 2,
+    "matches_per_model_per_table26": 26,
+    "external_final_manuscript_verified": false
+  },
+  "historical_training_asset_review": {
+    "main_task_result_files": 18,
+    "saved_rows": 5110,
+    "json_scopes": 12,
+    "json_references_found_only_in_official_filename_pool": 3608,
+    "lineage_receipt_present": false,
+    "finance_virtual_ids_are_not_content_overlap_proof": true,
+    "state_contains_later_engineering_fixtures": true
+  },
+  "result_output_lifecycle": {
+    "one_writer_per_run": true,
+    "fresh_output_refuses_existing_run": true,
+    "duplicate_or_foreign_resume_rows_rejected": true,
+    "initial_admission_saved_before_agent": true,
+    "exact_artifact_cleanup": true,
+    "failure_sidecars_derived_from_result_rows": true
+  },
+  "source_delivery_accepted": true,
+  "delivery_scope": {
+    "type": "repaired main-experiment source only",
+    "old_training_products_included": false,
+    "historical_numerical_reproduction_required_for_source_delivery": false,
+    "new_learning_requires_admitted_independent_inputs": true
+  },
+  "hierarchical_memory_change_scope": "Explicit single-execution Note metadata, observed tools, non-comparative statistics and source-typed relative-rule support/merge admission; existing batch/derived lifecycle preserved.",
+  "workspace_ownership": {
+    "precedence": [
+      "explicit CLI",
+      "process environment",
+      "config"
+    ],
+    "all_alias_cannot_repeat_included_steps": true,
+    "shared_trace_path_owner": true,
+    "foreign_workspace_trace_rejected": true,
+    "new_regression_cases": 24
+  },
+  "source_submission_ready": true,
+  "final_submission_checks": {
+    "critical_static_errors": 0,
+    "critical_static_scope": [
+      "timeclaw",
+      "scripts",
+      "tests"
+    ],
+    "active_native_core_unchanged_in_this_round": false,
+    "dead_alternate_training_helpers_removed": 3,
+    "csv_failure_not_success": true,
+    "sundial_capabilities_corrected": true,
+    "failed_setup_is_not_published": true,
+    "fresh_pinned_upstream_setup_verified": true,
+    "public_data_pin_metadata_checks": 8,
+    "public_data_raw_downloads": 0,
+    "new_regression_cases": 9,
+    "automatic_push": false
+  },
+  "release_task_count": 17,
+  "release_primary_metric_columns": 30,
+  "public_paper": {
+    "url": "https://arxiv.org/abs/2605.10038",
+    "date": "2026-05-11",
+    "status": "Under review",
+    "paper_tasks": 17,
+    "paper_metric_views": 30
+  },
+  "public_paper_exact_scope_match": true,
+  "independent_learning_corpus_public_download_verified": false,
+  "workspace_lifecycle_concurrency": {
+    "writers_exclusive": true,
+    "inference_shared_readers": true,
+    "lock_includes_cleanup": true,
+    "real_entrypoint_regressions": 8,
+    "new_fallback": false
+  },
+  "publication_ready": false,
+  "publication_open_items": [
+    "GitHub-managed PR #1 references retain credential-style literals; credential revocation/rotation unconfirmed",
+    "Full independent training-corpus coverage/public hosting and redistribution review incomplete; 160-record review subset admitted",
+    "Historical paper scores and all optional GPU environments not re-certified"
+  ],
+  "followup_documentation_only": false,
+  "normal_remote_branch_cleanup": {
+    "master": "0800b33c3a572f19b5b9f39f2d091d668653b3b9",
+    "root_parents": [],
+    "same_readme": true,
+    "old_branch_deleted": true,
+    "managed_PR_1_remains": true,
+    "credential_revocation_confirmed": false,
+    "source_release_uploaded": false
+  },
+  "actual_evaluation_source_audit": {
+    "rows": 7573,
+    "invalid_pool": "finance_aligned_long",
+    "file_matches_official_pinned_bytes": true,
+    "rows_dropped": 0,
+    "timestamps_imputed": false,
+    "full18_learning_lineage_accepted": false,
+    "raw_defects_retained_and_resolved_by_explicit_evidence": true,
+    "all_eight_evaluation_pools_source_support_accepted": true,
+    "reason_not_full_learning_acceptance": "Source admission verified; no new model learning, Notes, distillation or sealed inference run. Portable corpus is not full18 training coverage.",
+    "raw_invalid_timestamp_rows": 117,
+    "normalized_invalid_timestamp_rows": 0
+  },
+  "independent_corpus_review": {
+    "all_eight_pools_admitted_review_records": 160,
+    "corpora": {
+      "finance_aligned_short": 10,
+      "finance_qa_short": 50,
+      "weather_aligned_long": 50,
+      "weather_qa_short": 50
+    },
+    "full18_training_coverage": false,
+    "public_hosted_url": null,
+    "old_quarantine_removed": false,
+    "original_numeric_source_pools": {
+      "finance_aligned_short": 530,
+      "finance_aligned_long": 2133
+    }
+  },
+  "source_time_evidence": {
+    "schema": "observation_time_evidence_v1",
+    "attachment_sha256": "495abb6e633c95b69156d6b603fa22138ca42e38900f3814ac5905653c0c8469",
+    "unique_exact_historical_raw_matches": 117,
+    "future_values_used_for_source_selection": false,
+    "all_raw_future_values_validated_after_input_identity": true,
+    "original_prices_news_labels_changed": false,
+    "original_data_files_changed": false,
+    "input_timestamp_mismatch_rows": 112,
+    "output_timestamp_mismatch_rows": 74,
+    "union_rows": 117,
+    "source_groups_NOAA_verified": true,
+    "real_input_rows_verified": 7573,
+    "official_source_files_primary_byte_identity_verified": 6300,
+    "finance_long_prompt_pairs_unchanged": 1575,
+    "strict_guard_relaxed": false
+  },
+  "latest_reaudit": {
+    "date": "2026-11-17",
+    "prior_core_passed": 1159,
+    "new_regression_cases": 28,
+    "initial_missing_upstream_dependency_errors": 26,
+    "initial_missing_upstream_dependency_resolved_by": "documented pinned setup, not a code fallback",
+    "new_contract_counterexamples_failing_before_repair": 26,
+    "sample_indices_strict": true,
+    "learning_selection_admitted_before_services_and_lineage": true,
+    "baseline_output_writer_exclusive_across_processes": true,
+    "native_controller_dropout_memory_scorer_unchanged": true,
+    "author_order": [
+      "Hangchen Liu",
+      "Dongyuan Li",
+      "Jiewen Deng",
+      "Weiwei Ye",
+      "Yoshihide Sekimoto",
+      "Renhe Jiang"
+    ],
+    "new_model_requests": 0,
+    "gpu_use": false,
+    "source_publication_performed": false
+  },
+  "version": "0.1.2",
+  "task_set": "paper30_original",
+  "prior_0_1_1_offline_validation": {
+    "python": "3.10.9",
+    "system_site_packages": false,
+    "passed": 1187,
+    "skipped": 4,
+    "failed": 0,
+    "errors": 0,
+    "seconds": 54.645,
+    "skips": "four optional signal packages; no retired-wrapper skip remains"
+  },
+  "current_protocol": {
+    "default_tasks": 17,
+    "default_metric_cells": 30,
+    "extension_tasks": 18,
+    "extension_metric_cells": 26,
+    "single_candidate_recording": "terminal factual evidence after multi-branch exploration; no comparative signal",
+    "normal_comparative_minimum": 2,
+    "zero_or_unscored_note_admitted": false,
+    "single_note_relative_rule_support": false,
+    "distillation_batch_notes_per_scope": 10,
+    "new_api_requests": 0,
+    "gpu_use": false,
+    "new_fallback": false
+  },
+  "installed_wheel_validation": {
+    "version": "0.1.2",
+    "all_runtime_files_match_source": 172,
+    "task_entrypoints": 17,
+    "scripted_baseline_requests": 17,
+    "real_cpu_ets_steps": 4,
+    "all_imports_from_installed_wheel": true,
+    "actual_api_requests": 0
+  }
+}

@@ -1,0 +1,20 @@
+TimeClaw project code is covered by the top-level MIT license, as declared in
+the original project's package metadata. This does not relicense dependencies,
+datasets, downloaded weights, or third-party repositories.
+
+MTBench is a separate code/data dependency:
+  https://github.com/Graph-and-Geometric-Learning/MTBench
+  pinned source revision: 394a9d274403e93a08b24c2a0b7af461615ce302
+  prompt modules used: evaluation/weather/meta_prompt.py,
+    evaluation/finance/meta_prompt.py, evaluation/utils.py
+No MTBench source is bundled or represented as TimeClaw-owned MIT code.
+The inspected upstream revision has no top-level license file. Consult its
+authors for applicable redistribution terms. scripts/setup_mtbench.py fetches
+it as a separate user-installed dependency; it does not download the datasets.
+
+Dataset download identifiers are pinned in configs/datasets.lock.json.
+Observe their respective dataset terms and provenance. Independent learning
+corpora are not bundled; benchmark test files are not substitutes for them.
+
+Model adapters retain their upstream model identifiers in timeclaw/sbm/.
+Model extras and weights have their own licenses and dependency requirements.
